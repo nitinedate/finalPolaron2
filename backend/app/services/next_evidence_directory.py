@@ -1,0 +1,1280 @@
+"""Extract evidence directories one after another.
+
+The directory that is open is the only image in that pass. The next directory
+starts after that pass is saved to storage, and the next pipeline stage starts
+only after every directory has been saved and combined.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import threading
+import time
+import uuid
+from pathlib import PurePosixPath
+from typing import Any
+
+log = logging.getLogger("next_evidence_directory")
+
+_LOCK_STALE_SEC = 180
+
+
+def directory_key(path: str) -> str:
+    return str(path or "").replace("\\", "/").rstrip("/").lower()
+
+
+def pending_directories(
+    files: list[dict], segment_paths: list[str] | None,
+    directories: list[str] | None = None,
+) -> list[dict]:
+    """Directories registered on the job whose segments were not in the saved extract.
+
+    An empty segment list means no extract has been published yet. Those
+    directories belong to the extract that is already running, not to a follow-up.
+    """
+    from app.services.virtual_disk import list_image_directories
+
+    saved = [str(path) for path in (segment_paths or []) if str(path or "").strip()]
+    if not saved:
+        return []
+    saved_dirs = {directory_key(path.replace("\\", "/").rsplit("/", 1)[0]) for path in saved}
+    return [
+        group
+        for group in list_image_directories(files, preferred_directories=directories)
+        if directory_key(group["directory"]) not in saved_dirs
+    ]
+
+
+def lead_with_saved_image(
+    groups: list[dict], *, base_name: str = "", segment_count: int = 0,
+) -> list[dict]:
+    """Keep the image that already has a saved plan as directory 1.
+
+    A later image that finished registering must not take the first slot and
+    be read with the earlier image's file plan. Every other directory stays
+    after it, in the order it was already listed.
+    """
+    if len(groups) <= 1:
+        return list(groups)
+    match = None
+    count = int(segment_count or 0)
+    if count:
+        sized = [group for group in groups if len(group.get("paths") or []) == count]
+        if len(sized) == 1:
+            match = sized[0]
+    saved = str(base_name or "").casefold()
+    if match is None and saved:
+        hits = []
+        for group in groups:
+            label = str(group.get("label") or "").casefold()
+            stems = [
+                PurePosixPath(str(path).replace("\\", "/")).stem.casefold()
+                for path in (group.get("paths") or [])
+            ]
+            if saved == label or saved in stems:
+                hits.append(group)
+        if len(hits) == 1:
+            match = hits[0]
+    if match is None:
+        return list(groups)
+    return [match, *[group for group in groups if group is not match]]
+
+
+def restrict_to_next_directory(
+    files: list[dict], *, directories: list[str] | None = None,
+) -> tuple[list[dict], str | None]:
+    """Keep only the first image directory when several were registered.
+
+    The following directories are extracted after this one is saved.
+    """
+    from app.services.virtual_disk import _evidence_host_path, list_image_directories
+
+    groups = list_image_directories(files, preferred_directories=directories)
+    if len(groups) <= 1:
+        return files, None
+    target = groups[0]
+    wanted = {str(path).lower() for path in target["paths"]}
+    kept = [row for row in files if _evidence_host_path(row).lower() in wanted]
+    message = (
+        f"Directory 1 of {len(groups)}: extracting only {target['label']} "
+        f"({len(kept)} segment file(s)). The next directory starts after this "
+        "extraction is saved, and the file lists are combined before the next stage."
+    )
+    return kept or files, message
+
+
+def _manifest_from_row(row: dict) -> dict:
+    source = row.get("disk_source") or {}
+    if isinstance(source, str):
+        try:
+            source = json.loads(source)
+        except (TypeError, ValueError):
+            source = {}
+    if not isinstance(source, dict):
+        source = {}
+    if source.get("segment_paths") or source.get("index_uri") or source.get("parts_map"):
+        return source
+    uri = str(row.get("extracted_disk_uri") or "")
+    if not uri:
+        return source
+    from app.services.storage import get_bytes
+
+    raw = get_bytes(uri)
+    if not raw:
+        return source
+    try:
+        loaded = json.loads(raw)
+    except (TypeError, ValueError):
+        return source
+    return loaded if isinstance(loaded, dict) else source
+
+
+def directory_roster(db, job_id: str, row: dict | None = None) -> list[dict]:
+    """One line per registered image directory, for the processing panels.
+
+    A single directory returns an empty list. The panels only need the extra
+    directories the examiner added.
+    """
+    from app.db.sql_helpers import fetchall, fetchone
+
+    row = fetchone(
+        db,
+        """SELECT status, disk_source, extracted_disk_uri, files_extracted, bytes_extracted, pipeline_progress
+             FROM jobs WHERE id=:id""",
+        {"id": job_id},
+    ) or row or {}
+    manifest = _manifest_from_row(row)
+    files = fetchall(
+        db,
+        "SELECT * FROM evidence_files WHERE job_id=:job_id ORDER BY original_name",
+        {"job_id": job_id},
+    )
+    from app.services.virtual_disk import list_image_directories
+
+    registered = list_image_directories(files, preferred_directories=list(manifest.get("evidence_folders") or []))
+    if len(registered) <= 1:
+        return []
+    pending = pending_directories(
+        files, list(manifest.get("segment_paths") or []),
+        directories=list(manifest.get("evidence_folders") or []),
+    )
+    # Before the first extract is published every directory is still pending.
+    # `pending_directories` intentionally returns [] in this case to avoid
+    # scheduling a second extractor, but the UI must not display them as saved.
+    first_unpublished = not manifest.get("segment_paths")
+    if first_unpublished:
+        pending = list(registered)
+    pending_keys = {directory_key(item["directory"]) for item in pending}
+    append = manifest.get("directory_append") if isinstance(manifest.get("directory_append"), dict) else None
+    extracting = bool(append and append.get("owner")) or (
+        first_unpublished and str(row.get("status") or "") in {"processing", "extracting"}
+    )
+    first_pending = directory_key(pending[0]["directory"]) if pending else ""
+    stats = manifest.get("directory_stats") if isinstance(manifest.get("directory_stats"), list) else []
+    stats_by_key = {
+        directory_key(str(item.get("directory") or "")): item
+        for item in stats
+        if isinstance(item, dict)
+    }
+    progress = row.get("pipeline_progress") or {}
+    if isinstance(progress, str):
+        try:
+            progress = json.loads(progress)
+        except (TypeError, ValueError):
+            progress = {}
+    activity = progress.get("extraction_activity") if isinstance(progress, dict) else {}
+    if not isinstance(activity, dict):
+        activity = {}
+    roster: list[dict] = []
+    saved_missing: list[dict] = []
+    for index, group in enumerate(registered, 1):
+        key = directory_key(group["directory"])
+        stat = stats_by_key.get(key)
+        known_files = int(stat.get("files") or 0) if stat else None
+        known_bytes = int(stat.get("bytes") or 0) if stat else None
+        if key not in pending_keys:
+            state = "saved"
+            detail = "Saved and included in the combined file list."
+        elif extracting and key == first_pending:
+            state = "extracting"
+            age = None
+            try:
+                age = max(0, int(time.time() - float(append.get("heartbeat_at") or 0)))
+            except (TypeError, ValueError):
+                age = None
+            if age is not None and age < _LOCK_STALE_SEC:
+                detail = f"Opening this image now. Worker heartbeat {age}s ago."
+            else:
+                detail = "This image is opening now."
+            active_label = str(activity.get("directory_label") or "")
+            active_namespace = str(activity.get("directory_namespace") or "")
+            matches_active_directory = (
+                active_namespace == str(group.get("namespace") or "")
+                if active_namespace
+                else active_label == str(group.get("label") or "")
+            )
+            if matches_active_directory:
+                prior = int(manifest.get("files_extracted") or 0)
+                packed = activity.get("files_packed", activity.get("files_extracted"))
+                try:
+                    packed_n = int(packed) if packed is not None else None
+                except (TypeError, ValueError):
+                    packed_n = None
+                known_files = max(0, packed_n - prior) if packed_n is not None and packed_n >= prior else int(activity.get("files_found") or 0)
+                known_bytes = 0
+            else:
+                known_files = 0
+                known_bytes = 0
+        else:
+            state = "waiting"
+            detail = "Previous directories are saved. This directory is next."
+            known_files = 0
+            known_bytes = 0
+        entry = {
+            "index": index,
+            "total": len(registered),
+            "label": group["label"],
+            "source_directory": group["directory"],
+            "namespace": group["namespace"],
+            "segments": len(group["paths"]),
+            "state": state,
+            "detail": detail,
+            "files": known_files,
+            "bytes": known_bytes,
+        }
+        if state == "extracting":
+            step = "Extracting this image"
+        elif state == "waiting":
+            step = "Waiting — this image is extracted after the one that is open"
+        elif extracting:
+            step = "Extracted — filtering and later stages start after every image is saved"
+        else:
+            current_step = ""
+            if isinstance(progress, dict):
+                current_step = str(progress.get("label") or "")
+                serial = progress.get("serial_pipeline")
+                if isinstance(serial, dict):
+                    current_id = str(serial.get("current_stage") or "")
+                    for stage in serial.get("stages") or []:
+                        if isinstance(stage, dict) and str(stage.get("id") or "") == current_id:
+                            current_step = str(stage.get("label") or current_step)
+                            break
+            step = current_step or "Saved — filtering and later stages use the combined files"
+        entry["step"] = step
+        if state == "saved" and known_files is None:
+            saved_missing.append(entry)
+        roster.append(entry)
+    if len(saved_missing) == 1:
+        only = saved_missing[0]
+        known_files = sum(int(entry.get("files") or 0) for entry in roster if entry is not only and entry.get("files") is not None)
+        known_bytes = sum(int(entry.get("bytes") or 0) for entry in roster if entry is not only and entry.get("bytes") is not None)
+        only["files"] = max(0, int(row.get("files_extracted") or manifest.get("files_extracted") or 0) - known_files)
+        only["bytes"] = max(0, int(row.get("bytes_extracted") or manifest.get("bytes_extracted") or 0) - known_bytes)
+    for entry in roster:
+        entry["files"] = int(entry.get("files") or 0)
+        entry["bytes"] = int(entry.get("bytes") or 0)
+    return roster
+
+
+def combined_handoff_ready(
+    append_status: str, pending_reason: str | None, *, selected_count: int,
+    saved_count: int, materialize_pending: bool = False,
+) -> tuple[bool, str]:
+    """Fail-closed handoff barrier for multi-directory disk evidence.
+
+    Never start artifact parsing, semantic indexing or reporting on an incomplete
+    combined case, even if an append worker returned `busy` or `waiting`.
+    """
+    if append_status not in {"none", "extracted"}:
+        return False, f"Directory extraction not complete ({append_status})"
+    if pending_reason:
+        return False, pending_reason
+    if materialize_pending:
+        return False, "Combined evidence inventory is not registered"
+    if selected_count > 1 and saved_count != selected_count:
+        return False, f"Only {saved_count} of {selected_count} directories are saved"
+    return True, "All selected directories are saved and merged"
+
+
+def unfinished_directory_reason(db, job_id: str, row: dict | None = None) -> str | None:
+    """Why the next pipeline stage must wait, or None when every directory is saved."""
+    from app.db.sql_helpers import fetchall, fetchone
+
+    if row is None:
+        row = fetchone(db, "SELECT * FROM jobs WHERE id=:id", {"id": job_id}) or {}
+    manifest = _manifest_from_row(row)
+    files = fetchall(
+        db,
+        "SELECT * FROM evidence_files WHERE job_id=:job_id ORDER BY original_name",
+        {"job_id": job_id},
+    )
+    folders = manifest.get("evidence_folders") if isinstance(manifest.get("evidence_folders"), list) else []
+    from app.services.virtual_disk import list_image_directories
+
+    registered = list_image_directories(files, preferred_directories=list(manifest.get("evidence_folders") or []))
+    if len(folders) > len(registered):
+        return "Waiting for every evidence directory to finish registering"
+    if len(registered) > 1 and not manifest.get("segment_paths"):
+        return "Directory 1 extraction has not published its manifest; downstream work is held"
+    pending = pending_directories(
+        files, list(manifest.get("segment_paths") or []),
+        directories=list(manifest.get("evidence_folders") or []),
+    )
+    if not pending and manifest.get("directory_materialize_pending"):
+        return "Directory artifact registration starts after the combined extract is saved"
+    if not pending:
+        return None
+    nxt = pending[0]
+    return (
+        f"Directory {len(registered) - len(pending) + 1} of {len(registered)} "
+        f"({nxt['label']}) starts after the current extraction is saved"
+    )
+
+
+def _claim_append(db, job_id: str, owner: str) -> bool:
+    from app.db.sql_helpers import fetchone
+
+    payload = json.dumps({"owner": owner, "heartbeat_at": time.time()})
+    row = fetchone(
+        db,
+        """UPDATE jobs
+              SET disk_source = jsonb_set(
+                    COALESCE(disk_source, '{}'::jsonb),
+                    '{directory_append}',
+                    CAST(:payload AS jsonb),
+                    true
+                  ),
+                  updated_at = NOW()
+            WHERE id = :id
+              AND (
+                COALESCE(disk_source #>> '{directory_append,owner}', '') = ''
+                OR (
+                  COALESCE(disk_source #>> '{directory_append,heartbeat_at}', '0')::float < :stale
+                  AND updated_at < NOW() - INTERVAL '3 minutes'
+                )
+              )
+            RETURNING id""",
+        {"id": job_id, "payload": payload, "stale": time.time() - _LOCK_STALE_SEC},
+    )
+    db.commit()
+    return row is not None
+
+
+def directory_copy_is_live(row: dict | None, *, now: float | None = None) -> bool:
+    """True while the directory copy is still moving.
+
+    The filesystem walk holds the interpreter inside native code, so a thread
+    heartbeat can go quiet without the copy having stopped. A recent job update
+    from the packer is enough to keep a second walk from starting.
+    """
+    if not isinstance(row, dict):
+        return False
+    clock = time.time() if now is None else float(now)
+    source = row.get("disk_source") or {}
+    if isinstance(source, str):
+        try:
+            source = json.loads(source)
+        except (TypeError, ValueError):
+            source = {}
+    append = source.get("directory_append") if isinstance(source, dict) else None
+    if isinstance(append, dict):
+        try:
+            heartbeat = float(append.get("heartbeat_at") or 0)
+        except (TypeError, ValueError):
+            heartbeat = 0.0
+        if heartbeat and clock - heartbeat < _LOCK_STALE_SEC:
+            return True
+    updated = row.get("updated_at")
+    if updated is None:
+        return False
+    if isinstance(updated, str):
+        try:
+            from datetime import datetime
+            updated = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+    if hasattr(updated, "timestamp"):
+        try:
+            return clock - float(updated.timestamp()) < _LOCK_STALE_SEC
+        except (TypeError, ValueError, OSError):
+            return False
+    return False
+
+
+def directory_extract_gate(db, job_id: str, schema_name: str) -> dict | None:
+    """Keep a later-stage worker from opening an image the disk worker owns.
+
+    Phase 3 runs on the parse pool. Opening the next disk image there started
+    one walk on every parse process, and the pool was then killed. The disk
+    worker is the only place that walk runs.
+    """
+    from app.db.sql_helpers import fetchone
+
+    reason = unfinished_directory_reason(db, job_id)
+    if reason is None:
+        return None
+    if reason.startswith("Waiting for every evidence directory"):
+        return {"status": "waiting", "reason": reason}
+    row = fetchone(db, "SELECT * FROM jobs WHERE id=:id", {"id": job_id}) or {}
+    if directory_copy_is_live(row):
+        return {"status": "busy", "reason": "The next evidence directory is already being extracted"}
+    source = row.get("disk_source") or {}
+    if isinstance(source, str):
+        try:
+            source = json.loads(source)
+        except (TypeError, ValueError):
+            source = {}
+    if not isinstance(source, dict):
+        source = {}
+    try:
+        queued_at = float(source.get("directory_append_queued_at") or 0)
+    except (TypeError, ValueError):
+        queued_at = 0.0
+    if time.time() - queued_at < _LOCK_STALE_SEC:
+        return {"status": "busy", "reason": "The next evidence directory is already queued on the disk worker"}
+    from app.db.sql_helpers import execute
+
+    execute(
+        db,
+        """UPDATE jobs
+              SET disk_source = jsonb_set(
+                    COALESCE(disk_source, '{}'::jsonb),
+                    '{directory_append_queued_at}',
+                    CAST(:payload AS jsonb),
+                    true
+                  )
+            WHERE id = :id""",
+        {"id": job_id, "payload": json.dumps(time.time())},
+    )
+    db.commit()
+    from app.tasks import append_evidence_directory_task
+
+    append_evidence_directory_task.delay(schema_name, job_id)
+    return {"status": "waiting", "reason": reason}
+
+
+def _heartbeat(schema_name: str, job_id: str, owner: str, stop: threading.Event) -> None:
+    from app.db.session import firm_session
+    from app.db.sql_helpers import execute
+
+    while not stop.wait(20):
+        payload = json.dumps({"owner": owner, "heartbeat_at": time.time()})
+        try:
+            with firm_session(schema_name) as db:
+                execute(
+                    db,
+                    """UPDATE jobs
+                          SET disk_source = jsonb_set(
+                                COALESCE(disk_source, '{}'::jsonb),
+                                '{directory_append}',
+                                CAST(:payload AS jsonb),
+                                true
+                              ),
+                              updated_at = NOW()
+                        WHERE id = :id
+                          AND disk_source #>> '{directory_append,owner}' = :owner""",
+                    {"id": job_id, "payload": payload, "owner": owner},
+                )
+                db.commit()
+        except Exception:
+            log.debug("directory append heartbeat failed job=%s", job_id, exc_info=True)
+
+
+def _release_append(db, job_id: str, owner: str) -> None:
+    from app.db.sql_helpers import execute
+
+    execute(
+        db,
+        """UPDATE jobs
+              SET disk_source = COALESCE(disk_source, '{}'::jsonb) - 'directory_append',
+                  updated_at = NOW()
+            WHERE id = :id
+              AND disk_source #>> '{directory_append,owner}' = :owner""",
+        {"id": job_id, "owner": owner},
+    )
+    db.commit()
+
+
+def extract_pending_directories(db, job_id: str, *, schema_name: str) -> dict[str, Any]:
+    """Save every evidence directory that was not part of the published extract.
+
+    The caller runs this after one directory's extraction is saved and before
+    the next pipeline stage. A second caller waits; it does not open the image.
+    """
+    from app.db.sql_helpers import fetchone
+    from app.services.disk_build_log import write_disk_log
+
+    reason = unfinished_directory_reason(db, job_id)
+    if reason is None:
+        return {"status": "none"}
+    if reason.startswith("Waiting for every evidence directory"):
+        write_disk_log(db, job_id, reason, stage="extract", level="warning")
+        db.commit()
+        return {"status": "waiting", "reason": reason}
+
+    owner = uuid.uuid4().hex
+    if not _claim_append(db, job_id, owner):
+        return {"status": "busy", "reason": "The next evidence directory is already being extracted"}
+
+    stop = threading.Event()
+    beater = threading.Thread(
+        target=_heartbeat,
+        args=(schema_name, job_id, owner, stop),
+        name=f"dir-append-{job_id[:8]}",
+        daemon=True,
+    )
+    beater.start()
+    # A native filesystem walk can hold the interpreter long enough that the
+    # thread above never gets to write. This process has its own interpreter,
+    # so a quiet walk is not treated as a dead one and started again.
+    import subprocess
+    import sys
+
+    heartbeat_proc = None
+    try:
+        heartbeat_proc = subprocess.Popen(
+            [sys.executable, "-m", "app.services.directory_append_heartbeat", schema_name, job_id, owner],
+            start_new_session=True,
+        )
+    except Exception:
+        log.exception("directory append heartbeat process did not start job=%s", job_id)
+    extracted: list[str] = []
+    try:
+        while True:
+            row = fetchone(db, "SELECT * FROM jobs WHERE id=:id", {"id": job_id}) or {}
+            manifest = _manifest_from_row(row)
+            from app.db.sql_helpers import fetchall
+
+            files = fetchall(
+                db,
+                "SELECT * FROM evidence_files WHERE job_id=:job_id ORDER BY original_name",
+                {"job_id": job_id},
+            )
+            from app.services.virtual_disk import list_image_directories
+
+            registered = list_image_directories(files, preferred_directories=list(manifest.get("evidence_folders") or []))
+            pending = pending_directories(
+                files,
+                list(manifest.get("segment_paths") or []),
+                directories=list(manifest.get("evidence_folders") or []),
+            )
+            if not pending:
+                break
+            group = pending[0]
+            position = len(registered) - len(pending) + 1
+            from app.services.disk import segment_readiness
+            selected_paths = {str(path).casefold() for path in group["paths"]}
+            group_files = [
+                item for item in files
+                if str(item.get("host_path") or "").casefold() in selected_paths
+            ]
+            readiness = segment_readiness(group_files)
+            if not readiness["ready"]:
+                reason = (
+                    f"Directory {position} of {len(registered)} ({group['directory']}) is not ready: "
+                    f"{readiness.get('message') or 'missing image segments'}"
+                )
+                write_disk_log(db, job_id, reason, stage="extract", level="warning",
+                               metadata={"directory": group["directory"], "readiness": readiness})
+                db.commit()
+                return {"status": "waiting", "reason": reason}
+            write_disk_log(
+                db,
+                job_id,
+                f"Directory {position} of {len(registered)}: previous extraction is saved. "
+                f"Switching to source directory: {group['directory']} "
+                f"({len(group['paths'])} segment file(s), namespace={group['namespace']}).",
+                stage="extract",
+                metadata={"directory": group["directory"], "namespace": group["namespace"],
+                          "directory_index": position, "directories": len(registered),
+                          "segments": len(group["paths"])},
+            )
+            db.commit()
+            manifest = _extract_one_directory(
+                db,
+                job_id,
+                schema_name=schema_name,
+                manifest=manifest,
+                group=group,
+                position=position,
+                total=len(registered),
+            )
+            extracted.append(group["label"])
+            write_disk_log(
+                db, job_id,
+                f"Directory {position} of {len(registered)} saved: {group['directory']}. "
+                f"Combined index now contains {int(manifest.get('files_extracted') or 0):,} files "
+                f"({int(manifest.get('bytes_extracted') or 0):,} bytes).",
+                stage="extract",
+                metadata={"directory": group["directory"], "namespace": group["namespace"],
+                          "directory_index": position, "directories": len(registered),
+                          "files_combined": int(manifest.get("files_extracted") or 0)},
+            )
+            db.commit()
+            if position == len(registered):
+                write_disk_log(
+                    db,
+                    job_id,
+                    f"Combined {len(registered)} images. Extraction of every image is saved. "
+                    "Filtering and the later stages now run once on the combined file list.",
+                    stage="extract",
+                    metadata={"directories": [item["label"] for item in registered]},
+                )
+                db.commit()
+        from app.services.pipeline_progress import write_merged_pipeline_progress
+
+        write_merged_pipeline_progress(
+            db,
+            job_id,
+            {
+                "extraction_activity": {
+                    "next_directory": False,
+                    "subphase": "finalizing",
+                },
+            },
+            writer="extract",
+        )
+        db.commit()
+        try:
+            if not extracted:
+                latest = fetchone(db, "SELECT * FROM jobs WHERE id=:id", {"id": job_id}) or {}
+                source = _manifest_from_row(latest)
+                if source.get("directory_materialize_pending"):
+                    extracted = [
+                        str(item.get("label") or item.get("directory") or "source")
+                        for item in (source.get("directory_stats") or [])
+                        if isinstance(item, dict)
+                    ]
+            _register_appended_files(db, job_id, extracted)
+        except Exception:
+            log.exception("appended directory files were not registered job=%s", job_id)
+            raise  # Never run OCR/RAG on only part of the intended source set.
+        from app.db.sql_helpers import execute
+        execute(
+            db,
+            "UPDATE jobs SET progress_pct=100, updated_at=NOW() WHERE id=:jid",
+            {"jid": job_id},
+        )
+        write_disk_log(
+            db, job_id,
+            "All evidence directories saved and registered. Starting shared parse, OCR, "
+            "artifact inventory, RAG, graph, and validation on the combined index.",
+            stage="extract", metadata={"appended_directories": extracted},
+        )
+        db.commit()
+        return {"status": "extracted", "directories": extracted}
+    except Exception as exc:
+        from app.services.job_control import JobStopRequested
+
+        if isinstance(exc, JobStopRequested):
+            raise
+        log.exception("next evidence directory failed job=%s", job_id)
+        raise
+    finally:
+        stop.set()
+        beater.join(timeout=2)
+        if heartbeat_proc is not None and heartbeat_proc.poll() is None:
+            heartbeat_proc.terminate()
+        try:
+            _release_append(db, job_id, owner)
+        except Exception:
+            log.exception("could not release directory append lock job=%s", job_id)
+
+
+def _register_appended_files(db, job_id: str, extracted: list[str]) -> None:
+    """Register files from a directory that was saved after materialize already ran.
+
+    The running parse keeps going. New files are pending, so that parse — or the
+    next one if it already finished — includes them.
+    """
+    if not extracted:
+        return
+    from app.db.sql_helpers import execute
+    from app.services.artifact_materialize import rematerialize_missing_from_index
+    from app.services.disk_build_log import write_disk_log
+
+    filled = rematerialize_missing_from_index(db, job_id, update_status=False)
+    added = int(filled.get("added") or 0)
+    write_disk_log(
+        db,
+        job_id,
+        f"Registered {added:,} file(s) from {', '.join(extracted)} onto the disk job.",
+        stage="materialize",
+        metadata={"added": added, "directories": extracted},
+    )
+    # V1.10.3: reopen parse also when it is waiting or failed after its stage
+    # process was cancelled, and reopen every finished stage after parse, so the
+    # new directory's files also go through recovery, OCR, inventory, RAG chunking,
+    # enrichment, graph and validation. Parse resumes from parse_status rows.
+    execute(
+        db,
+        """UPDATE pipeline_stage_runs
+              SET status='waiting', task_id=NULL, completed_at=NULL, error=NULL,
+                  cancel_requested_at=NULL, recovery_dispatches=0, updated_at=NOW()
+            WHERE job_id=:jid AND stage='parse'
+              AND (status IN ('done','skipped')
+                   OR (status IN ('failed','waiting')
+                       AND (lower(COALESCE(error,'')) LIKE '%progressagent%'
+                            OR lower(COALESCE(error,'')) LIKE '%stage process%')))""",
+        {"jid": job_id},
+    )
+    execute(
+        db,
+        """UPDATE pipeline_stage_runs
+              SET status='pending', task_id=NULL, completed_at=NULL, updated_at=NOW()
+            WHERE job_id=:jid AND status IN ('done','skipped')
+              AND sequence_no > (SELECT sequence_no FROM pipeline_stage_runs
+                                  WHERE job_id=:jid AND stage='parse')""",
+        {"jid": job_id},
+    )
+    execute(
+        db,
+        """UPDATE jobs SET status='indexing', updated_at=NOW()
+            WHERE id=:jid AND status IN ('ready','report_ready','parsed','indexed')""",
+        {"jid": job_id},
+    )
+    execute(
+        db,
+        """UPDATE jobs SET disk_source = COALESCE(disk_source, '{}'::jsonb)
+                   - 'directory_materialize_pending', updated_at=NOW()
+            WHERE id=:jid""",
+        {"jid": job_id},
+    )
+    db.commit()
+
+
+def combine_saved_directory_counts(activity: dict | None, *, saved_files: int) -> dict | None:
+    """Add a saved image back onto a follow-up image that started its counter at zero.
+
+    The second image's packer publishes only its own files. The card then shows
+    a few thousand of the old total and looks stuck, while the first image's
+    files are still saved.
+    """
+    if not isinstance(activity, dict) or not activity.get("next_directory"):
+        return None
+    saved = int(saved_files or 0)
+    if saved <= 0:
+        return None
+    packed = int(activity.get("files_packed") or activity.get("files_extracted") or 0)
+    uploaded = int(activity.get("files_uploaded") or 0)
+    if packed >= saved or uploaded >= saved:
+        return None
+    live_total = int(activity.get("files_total") or 0)
+    shown = saved + max(packed, uploaded)
+    combined = dict(activity)
+    combined["files_uploaded"] = shown
+    combined["files_packed"] = shown
+    combined["files_extracted"] = shown
+    if live_total:
+        combined["files_total"] = saved + live_total
+    return combined
+
+
+def directory_shard_count(node_count: int, configured: int = 12) -> int:
+    """How many copy pieces one directory uses.
+
+    A single piece of a hundred thousand files builds a tar large enough for
+    the kernel to kill the worker. The task then starts the directory again.
+    """
+    count = int(node_count or 0)
+    if count < 2:
+        return 1
+    configured = max(int(configured or 1), 1)
+    by_size = max(1, (count + 19_999) // 20_000)
+    return min(count, 32, max(configured, by_size))
+
+
+def followup_activity_for_card(job: dict) -> dict | None:
+    """Keep the extract card in progress while another directory is still copying.
+
+    The first directory publishes a manifest as soon as it is saved. The card
+    treats that manifest as a finished extraction unless this copy is marked
+    as the next directory. A follow-up counter that started at zero also gets
+    the saved files added back.
+    """
+    progress = job.get("pipeline_progress") if isinstance(job.get("pipeline_progress"), dict) else {}
+    activity = progress.get("extraction_activity") if isinstance(progress.get("extraction_activity"), dict) else None
+    if activity is None:
+        return None
+    source = job.get("disk_source") if isinstance(job.get("disk_source"), dict) else {}
+    shown = dict(activity)
+    if _saved_manifest_still_copying(job, shown):
+        shown["next_directory"] = True
+    combined = combine_saved_directory_counts(
+        shown, saved_files=int(source.get("files_extracted") or 0),
+    )
+    if combined is not None:
+        return combined
+    if shown.get("next_directory") and not activity.get("next_directory"):
+        return shown
+    return None
+
+
+def _saved_manifest_still_copying(job: dict, activity: dict) -> bool:
+    if str(activity.get("subphase") or "") != "copying":
+        return False
+    if not str(job.get("extracted_disk_uri") or "").strip():
+        return False
+    planned = int(activity.get("files_total") or job.get("files_total") or 0)
+    live = max(
+        int(activity.get("files_packed") or 0),
+        int(activity.get("files_extracted") or 0),
+        int(activity.get("files_uploaded") or 0),
+        int(job.get("files_extracted") or 0),
+    )
+    return planned > 0 and live < planned
+
+
+def _directory_plan(db, job_id: str, namespace: str) -> dict | None:
+    from app.db.sql_helpers import fetchone
+
+    row = fetchone(db, "SELECT disk_source FROM jobs WHERE id=:id", {"id": job_id}) or {}
+    source = row.get("disk_source") or {}
+    if isinstance(source, str):
+        try:
+            source = json.loads(source)
+        except (TypeError, ValueError):
+            source = {}
+    plans = source.get("directory_plans") if isinstance(source, dict) else None
+    plan = plans.get(namespace) if isinstance(plans, dict) else None
+    if isinstance(plan, str):
+        plan = {"uri": plan}
+    if not isinstance(plan, dict) or not str(plan.get("uri") or "").strip():
+        return None
+    return plan
+
+
+def _store_directory_plan(
+    db, job_id: str, namespace: str, nodes: list[dict], *, enumerated: int, filtered_out: int,
+) -> str:
+    from app.db.sql_helpers import execute
+    from app.services.disk_manifest import upload_named_nodes
+
+    uri = upload_named_nodes(job_id, namespace, nodes)
+    record = {
+        "uri": uri,
+        "files": len(nodes),
+        "enumerated": int(enumerated),
+        "filtered_out": int(filtered_out),
+    }
+    execute(
+        db,
+        """UPDATE jobs
+              SET disk_source = jsonb_set(
+                    COALESCE(disk_source, '{}'::jsonb),
+                    '{directory_plans}',
+                    COALESCE(disk_source->'directory_plans', '{}'::jsonb) || CAST(:patch AS jsonb),
+                    true
+                  ),
+                  updated_at = NOW()
+            WHERE id = :id""",
+        {"id": job_id, "patch": json.dumps({namespace: record})},
+    )
+    db.commit()
+    return uri
+
+
+def _extract_one_directory(
+    db,
+    job_id: str,
+    *,
+    schema_name: str,
+    manifest: dict,
+    group: dict,
+    position: int,
+    total: int,
+) -> dict:
+    from app.config import get_settings
+    from app.services.disk_build_log import write_disk_log
+    from app.services.extracted_disk import (
+        _ExtractionProgress,
+        _ProgressFlusher,
+        _enumerate_mounted_image,
+        _filter_nodes,
+        _shard_nodes,
+    )
+    from app.services.extract_shard_v45 import shard_worker_v45
+    from app.services.os_detect import detect_os_from_paths
+    from app.services.disk_manifest import disk_prefix
+    from app.services.pipeline_progress import write_merged_pipeline_progress
+    from app.services.virtual_disk import open_virtual_disk_from_paths
+    import zstandard as zstd
+
+    settings = get_settings()
+    mode = str(manifest.get("extract_mode") or settings.extract_mode or "forensic").strip().lower()
+    prior_files = int(manifest.get("files_extracted") or 0)
+    prior_bytes = int(manifest.get("bytes_extracted") or 0)
+    prior_skipped = int(manifest.get("files_skipped") or 0)
+    if prior_files <= 0:
+        from app.services.job_control import load_extraction_checkpoint
+
+        saved = load_extraction_checkpoint(db, job_id) or {}
+        prior_files = int(saved.get("files_extracted") or 0)
+        prior_bytes = int(saved.get("bytes_extracted") or prior_bytes)
+
+    one = None
+    try:
+        one = open_virtual_disk_from_paths(
+            job_id,
+            list(group["paths"]),
+            hashes=list(group["hashes"]),
+            base_name=group["label"],
+            combine_image_sets=False,
+        )
+        if one._fs_info is None or one.mode not in {"ewf", "raw"}:
+            one.close()
+            one = None
+            raise RuntimeError(
+                f"Could not mount {group['label']}. Its segment files were not used as extracted files."
+            )
+        label = str(group["label"])
+        namespace = str(group["namespace"])
+        plan = _directory_plan(db, job_id, namespace)
+        nodes: list[dict] = []
+        filter_stats: dict = {"filtered_out": 0}
+        if plan is not None:
+            from app.services.disk_manifest import load_extract_nodes
+
+            try:
+                nodes = load_extract_nodes(str(plan["uri"]))
+            except Exception:
+                log.exception("saved directory plan could not be read job=%s", job_id)
+                nodes = []
+            if nodes:
+                filter_stats = {
+                    "filtered_out": int(plan.get("filtered_out") or 0),
+                    "resumed": True,
+                }
+                write_disk_log(
+                    db,
+                    job_id,
+                    f"Directory {position} of {total} is continuing from its saved file plan "
+                    f"({len(nodes):,} files from {label}). The filesystem is not walked again.",
+                    stage="extract",
+                    metadata={"directory": group["directory"], "files_kept": len(nodes), "resumed": True},
+                )
+                db.commit()
+        if not nodes:
+            enumerated = _enumerate_mounted_image(
+                one,
+                on_progress=lambda message, metadata=None: None,
+                schema_name=schema_name,
+            )
+            if not enumerated:
+                raise RuntimeError(
+                    f"Directory {position} of {total} ({group['directory']}) mounted but returned "
+                    "no filesystem entries. Evidence was not marked processed."
+                )
+            # Separate images may belong to different operating systems. Determine
+            # filtering rules from this source, not the first source's OS.
+            os_info = detect_os_from_paths(enumerated)
+            nodes, filter_stats = _filter_nodes(enumerated, settings, os_info=os_info, mode_override=mode)
+            enumerated_count = len(enumerated)
+            for node in nodes:
+                rel = str(node.get("path") or "").replace("\\", "/").lstrip("/")
+                node["source_path"] = rel
+                node["path"] = f"{namespace}/{rel}" if rel else namespace
+            del enumerated
+            import gc
+            gc.collect()
+            write_disk_log(
+                db,
+                job_id,
+                f"Directory {position} of {total} listed {enumerated_count:,} files from {label}. "
+                f"The same filter kept {len(nodes):,} "
+                f"({int(filter_stats.get('filtered_out') or 0):,} pre-filtered).",
+                stage="extract",
+                metadata={
+                    "directory": group["directory"],
+                    "files_enumerated": enumerated_count,
+                    "files_kept": len(nodes),
+                    "pre_filtered": int(filter_stats.get("filtered_out") or 0),
+                },
+            )
+            db.commit()
+            if nodes:
+                try:
+                    _store_directory_plan(
+                        db,
+                        job_id,
+                        namespace,
+                        nodes,
+                        enumerated=enumerated_count,
+                        filtered_out=int(filter_stats.get("filtered_out") or 0),
+                    )
+                    write_disk_log(
+                        db,
+                        job_id,
+                        f"Directory {position} of {total} file plan is saved ({len(nodes):,} files). "
+                        "A restarted worker continues this copy and does not walk the disk again.",
+                        stage="extract",
+                        metadata={"directory": group["directory"], "files_kept": len(nodes)},
+                    )
+                    db.commit()
+                except Exception:
+                    log.exception("directory file plan was not saved job=%s", job_id)
+        if not nodes:
+            return _publish_directory(
+                db,
+                job_id,
+                manifest=manifest,
+                group=group,
+                new_entries=[],
+                parts_map={},
+                files_added=0,
+                bytes_added=0,
+                skipped_added=int(filter_stats.get("filtered_out") or 0),
+                filter_stats=filter_stats,
+            )
+
+        worker_count = directory_shard_count(len(nodes), int(settings.extract_shard_count or 12))
+        local_shards = _shard_nodes(nodes, worker_count, strategy="byte_range_v53")
+        occupied = [int(key) for key in (manifest.get("parts_map") or {})]
+        if not occupied and manifest.get("parts"):
+            occupied = list(range(len(manifest.get("parts") or [])))
+        base = (max(occupied) + 1) if occupied else 0
+        planned_bytes = prior_bytes + sum(int(node.get("size_bytes") or 0) for node in nodes)
+        progress = _ExtractionProgress(
+            prior_files + len(nodes),
+            progress_step=settings.extract_progress_step,
+            initial_extracted=prior_files,
+            initial_bytes=prior_bytes,
+            pre_filtered=prior_skipped + int(filter_stats.get("filtered_out") or 0),
+        )
+        write_merged_pipeline_progress(
+            db,
+            job_id,
+            {
+                "phase": "extract",
+                "completed": prior_files,
+                "total": prior_files + len(nodes),
+                "label": f"Extracting directory {position} of {total}: {label}",
+                "extraction_activity": {
+                    "subphase": "copying",
+                    "next_directory": True,
+                    "label": f"Extracting directory {position} of {total}: {label}",
+                    "files_extracted": prior_files,
+                    "files_packed": prior_files,
+                    "files_uploaded": prior_files,
+                    "files_total": prior_files + len(nodes),
+                    "directory_index": position,
+                    "directories": total,
+                    "directory_label": label,
+                    "directory_namespace": namespace,
+                    "source_directory": group["directory"],
+                },
+            },
+            writer="extract",
+            # V1.10.3: never pull a job whose later stages are running back to
+            # 'processing'; the next directory is extracted beside them.
+            extra_sets=("status=CASE WHEN status IN ('indexing','parsed','ready','report_ready','completed','paused') "
+                        "THEN status ELSE 'processing' END, files_total=:ft"),
+            extra_params={"ft": prior_files + len(nodes)},
+        )
+        db.commit()
+        flusher = _ProgressFlusher(
+            schema_name,
+            job_id,
+            progress,
+            shard_count=worker_count,
+            total_bytes=planned_bytes,
+        )
+        flusher.start()
+        part_prefix = f"{disk_prefix(job_id)}/directories/{position:02d}"
+        new_entries: list[dict] = []
+        parts_map: dict[str, str] = {}
+        files_added = 0
+        bytes_added = 0
+        try:
+            for local_id in sorted(local_shards):
+                shard_nodes = local_shards[local_id]
+                if not shard_nodes:
+                    continue
+                shard_id = base + int(local_id)
+                result = shard_worker_v45(
+                    {
+                        "schema_name": schema_name,
+                        "job_id": job_id,
+                        "shard_id": shard_id,
+                        "nodes": shard_nodes,
+                        "zstd_level": settings.extract_zstd_level,
+                        "shard_count": base + worker_count,
+                        "hash_files": settings.extract_hash_files,
+                        "stop_check_interval": settings.extract_stop_check_interval,
+                        "tar_bufsize": getattr(settings, "extract_tar_bufsize", 262_144),
+                        "part_prefix": part_prefix,
+                    },
+                    progress,
+                    flusher,
+                    None,
+                    shared_vd=one,
+                    event_bus=flusher.event_bus,
+                )
+                if result.get("part_uri"):
+                    parts_map[str(shard_id)] = result["part_uri"]
+                new_entries.extend(result.get("index_entries") or [])
+                files_added += int(result.get("files_extracted") or 0)
+                bytes_added += int(result.get("bytes_extracted") or 0)
+                progress.mark_shard_committed(
+                    int(result.get("files_extracted") or 0),
+                    int(result.get("bytes_extracted") or 0),
+                )
+                flusher.mark_dirty()
+        finally:
+            flusher.stop(flush=True)
+        return _publish_directory(
+            db,
+            job_id,
+            manifest=manifest,
+            group=group,
+            new_entries=new_entries,
+            parts_map=parts_map,
+            files_added=files_added,
+            bytes_added=bytes_added,
+            skipped_added=int(filter_stats.get("filtered_out") or 0),
+            filter_stats=filter_stats,
+            compressor=zstd.ZstdCompressor(level=settings.extract_zstd_level),
+        )
+    finally:
+        if one is not None:
+            one.close()
+
+
+def _publish_directory(
+    db,
+    job_id: str,
+    *,
+    manifest: dict,
+    group: dict,
+    new_entries: list[dict],
+    parts_map: dict[str, str],
+    files_added: int,
+    bytes_added: int,
+    skipped_added: int,
+    filter_stats: dict,
+    compressor=None,
+) -> dict:
+    from app.db.sql_helpers import execute, fetchone
+    from app.services.disk_manifest import disk_prefix, load_index_entries
+    from app.services.storage import put_bytes
+
+    published = dict(manifest)
+    live_row = fetchone(db, "SELECT disk_source FROM jobs WHERE id=:id", {"id": job_id}) or {}
+    live = live_row.get("disk_source") or {}
+    if isinstance(live, str):
+        try:
+            live = json.loads(live)
+        except (TypeError, ValueError):
+            live = {}
+    if isinstance(live, dict):
+        if live.get("directory_append"):
+            published["directory_append"] = live["directory_append"]
+        if live.get("evidence_folders") and "evidence_folders" not in published:
+            published["evidence_folders"] = live["evidence_folders"]
+        # The saved manifest is an older snapshot. Keep the disk identity from
+        # the live row so publishing the next directory cannot mark a disk job
+        # as Android or iOS.
+        for key in ("source_type", "format", "mode", "evidence_platform", "axiom_platform", "detected_os"):
+            if key in live:
+                published[key] = live[key]
+        for key in ("mobile_os", "owner_agent", "owner_agent_label", "os_selection_source", "os_mismatch_warning"):
+            if key not in live:
+                published.pop(key, None)
+    existing_entries = load_index_entries(published) if published.get("index_uri") or published.get("shard_indexes") else []
+    seen: set[tuple] = set()
+    combined: list[dict] = []
+    for entry in list(existing_entries) + list(new_entries):
+        key = (str(entry.get("path") or ""), int(entry.get("part_id") or 0), int(entry.get("offset") or 0))
+        if key in seen:
+            continue
+        seen.add(key)
+        combined.append(entry)
+    if compressor is None:
+        import zstandard as zstd
+
+        compressor = zstd.ZstdCompressor(level=1)
+    index_lines = "\n".join(json.dumps(entry, separators=(",", ":")) for entry in combined).encode("utf-8")
+    # Never overwrite an index that the last COMMITTED manifest points to.
+    # A crash between object upload and PostgreSQL commit can otherwise change
+    # the evidence contents of a previously published snapshot.
+    generation = len(published.get("extracted_directories") or []) + 1
+    index_key = (
+        f"{disk_prefix(job_id)}/indexes/combined-{generation:03d}-"
+        f"{group['namespace']}.jsonl.zst"
+    )
+    index_uri = put_bytes(index_key, compressor.compress(index_lines), content_type="application/zstd")
+
+    merged_parts = {str(key): value for key, value in (published.get("parts_map") or {}).items() if value}
+    merged_parts.update({str(key): value for key, value in parts_map.items() if value})
+    ordered_ids = sorted((int(key) for key in merged_parts), key=int)
+    # Keep every previously stored part id. A follow-up directory starts above them.
+    parts = [merged_parts[str(part_id)] for part_id in ordered_ids]
+    files_total = int(published.get("files_extracted") or 0) + int(files_added)
+    bytes_total = int(published.get("bytes_extracted") or 0) + int(bytes_added)
+    skipped = int(published.get("files_skipped") or 0) + int(skipped_added)
+    directory_stats = [
+        item for item in (published.get("directory_stats") or [])
+        if isinstance(item, dict) and directory_key(str(item.get("directory") or "")) != directory_key(group["directory"])
+    ]
+    directory_stats.append(
+        {
+            "directory": group["directory"],
+            "label": group.get("label") or "",
+            "namespace": group.get("namespace") or "",
+            "files": int(files_added),
+            "bytes": int(bytes_added),
+            "skipped": int(skipped_added),
+            "detected_os": filter_stats.get("detected_os") or {"family": "unknown"},
+        }
+    )
+    published.update(
+        {
+            "segment_paths": list(published.get("segment_paths") or []) + list(group["paths"]),
+            "segment_hashes": list(published.get("segment_hashes") or []) + list(group["hashes"]),
+            "files_total": files_total,
+            "files_extracted": files_total,
+            "files_skipped": skipped,
+            "bytes_extracted": bytes_total,
+            "parts_map": merged_parts,
+            "parts": parts,
+            "index_uri": index_uri,
+            "extracted_directories": list(published.get("extracted_directories") or []) + [group["directory"]],
+            "directory_stats": directory_stats,
+            "directory_materialize_pending": True,
+            "filter_stats": {**(published.get("filter_stats") or {}), "next_directory": filter_stats},
+        }
+    )
+    # Publish immutable snapshots. A failed DB update must not retroactively
+    # change the data visible through the previously committed manifest URI.
+    manifest_key = (
+        f"{disk_prefix(job_id)}/manifests/combined-{generation:03d}-"
+        f"{group['namespace']}.json"
+    )
+    manifest_uri = put_bytes(manifest_key, json.dumps(published, indent=2).encode(), "application/json")
+    execute(
+        db,
+        """UPDATE jobs
+              SET extracted_disk_uri=:uri,
+                  disk_source=CAST(:ds AS jsonb),
+                  files_total=:total,
+                  files_extracted=:extracted,
+                  bytes_extracted=:bytes,
+                  status=CASE
+                    WHEN status IN ('indexing','parsed','ready','report_ready','completed') THEN status
+                    ELSE 'processing'
+                  END,
+                  error=NULL,
+                  updated_at=NOW()
+            WHERE id=:job_id""",
+        {
+            "uri": manifest_uri,
+            "ds": json.dumps(published),
+            "total": files_total,
+            "extracted": files_total,
+            "bytes": bytes_total,
+            "job_id": job_id,
+        },
+    )
+    db.commit()
+    return published
