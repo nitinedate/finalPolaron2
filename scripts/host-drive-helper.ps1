@@ -269,7 +269,7 @@ $script:HelperComputerName = [string]$env:COMPUTERNAME
 # the same case root server-side collections use. HOST_IMPORT_CASE_ROOT overrides it.
 $script:ImportCasesRootOverride = [string]$env:HOST_IMPORT_CASE_ROOT
 $script:ImportCasesRoot = $(if ($script:ImportCasesRootOverride) { $script:ImportCasesRootOverride } else { Join-Path $root "evidence\cases" })
-$script:HelperVersion = "5.59"  # 5.59 C# taskkill fallbacks keep `$_ (stop USB collection works); 5.58 client mobile imaging: /acquisition/import/* server copy + computer_name in /health; 5.57 ADB-only phones detected
+$script:HelperVersion = "5.60"  # 5.60 do not kill pnputil or re-enumerate USB during a phone copy; 5.59 C# taskkill fallbacks keep `$_ (stop USB collection works)
 $script:DeviceCacheAt = [datetime]::MinValue
 $script:DeviceCache = @()
 $script:DeviceScanBusy = $false
