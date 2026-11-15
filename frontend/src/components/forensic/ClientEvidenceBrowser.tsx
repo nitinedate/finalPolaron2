@@ -158,8 +158,8 @@ export function ClientAgentSetup({
           </p>
           <p className="mt-1 text-amber-900">
             {unpaired
-              ? `The agent is running on this computer but does not accept requests from ${origin}. Run the installer again to add this console.`
-              : "The agent lets the forensic server read the folder you select here. Files are opened read-only and stay on this computer; the server reads them over the network and makes no copy of the image."}
+              ? `Directories stay hidden because the agent is running but does not accept requests from ${origin}. Run the installer again to add this console.`
+              : "Directories stay hidden because nothing is answering at 127.0.0.1:9877. The agent lets the forensic server read the folder you select here. Files are opened read-only and stay on this computer; the server reads them over the network and makes no copy of the image. A failed check is remembered and is not raised as an error."}
           </p>
         </div>
       </div>
@@ -239,19 +239,31 @@ export function ClientEvidenceBrowser({
   const [status, setStatus] = useState<ClientAgentStatus | null>(null);
   const [checking, setChecking] = useState(false);
   const [drives, setDrives] = useState<ClientDriveVolume[]>([]);
+  const [arrived, setArrived] = useState<string[]>([]);
   const [listing, setListing] = useState<ClientDirListing | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const seq = useRef(0);
+  const driveKey = useRef("");
 
   const check = useCallback(async (quiet = false) => {
     if (!quiet) setChecking(true);
     try {
-      const next = await clientAgentStatus(2000);
+      const next = await clientAgentStatus(2000, { force: !quiet });
       setStatus(next);
       if (next.state === "online") {
         try {
-          setDrives((await listClientDrives()).sort(driveSort));
+          const nextDrives = (await listClientDrives()).sort(driveSort);
+          const key = nextDrives.map((d) => `${d.letter}|${d.ready ? 1 : 0}|${d.label || ""}`).join(",");
+          const before = new Set(driveKey.current ? driveKey.current.split(",").map((row) => row.split("|")[0]) : []);
+          if (key !== driveKey.current) {
+            if (before.size) {
+              const added = nextDrives.map((d) => d.letter.toUpperCase()).filter((letter) => !before.has(letter));
+              if (added.length) setArrived(added);
+            }
+            driveKey.current = key;
+            setDrives(nextDrives);
+          }
           setError(null);
         } catch (e) {
           setError(e instanceof Error ? e.message : "Could not list this computer's drives.");
@@ -267,11 +279,25 @@ export function ClientEvidenceBrowser({
   }, [check]);
 
   // Connect on its own once the examiner finishes installing the agent.
+  // Quiet checks reuse the offline backoff, so a down agent is not probed every tick.
   useEffect(() => {
     if (status?.state === "online") return;
     const id = window.setInterval(() => void check(true), 5000);
     return () => window.clearInterval(id);
   }, [status?.state, check]);
+
+  // Same idea as server drive changes: a disk attached while this window is open shows up on its own.
+  useEffect(() => {
+    if (status?.state !== "online") return;
+    const id = window.setInterval(() => void check(true), 8000);
+    return () => window.clearInterval(id);
+  }, [status?.state, check]);
+
+  useEffect(() => {
+    if (!arrived.length) return;
+    const timer = window.setTimeout(() => setArrived([]), 15_000);
+    return () => window.clearTimeout(timer);
+  }, [arrived]);
 
   const openPath = useCallback(async (path: string) => {
     const mine = ++seq.current;
@@ -296,6 +322,13 @@ export function ClientEvidenceBrowser({
 
   const health = status.health;
   const dirs = (listing?.entries || []).filter((e) => e.kind === "dir" && !HIDDEN_CLIENT_DIR_RE.test(e.name));
+  const unseen = [
+    ...(listing?.entries || [])
+      .filter((e) => e.kind === "dir" && HIDDEN_CLIENT_DIR_RE.test(e.name))
+      .map((e) => ({ name: e.name, detail: "System folder. Left out the same way a disk that is not ready is left out of the usable list." })),
+    ...(listing?.omitted || []).map((e) => ({ name: e.name, detail: e.detail || "Windows could not open this directory." })),
+  ];
+  const notReady = drives.filter((d) => !d.ready);
   const files = (listing?.entries || []).filter((e) => e.kind === "file");
   const evidenceCount = files.filter((f) => EVIDENCE_FILE_RE.test(f.name)).length;
   const locked = disabled || busy;
@@ -332,6 +365,18 @@ export function ClientEvidenceBrowser({
             : "This agent version works on the office network only. "}
           Install the latest agent (steps above the drive list when it is missing) to use this computer from home or
           another site: it connects out to the Polaron server instead.
+        </div>
+      ) : null}
+
+      {arrived.length ? (
+        <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-900" role="status">
+          New drive detected: {arrived.map((letter) => `${letter}:`).join(", ")}. Select it to browse.
+        </div>
+      ) : null}
+
+      {notReady.length ? (
+        <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900" role="status">
+          {notReady.map((d) => `${d.letter.length === 1 ? `${d.letter}:` : d.root} is visible but not ready (locked, ejected or empty)`).join(". ")}.
         </div>
       ) : null}
 
@@ -416,6 +461,18 @@ export function ClientEvidenceBrowser({
               {!dirs.length && !files.length ? <li className="px-3 py-2 text-xs text-ink-400">Directory is empty.</li> : null}
             </ul>
           )}
+          {!loading && unseen.length ? (
+            <div className="border-t border-amber-100 bg-amber-50/70 px-3 py-1.5 text-[11px] text-amber-950" role="status">
+              <p className="font-semibold">Directories not listed ({unseen.length})</p>
+              <ul className="mt-1 space-y-0.5">
+                {unseen.map((entry) => (
+                  <li key={entry.name}>
+                    <span className="font-medium">{entry.name}</span> — {entry.detail}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
           {listing.truncated || files.length > 200 ? (
             <p className="border-t border-ink-100 px-3 py-1.5 text-[11px] text-ink-400">
               Showing the first entries only. Every file in the folder is still processed.

@@ -15,9 +15,11 @@ import { inferApiService } from "./apiRouting";
 export const CLIENT_AGENT_PORT = 9877;
 
 const CONFIGURED_BASE = (import.meta.env.VITE_CLIENT_EVIDENCE_AGENT_URL as string | undefined)?.replace(/\/$/, "");
+// One loopback address. Also trying localhost after 127.0.0.1 is down only
+// adds a second connection-refused exception for the same missing agent.
 const AGENT_BASES = CONFIGURED_BASE
   ? [CONFIGURED_BASE]
-  : [`http://127.0.0.1:${CLIENT_AGENT_PORT}`, `http://localhost:${CLIENT_AGENT_PORT}`];
+  : [`http://127.0.0.1:${CLIENT_AGENT_PORT}`];
 
 /** Same evidence-file pattern as the server drive browser. */
 export const EVIDENCE_FILE_RE =
@@ -66,6 +68,12 @@ export type ClientDirEntry = {
   link?: boolean;
 };
 
+export type ClientOmittedEntry = {
+  name: string;
+  reason: string;
+  detail?: string;
+};
+
 export type ClientDirListing = {
   ok: boolean;
   path: string;
@@ -73,6 +81,8 @@ export type ClientDirListing = {
   entries: ClientDirEntry[];
   count: number;
   truncated: boolean;
+  /** Directories the agent could see but could not open. */
+  omitted?: ClientOmittedEntry[];
 };
 
 export type ClientShare = {
@@ -108,6 +118,12 @@ export class ClientAgentError extends Error {
 }
 
 let preferredBase: string | null = null;
+let healthInFlight: Promise<ClientAgentStatus> | null = null;
+let offlineUntilMs = 0;
+let offlineStreak = 0;
+
+/** Tests probe every call. A real browser backs off so a down agent is not an exception storm. */
+const HEALTH_BACKOFF = import.meta.env.MODE !== "test";
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
   const controller = new AbortController();
@@ -156,12 +172,31 @@ async function agentJson<T>(path: string, init: RequestInit = {}, timeoutMs = 80
   return body as T;
 }
 
-export async function clientAgentStatus(timeoutMs = 1500): Promise<ClientAgentStatus> {
+export async function clientAgentStatus(
+  timeoutMs = 1500,
+  opts?: { force?: boolean },
+): Promise<ClientAgentStatus> {
+  if (HEALTH_BACKOFF && !opts?.force && Date.now() < offlineUntilMs) {
+    return { state: "offline", health: null };
+  }
+  if (healthInFlight) return healthInFlight;
+  healthInFlight = probeClientAgent(timeoutMs).finally(() => {
+    healthInFlight = null;
+  });
+  return healthInFlight;
+}
+
+async function probeClientAgent(timeoutMs: number): Promise<ClientAgentStatus> {
   try {
     const health = await agentJson<ClientAgentHealth>("/health", {}, timeoutMs);
+    offlineStreak = 0;
+    offlineUntilMs = 0;
     if (!health.ok) return { state: "offline", health: null };
     return { state: health.origin_allowed === false ? "unpaired" : "online", health };
   } catch {
+    offlineStreak += 1;
+    const wait = Math.min(8_000 * 1.5 ** Math.max(offlineStreak - 1, 0), 30_000);
+    if (HEALTH_BACKOFF) offlineUntilMs = Date.now() + wait;
     return { state: "offline", health: null };
   }
 }

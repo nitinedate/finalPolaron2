@@ -52,7 +52,7 @@ function installFakeAgent(mode: AgentMode) {
         return json({ ok: true, path: "E:\\", parent: null, count: 2, truncated: false, entries: [
           { name: "Case-0423", kind: "dir" },
           { name: "System Volume Information", kind: "dir" },
-        ] });
+        ], omitted: [{ name: "Locked", reason: "access_denied", detail: "Windows denied access" }] });
       }
       return json({ ok: true, path: "E:\\Case-0423", parent: "E:\\", count: 3, truncated: false, entries: [
         { name: "laptop.E01", kind: "file", size_bytes: 2147483648 },
@@ -95,9 +95,11 @@ describe("EvidenceLocationSwitch", () => {
 
 describe("ClientEvidenceBrowser", () => {
   it("guides installation with the console address when the agent is not running", async () => {
-    installFakeAgent("offline");
+    const calls = installFakeAgent("offline");
     render(<ClientEvidenceBrowser onUseFolder={vi.fn()} />);
     expect(await screen.findByText(/Install the Client Evidence Agent on this computer/)).toBeTruthy();
+    expect(calls.some((call) => call.url.includes("localhost:9877"))).toBe(false);
+    expect(calls.some((call) => call.url.startsWith("http://127.0.0.1:9877/health"))).toBe(true);
     expect(screen.getByRole("link", { name: "Install-PolaronClientEvidenceAgent.cmd" }).getAttribute("href")).toBe("/downloads/client-evidence-agent/Install-PolaronClientEvidenceAgent.cmd");
     expect(screen.getByText(clientAgentInstallCommand(window.location.origin))).toBeTruthy();
   });
@@ -114,7 +116,10 @@ describe("ClientEvidenceBrowser", () => {
     render(<ClientEvidenceBrowser onUseFolder={onUseFolder} />);
     await userEvent.click(await screen.findByRole("button", { name: /E:.*EVIDENCE.*USB/ }));
     expect(await screen.findByText("Case-0423")).toBeTruthy();
-    expect(screen.queryByText("System Volume Information")).toBeNull();
+    expect(screen.queryByRole("button", { name: "System Volume Information" })).toBeNull();
+    expect(screen.getByText(/Directories not listed \(2\)/)).toBeTruthy();
+    expect(screen.getByText(/System folder/)).toBeTruthy();
+    expect(screen.getByText(/Windows denied access/)).toBeTruthy();
     await userEvent.click(screen.getByText("Case-0423"));
     await userEvent.click(await screen.findByRole("button", { name: "Use this directory (2 evidence files)" }));
     expect(onUseFolder).toHaveBeenCalledWith({

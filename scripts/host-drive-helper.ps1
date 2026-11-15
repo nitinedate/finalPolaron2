@@ -868,26 +868,43 @@ function Invoke-ListDir {
     }
     $item = Get-Item -LiteralPath $norm -Force -ErrorAction Stop
     $folder = if ($item.PSIsContainer) { [string]$item.FullName } else { [string]$item.DirectoryName }
-    $entries = @(Get-ChildItem -LiteralPath $folder -Force -ErrorAction SilentlyContinue | Sort-Object -Property Name)
     $files = New-Object System.Collections.Generic.List[hashtable]
-    foreach ($e in $entries) {
-        $isDir = $false
-        try { $isDir = [bool]$e.PSIsContainer } catch { $isDir = $false }
-        $size = $null
-        if (-not $isDir) {
-            try { $size = [int64]$e.Length } catch { $size = $null }
+    $omitted = New-Object System.Collections.Generic.List[hashtable]
+    $names = @()
+    try {
+        $names = @([System.IO.Directory]::GetFileSystemEntries($folder))
+    }
+    catch [System.UnauthorizedAccessException] {
+        throw "Windows denied access to $folder"
+    }
+    foreach ($entryPath in $names) {
+        $name = [System.IO.Path]::GetFileName($entryPath)
+        try {
+            $attr = [System.IO.File]::GetAttributes($entryPath)
+            $isDir = ($attr -band [System.IO.FileAttributes]::Directory) -ne 0
+            $size = $null
+            if (-not $isDir) {
+                try { $size = [int64](New-Object System.IO.FileInfo($entryPath)).Length } catch { $size = $null }
+            }
+            $files.Add(@{
+                name       = [string]$name
+                kind       = $(if ($isDir) { "dir" } else { "file" })
+                size_bytes = $size
+            }) | Out-Null
         }
-        $files.Add(@{
-            name       = [string]$e.Name
-            kind       = $(if ($isDir) { "dir" } else { "file" })
-            size_bytes = $size
-        }) | Out-Null
+        catch [System.UnauthorizedAccessException] {
+            $omitted.Add(@{ name = [string]$name; reason = "access_denied"; detail = "Windows denied access" }) | Out-Null
+        }
+        catch {
+            $omitted.Add(@{ name = [string]$name; reason = "unavailable"; detail = $_.Exception.Message }) | Out-Null
+        }
     }
     return @{
         ok         = $true
         path       = $folder
         count      = $files.Count
         entries    = $files.ToArray()
+        omitted    = $omitted.ToArray()
         error      = $null
     }
 }

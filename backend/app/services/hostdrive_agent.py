@@ -457,14 +457,25 @@ def _list_windows_path_in_docker(win_path: str) -> dict[str, Any] | None:
     try:
         target = p.parent if p.is_file() else p
         entries: list[dict[str, Any]] = []
-        for entry in sorted(target.iterdir(), key=lambda item: (item.is_symlink() or not item.is_dir(), item.name.lower())):
-            entries.append(_listed_entry(entry))
+        omitted: list[dict[str, Any]] = []
+        children = sorted(target.iterdir(), key=lambda item: item.name.lower())
+        for entry in children:
+            try:
+                entries.append(_listed_entry(entry))
+            except OSError as exc:
+                omitted.append({
+                    "name": entry.name,
+                    "reason": "access_denied" if isinstance(exc, PermissionError) else "unavailable",
+                    "detail": "Windows denied access" if isinstance(exc, PermissionError) else str(exc),
+                })
+        entries.sort(key=lambda item: (item.get("kind") != "dir", str(item.get("name") or "").lower()))
         display = container_to_workstation_path(target)
         return {
             "ok": True,
             "path": display,
             "count": len(entries),
             "entries": entries,
+            "omitted": omitted,
             "source": "docker",
         }
     except OSError:

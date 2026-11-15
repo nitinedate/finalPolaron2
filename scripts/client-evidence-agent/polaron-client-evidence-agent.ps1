@@ -515,31 +515,57 @@ namespace Polaron.ClientEvidence
             if (!Directory.Exists(full)) { WriteJson(resp, 404, Error("not_found", "Folder not found: " + full)); return; }
 
             List<object> entries = new List<object>();
+            List<object> omitted = new List<object>();
             bool truncated = false;
             DirectoryInfo di = new DirectoryInfo(full);
-            try
-            {
-                foreach (FileSystemInfo fsi in di.EnumerateFileSystemInfos())
-                {
-                    if (entries.Count >= MaxListEntries) { truncated = true; break; }
-                    Dictionary<string, object> e = new Dictionary<string, object>();
-                    bool isDir = (fsi.Attributes & FileAttributes.Directory) == FileAttributes.Directory;
-                    e["name"] = fsi.Name;
-                    e["kind"] = isDir ? "dir" : "file";
-                    e["hidden"] = (fsi.Attributes & (FileAttributes.Hidden | FileAttributes.System)) != 0;
-                    e["link"] = (fsi.Attributes & FileAttributes.ReparsePoint) != 0;
-                    try { e["mtime_ms"] = ToMs(fsi.LastWriteTimeUtc); } catch { }
-                    if (!isDir)
-                    {
-                        try { e["size_bytes"] = ((FileInfo)fsi).Length; } catch { e["size_bytes"] = null; }
-                    }
-                    entries.Add(e);
-                }
-            }
+            string[] names;
+            try { names = Directory.GetFileSystemEntries(full); }
             catch (UnauthorizedAccessException)
             {
                 WriteJson(resp, 403, Error("access_denied", "Windows denied access to " + full));
                 return;
+            }
+            catch (Exception ex)
+            {
+                WriteJson(resp, 500, Error("list_failed", ex.Message));
+                return;
+            }
+            foreach (string entryPath in names)
+            {
+                if (entries.Count >= MaxListEntries) { truncated = true; break; }
+                string name = Path.GetFileName(entryPath);
+                try
+                {
+                    FileAttributes attr = File.GetAttributes(entryPath);
+                    bool isDir = (attr & FileAttributes.Directory) == FileAttributes.Directory;
+                    Dictionary<string, object> e = new Dictionary<string, object>();
+                    e["name"] = name;
+                    e["kind"] = isDir ? "dir" : "file";
+                    e["hidden"] = (attr & (FileAttributes.Hidden | FileAttributes.System)) != 0;
+                    e["link"] = (attr & FileAttributes.ReparsePoint) != 0;
+                    try { e["mtime_ms"] = ToMs(File.GetLastWriteTimeUtc(entryPath)); } catch { }
+                    if (!isDir)
+                    {
+                        try { e["size_bytes"] = new FileInfo(entryPath).Length; } catch { e["size_bytes"] = null; }
+                    }
+                    entries.Add(e);
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    Dictionary<string, object> skip = new Dictionary<string, object>();
+                    skip["name"] = name;
+                    skip["reason"] = "access_denied";
+                    skip["detail"] = "Windows denied access";
+                    omitted.Add(skip);
+                }
+                catch (Exception ex)
+                {
+                    Dictionary<string, object> skip = new Dictionary<string, object>();
+                    skip["name"] = name;
+                    skip["reason"] = "unavailable";
+                    skip["detail"] = ex.Message;
+                    omitted.Add(skip);
+                }
             }
             entries.Sort(CompareEntries);
             Dictionary<string, object> res = Ok();
@@ -547,6 +573,7 @@ namespace Polaron.ClientEvidence
             DirectoryInfo parent = di.Parent;
             res["parent"] = parent == null ? null : parent.FullName;
             res["entries"] = entries;
+            res["omitted"] = omitted;
             res["count"] = entries.Count;
             res["truncated"] = truncated;
             WriteJson(resp, 200, res);

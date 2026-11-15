@@ -7,6 +7,7 @@ import {
   listOfficeServerDriveLetters,
   type HostDirectoryEntry,
   type HostDriveVolume,
+  type HostOmittedEntry,
 } from "../../lib/hostDriveHelper";
 
 const HIDDEN_DIR_RE = /^(?:\$recycle\.bin|system volume information|recovery|config\.msi)$/i;
@@ -108,6 +109,7 @@ export function BrowseFolderDialog({
   const [windowsVolumes, setWindowsVolumes] = useState<HostDriveVolume[]>([]);
   const [browsePath, setBrowsePath] = useState<string | null>(null);
   const [browseEntries, setBrowseEntries] = useState<HostDirectoryEntry[]>([]);
+  const [unseenDirs, setUnseenDirs] = useState<HostOmittedEntry[]>([]);
   const [browseLoading, setBrowseLoading] = useState(false);
   const [browseError, setBrowseError] = useState<string | null>(null);
   const [drivesLoading, setDrivesLoading] = useState(false);
@@ -215,6 +217,7 @@ export function BrowseFolderDialog({
       setWindowsVolumes([]);
       setBrowsePath(null);
       setBrowseEntries([]);
+      setUnseenDirs([]);
       setBrowseError(null);
       setDrivesLoading(false);
       setAgentLetters([]);
@@ -248,10 +251,20 @@ export function BrowseFolderDialog({
         );
         setBrowsePath(path);
         setBrowseEntries([]);
+        setUnseenDirs([]);
         return;
       }
       setBrowsePath(listing.path || path);
-      setBrowseEntries((listing.entries || []).filter((e) => !HIDDEN_DIR_RE.test(e.name)));
+      const all = listing.entries || [];
+      const hidden = all
+        .filter((e) => e.kind === "dir" && HIDDEN_DIR_RE.test(e.name))
+        .map((e) => ({
+          name: e.name,
+          reason: "system_folder",
+          detail: "System folder. Left out the same way a disk that is not ready is left out of the usable list.",
+        }));
+      setBrowseEntries(all.filter((e) => !HIDDEN_DIR_RE.test(e.name)));
+      setUnseenDirs([...(listing.omitted || []), ...hidden]);
     } finally {
       setBrowseLoading(false);
     }
@@ -495,6 +508,18 @@ export function BrowseFolderDialog({
                   ) : null}
                 </ul>
               )}
+              {unseenDirs.length ? (
+                <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-950" role="status">
+                  <p className="font-semibold">Directories not listed ({unseenDirs.length})</p>
+                  <ul className="mt-1 space-y-0.5">
+                    {unseenDirs.map((entry) => (
+                      <li key={`${entry.reason}-${entry.name}`}>
+                        <span className="font-medium">{entry.name}</span> — {entry.detail || "Windows could not open this directory."}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
             </div>
           ) : null}
         </div>

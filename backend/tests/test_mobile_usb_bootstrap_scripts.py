@@ -25,9 +25,14 @@ def test_helper_refresh_does_not_reset_usb():
     ensure = (ROOT / "scripts" / "ensure-host-drive-helper.ps1").read_text(encoding="utf-8")
     assert 'HelperVersion = "5.60"' in helper
     assert 'ExpectedHelperVersion = "5.60"' in ensure
-    assert "proc.Kill()" not in helper
-    assert "Test-UsbTransferActive" in helper
-    assert "EnumFresh" in helper
+    refresh = helper.split("function Start-MobileDeviceRefresh", 1)[1].split("function Write-HostAdapterCache", 1)[0]
+    parent = helper.split("function Get-StartedUsbInstanceIds", 1)[1].split("function Test-WpdIdCurrentlyAttached", 1)[0]
+    assert "proc.Kill()" not in refresh
+    assert "proc.Kill()" not in parent
+    assert "Killing pnputil mid-enum" in refresh
+    assert "Test-UsbTransferActive" in refresh
+    assert "EnumFresh" in refresh
+    assert "WaitForExit(20000)" in parent
     acquire = (ROOT / "scripts" / "host-mobile-acquire.ps1").read_text(encoding="utf-8")
     assert "Get-Process -Name adb" not in acquire
     assert "Start-AdbKeepAlive" in acquire

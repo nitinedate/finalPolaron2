@@ -672,11 +672,19 @@ export type HostDirectoryEntry = {
   size_bytes?: number | null;
 };
 
+export type HostOmittedEntry = {
+  name: string;
+  reason: string;
+  detail?: string;
+};
+
 export type HostDirectoryResult = {
   ok: boolean;
   path?: string | null;
   count?: number;
   entries?: HostDirectoryEntry[];
+  /** Directories Windows could see but could not open. */
+  omitted?: HostOmittedEntry[];
   error?: string;
   source?: string;
   healed?: boolean;
