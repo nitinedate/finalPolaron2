@@ -1219,12 +1219,10 @@ function Get-StartedUsbInstanceIds {
         if (Test-Path -LiteralPath $pnputil) {
             $proc = Start-Process -FilePath $pnputil -ArgumentList @("/enum-devices", "/connected", "/ids") `
                 -PassThru -WindowStyle Hidden -RedirectStandardOutput $tmp -RedirectStandardError $err
-            if (-not $proc.WaitForExit(5000)) {
-                try { $proc.Kill() } catch {}
-            } else {
-                $pnputilOk = ($proc.ExitCode -eq 0)
-            }
-            if (Test-Path -LiteralPath $tmp) {
+            # Never kill pnputil. Aborting enumeration resets the phone USB interfaces.
+            $finished = $false
+            try { $finished = $proc.WaitForExit(20000) } catch { $finished = $false }
+            if ($finished -and $proc.ExitCode -eq 0 -and (Test-Path -LiteralPath $tmp)) {
                 $script:LastConnectedUsbLines = @(Get-Content -LiteralPath $tmp -ErrorAction SilentlyContinue)
                 foreach ($line in $script:LastConnectedUsbLines) {
                     if ($line -match '(?i)Instance ID:\s+(\S+)') {
@@ -1237,7 +1235,9 @@ function Get-StartedUsbInstanceIds {
         }
     } catch {}
     finally {
-        Remove-Item -LiteralPath $tmp, $err -Force -ErrorAction SilentlyContinue
+        if ($finished) {
+            Remove-Item -LiteralPath $tmp, $err -Force -ErrorAction SilentlyContinue
+        }
     }
     if ($pnputilOk) { return $ids }
     $svcRoot = "HKLM:\SYSTEM\CurrentControlSet\Services"
@@ -1457,32 +1457,61 @@ function Start-MobileDeviceRefresh {
     } catch {}
     $script:DeviceRefreshJob = Start-Job -Name "aetheris-mobile-refresh" -ScriptBlock {
         param($CacheFile, $AcqFile)
-        function Get-StartedUsbInstanceIds {
+        $script:PnputilProc = $null
+        $script:PnputilOut = Join-Path $env:TEMP "aetheris_mobile_pnputil.txt"
+        $script:PnputilErr = Join-Path $env:TEMP "aetheris_mobile_pnputil.err"
+        $script:EnumFresh = $false
+        function Read-PnputilUsbIds {
+            param([string]$Path)
             $ids = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
             $script:LastConnectedUsbLines = @()
-            $tmp = Join-Path $env:TEMP ("aetheris_pnputil_" + [guid]::NewGuid().ToString("N") + ".txt")
-            $err = $tmp + ".err"
-            $pnputil = Join-Path $env:SystemRoot "System32\pnputil.exe"
-            $pnputilOk = $false
-            try {
-                if (Test-Path -LiteralPath $pnputil) {
-                    $proc = Start-Process -FilePath $pnputil -ArgumentList @("/enum-devices", "/connected", "/ids") `
-                        -PassThru -WindowStyle Hidden -RedirectStandardOutput $tmp -RedirectStandardError $err
-                    if (-not $proc.WaitForExit(5000)) { try { $proc.Kill() } catch {} }
-                    if (Test-Path -LiteralPath $tmp) {
-                        $script:LastConnectedUsbLines = @(Get-Content -LiteralPath $tmp -ErrorAction SilentlyContinue)
-                        foreach ($line in $script:LastConnectedUsbLines) {
-                            if ($line -match '(?i)Instance ID:\s+(\S+)') {
-                                $id = [string]$Matches[1]
-                                if ($id -match '(?i)USB\\VID_') { [void]$ids.Add($id) }
-                            }
-                        }
-                        $pnputilOk = $true
-                    }
+            if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $ids }
+            $script:LastConnectedUsbLines = @(Get-Content -LiteralPath $Path -ErrorAction SilentlyContinue)
+            foreach ($line in $script:LastConnectedUsbLines) {
+                if ($line -match '(?i)Instance ID:\s+(\S+)') {
+                    $id = [string]$Matches[1]
+                    if ($id -match '(?i)USB\\VID_') { [void]$ids.Add($id) }
                 }
-            } catch {}
-            finally { Remove-Item -LiteralPath $tmp, $err -Force -ErrorAction SilentlyContinue }
-            if ($pnputilOk) { return $ids }
+            }
+            return $ids
+        }
+        function Get-StartedUsbInstanceIds {
+            $script:EnumFresh = $false
+            if ($script:PnputilProc -and -not $script:PnputilProc.HasExited) {
+                return (New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase))
+            }
+            if ($script:PnputilProc -and $script:PnputilProc.HasExited) {
+                $done = $script:PnputilProc
+                $script:PnputilProc = $null
+                $ids = Read-PnputilUsbIds -Path $script:PnputilOut
+                Remove-Item -LiteralPath $script:PnputilOut, $script:PnputilErr -Force -ErrorAction SilentlyContinue
+                if ($done.ExitCode -eq 0) {
+                    $script:EnumFresh = $true
+                    return $ids
+                }
+            }
+            $pnputil = Join-Path $env:SystemRoot "System32\pnputil.exe"
+            if (Test-Path -LiteralPath $pnputil) {
+                try {
+                    $proc = Start-Process -FilePath $pnputil -ArgumentList @("/enum-devices", "/connected", "/ids") `
+                        -PassThru -WindowStyle Hidden -RedirectStandardOutput $script:PnputilOut -RedirectStandardError $script:PnputilErr
+                    $finished = $false
+                    try { $finished = $proc.WaitForExit(20000) } catch { $finished = $false }
+                    if (-not $finished) {
+                        # Leave it running. Killing pnputil mid-enum resets Android and iPhone USB.
+                        $script:PnputilProc = $proc
+                        return (New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase))
+                    }
+                    $ids = Read-PnputilUsbIds -Path $script:PnputilOut
+                    Remove-Item -LiteralPath $script:PnputilOut, $script:PnputilErr -Force -ErrorAction SilentlyContinue
+                    if ($proc.ExitCode -eq 0) {
+                        $script:EnumFresh = $true
+                        return $ids
+                    }
+                } catch {}
+            }
+            $ids = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            $script:EnumFresh = $true
             Get-ChildItem -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services" -ErrorAction SilentlyContinue | ForEach-Object {
                 $enumPath = Join-Path $_.PSPath "Enum"
                 if (-not (Test-Path -LiteralPath $enumPath)) { return }
@@ -1631,9 +1660,39 @@ function Start-MobileDeviceRefresh {
             }
             return $list
         }
+        function Test-UsbTransferActive {
+            try {
+                $procs = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+                    $cmd = [string]$_.CommandLine
+                    if ($cmd -match 'ios_usbmux_backup|ios_usbmux_afc|native_ios_job|native_mtp_job|host-mobile-acquire|acq_run_') { return $true }
+                    if (([string]$_.Name) -match '^(adb|adb\.exe)$' -and $cmd -match '\s(pull|backup|exec-out|shell)\b') { return $true }
+                    return $false
+                })
+                return $procs.Count -gt 0
+            } catch { return $false }
+        }
+        function Set-UsbStayAwake {
+            param([bool]$On)
+            if (-not ('AetherisStayAwake' -as [type])) {
+                Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public static class AetherisStayAwake { [DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags); }'
+            }
+            $flags = $(if ($On) { [uint32]0x80000003 } else { [uint32]0x80000000 })
+            try { [AetherisStayAwake]::SetThreadExecutionState($flags) | Out-Null } catch {}
+        }
         while ($true) {
             try {
+                if (Test-UsbTransferActive) {
+                    Set-UsbStayAwake $true
+                    Start-Sleep -Seconds 15
+                    continue
+                }
                 $list = @(Read-WpdPhones)
+                if (-not $script:EnumFresh) {
+                    Set-UsbStayAwake $true
+                    Start-Sleep -Seconds 10
+                    continue
+                }
+                Set-UsbStayAwake ($list.Count -gt 0)
                 $json = if ($list.Count -eq 0) { "[]" } elseif ($list.Count -eq 1) { "[" + ($list[0] | ConvertTo-Json -Compress -Depth 6) + "]" } else { ($list | ConvertTo-Json -Compress -Depth 6) }
                 [System.IO.File]::WriteAllText($CacheFile, $json)
                 $acq = @()
@@ -1657,7 +1716,7 @@ function Start-MobileDeviceRefresh {
                 $acqBody = @{ ok = $true; devices = $acq; warnings = @(); count = $acq.Count }
                 [System.IO.File]::WriteAllText($AcqFile, ($acqBody | ConvertTo-Json -Compress -Depth 6))
             } catch {}
-            Start-Sleep -Seconds 6
+            Start-Sleep -Seconds 15
         }
     } -ArgumentList $script:DeviceCacheFile, $script:AcqDevicesCacheFile
 }
