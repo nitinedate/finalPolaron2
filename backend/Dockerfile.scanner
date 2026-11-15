@@ -7,6 +7,10 @@
 # downloadable forever. Use the official pinned Trivy container as a build
 # stage and copy its binary into the Python worker instead of curl-ing a
 # release tarball during the build.
+# The Windows starter passes AETHERIS_DEPS_IMAGE=<dependency image it built and checked>, so the
+# application stage starts from the installed libraries and never reinstalls them. Without it
+# the application stage is built from the dependencies stage below, as before.
+ARG AETHERIS_DEPS_IMAGE=dependencies
 ARG TRIVY_VERSION=0.58.1
 FROM aquasec/trivy:${TRIVY_VERSION} AS trivy-bin
 
@@ -101,7 +105,7 @@ ENV TORCH_INDEX_URL=${TORCH_INDEX_URL}
 RUN --mount=type=cache,target=/root/.cache/pip \
     sed -i 's/\r$//' docker-pip-install.sh && sh docker-pip-install.sh
 
-FROM dependencies AS application
+FROM ${AETHERIS_DEPS_IMAGE} AS application
 ARG AETHERIS_APP_BUILD_ID=source
 COPY . .
 RUN test -n "$AETHERIS_APP_BUILD_ID" && python -m compileall -q app

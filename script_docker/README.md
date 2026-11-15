@@ -95,6 +95,27 @@ in automated runs. Failures propagate a nonzero exit code.
 | Database, Redis, MinIO, nginx and scanner vendor images | Existing images reused; missing images pulled | Update deliberately during maintenance |
 | Certificates | Existing ACME lineages reused; Certbot renews only when due | New certificate issued for a new IP/domain or required renewal |
 
+**Installed libraries are reused, not reinstalled (V1.29.1).** Each library stage has its own image:
+- `aetheris-backend-deps`: CUDA, apt, PyTorch and the Python requirements;
+- `aetheris-malware-deps`;
+- `aetheris-scanner-deps`;
+- `aetheris-frontend-deps`: `npm ci`.
+
+Each image is labeled with a fingerprint of what it installs: its Dockerfile stage, the requirement files and
+`TORCH_INDEX_URL`. When the fingerprint matches, the launcher reuses the image and the application images are
+built `FROM` it. No apt, pip or npm step runs, even after Docker Desktop pruned its build cache (which is what
+made earlier launches download PyTorch/cuDNN again).
+
+An image built by an earlier release is checked and reused once by labeling it. The check is read-only:
+- same base image layers;
+- the same `RUN` steps in its history;
+- byte-identical requirement files;
+- the same Trivy version for the scanner.
+
+Libraries are installed only when a requirement file or a library stage of a Dockerfile changes, or with
+`-RefreshDependencies`. Other builders than Docker Desktop's default `docker` driver keep the previous
+cache-based behaviour.
+
 The first build of the updated Dockerfiles installs any missing or newly
 changed dependencies. Later launches keep those layers cached. Removing Docker
 images/build cache or changing requirements/lockfiles requires rebuilding them.
@@ -118,6 +139,35 @@ For an explicit dependency maintenance rebuild:
 Ordinary launches never set `--no-cache` or `--pull` for application builds.
 The legacy positional `cache` option now means the ordinary cached mode.
 `nocache`, `no-cache` and `-NoCache` remain explicit maintenance aliases.
+
+## Caddy already on this server (V1.30)
+
+If Caddy already serves TCP 80/443 on the Windows server, Polaron joins it instead of starting its own
+HTTPS gateway. Set `PUBLIC_HTTPS_PROXY=caddy` in `.env`; the default `auto` does this whenever a Caddy
+process holds TCP 80/443. Then `start_docker_prod.cmd`:
+
+1. finds the running Caddy and the Caddyfile it uses, from the Caddy process's `--config` or from
+   `CADDY_EXE` / `CADDY_CONFIG` in `.env`;
+2. writes `polaron.caddy` next to that Caddyfile, with a site for `https://<PUBLIC_HTTPS_IP>` and, when set,
+   `https://<PUBLIC_HTTPS_DOMAIN>`. Both proxy to the Polaron gateway on `127.0.0.1:3001`;
+3. appends one line to the Caddyfile, `import polaron*.caddy`, and keeps a backup
+   (`Caddyfile.polaron-backup-<time>`). Because the import is a glob, a deleted `polaron.caddy` never stops
+   Caddy from starting;
+4. runs `caddy validate`, then `caddy reload`. Caddy's other sites keep running. If Caddy rejects the
+   config (for example, another site already uses the same IP) or the reload fails, both files are
+   restored, Caddy keeps its current config and startup stops **before** any Polaron container is
+   stopped;
+5. starts the Polaron gateway on loopback only (`127.0.0.1:3000/3001`) and removes Polaron's own Certbot
+   containers.
+
+**Certificates:** Caddy obtains and renews them.
+- **IP:** a Let's Encrypt short-lived certificate (`profile shortlived`), using HTTP-01 on Caddy's TCP 80.
+  It needs Caddy 2.10 or later; 2.11 or later is recommended.
+- **Domain:** Caddy's default certificate.
+
+**Settings:** `CADDY_MANAGE_CONFIG=false` writes `deployment/caddy/polaron.caddy` only and leaves Caddy
+untouched, for administrators who edit Caddy themselves. `PUBLIC_HTTPS_PROXY=builtin` uses Polaron's own
+nginx and Certbot on TCP 80/443.
 
 ## HTTPS and renewal
 

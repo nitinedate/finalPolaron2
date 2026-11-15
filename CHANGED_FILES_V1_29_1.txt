@@ -1,0 +1,21 @@
+Polaron V1.29.1 - launches reuse installed libraries (no apt/pip/npm reinstall after Docker prunes its cache)
+
+New
+  tests/dependency_reuse_checks.ps1                37 offline checks (real Dockerfiles parsed, Docker mocked)
+  backend/tests/test_dependency_reuse_v1_29_1.py   10 static checks (library stages unchanged vs. snapshot)
+  RELEASE_V1_29_1_DEPENDENCY_REUSE.md
+  CHANGED_FILES_V1_29_1.txt
+
+Changed
+  script_docker/start_docker.ps1      Get-DependencyImageSpecs, Test-DependencyImageAdoptable, Set-DependencyImageLabel,
+                                      Ensure-DependencyImage, Test-LocalImageBuilds; Invoke-BuildProdApplications builds
+                                      applications FROM the labeled library images
+  script_docker/start_docker.lib.ps1  Dockerfile stage parsing + dependency fingerprint; Get-AppBuildArgs -NoPull
+  backend/Dockerfile                  ARG AETHERIS_DEPS_IMAGE; FROM ${AETHERIS_DEPS_IMAGE} AS application
+  backend/Dockerfile.malware          ARG AETHERIS_DEPS_IMAGE; FROM ${AETHERIS_DEPS_IMAGE} AS application
+  backend/Dockerfile.scanner          ARG AETHERIS_DEPS_IMAGE; FROM ${AETHERIS_DEPS_IMAGE} AS application
+  frontend/Dockerfile                 ARG AETHERIS_DEPS_IMAGE; FROM ${AETHERIS_DEPS_IMAGE} AS build
+  script_docker/README.md             "Installed libraries are reused" section
+  (library stages of all four Dockerfiles are unchanged, so existing images are reused)
+
+Originals: recovery-snapshots/pre-v1.29.1-dependency-reuse-20261115/

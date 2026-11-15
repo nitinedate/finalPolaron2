@@ -690,17 +690,189 @@ function Get-TorchIndexUrl {
     return 'https://download.pytorch.org/whl/cu130'
 }
 
+$script:DependencyLabel = 'org.aetheris.dependency-fingerprint'
+
+function Invoke-DockerCapture {
+    # Output of a read-only docker command as one string, or $null when it fails. Never throws.
+    param([string[]]$DockerArgs)
+    $saved = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $out = @(& docker @DockerArgs 2>$null)
+        if ($LASTEXITCODE -ne 0) { return $null }
+        return (($out | ForEach-Object { [string]$_ }) -join "`n")
+    } catch {
+        return $null
+    } finally {
+        $ErrorActionPreference = $saved
+    }
+}
+
+function Test-LocalImageBuilds {
+    # A build can start FROM an image built on this PC only with the default "docker" BuildKit
+    # driver, which shares the Docker image store. Other drivers would try to pull it from Docker Hub.
+    if ($null -ne $script:AetherisLocalImageBuilds) { return $script:AetherisLocalImageBuilds }
+    $info = Invoke-DockerCapture -DockerArgs @('buildx', 'inspect')
+    $driver = ''
+    if ($info -and $info -match '(?m)^\s*Driver:\s*(\S+)') { $driver = $Matches[1] }
+    $script:AetherisLocalImageBuilds = ($driver -eq 'docker')
+    return $script:AetherisLocalImageBuilds
+}
+
+function Get-DependencyImageSpecs {
+    # The four images that hold installed libraries. Application builds start FROM these images,
+    # so an ordinary launch never reinstalls apt, pip or npm packages that are already installed.
+    param([string]$TorchIndexUrl)
+    $scanner = Join-Path $root 'backend/Dockerfile.scanner'
+    $trivy = Get-DockerfileGlobalArg -Path $scanner -Name 'TRIVY_VERSION'
+    return @(
+        [pscustomobject]@{ Key = 'backend'; Name = 'Shared backend (CUDA, apt, PyTorch, Python requirements)'
+            Image = 'aetheris-backend-deps'; Dockerfile = (Join-Path $root 'backend/Dockerfile'); Stage = 'dependencies'
+            Context = 'backend'; ImageDir = '/app'; InputFiles = @((Join-Path $root 'backend/requirements.txt'))
+            BuildArgs = @{ TORCH_INDEX_URL = $TorchIndexUrl }; Probes = @() },
+        [pscustomobject]@{ Key = 'frontend'; Name = 'Shared website (npm ci)'
+            Image = 'aetheris-frontend-deps'; Dockerfile = (Join-Path $root 'frontend/Dockerfile'); Stage = 'dependencies'
+            Context = 'frontend'; ImageDir = '/app'
+            InputFiles = @((Join-Path $root 'frontend/package.json'), (Join-Path $root 'frontend/package-lock.json'))
+            BuildArgs = @{}; Probes = @() },
+        [pscustomobject]@{ Key = 'malware'; Name = 'Malware Detection (CUDA, PyTorch, analysis libraries)'
+            Image = 'aetheris-malware-deps'; Dockerfile = (Join-Path $root 'backend/Dockerfile.malware'); Stage = 'malware-dependencies'
+            Context = 'backend'; ImageDir = '/app'
+            InputFiles = @((Join-Path $root 'backend/requirements.txt'), (Join-Path $root 'backend/requirements-malware.txt'))
+            BuildArgs = @{ TORCH_INDEX_URL = $TorchIndexUrl }; Probes = @() },
+        [pscustomobject]@{ Key = 'scanner'; Name = 'Vulnerability scanner (Trivy, Nuclei, Python requirements)'
+            Image = 'aetheris-scanner-deps'; Dockerfile = $scanner; Stage = 'dependencies'
+            Context = 'backend'; ImageDir = '/app'
+            InputFiles = @((Join-Path $root 'backend/requirements.txt'), (Join-Path $root 'backend/docker-pip-install.sh'))
+            BuildArgs = @{}; Probes = @(@{ Entrypoint = 'trivy'; Args = @('--version'); Expect = $trivy }) }
+    )
+}
+
+function Get-FileSha256 {
+    param([string]$Path)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return ([System.BitConverter]::ToString($sha.ComputeHash([System.IO.File]::ReadAllBytes($Path))) -replace '-', '').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+}
+
+function Test-DependencyImageAdoptable {
+    # True when an existing dependency image without a fingerprint label (built by an earlier
+    # release) was made from the same recipe. Read-only checks:
+    #   - it starts with the same base image layers;
+    #   - every RUN step and stage ARG value of the stage chain is in its history;
+    #   - its copied requirement files are byte-identical (SHA-256);
+    #   - any probe (for example the Trivy version) passes.
+    param($Spec)
+    if (-not (Test-DockerImagePresent -Image $Spec.Image)) { return $false }
+    $lines = @(Get-DockerfileStageLines -Path $Spec.Dockerfile -Stage $Spec.Stage)
+    $base = Get-DockerfileRootBase -Lines $lines -Stage $Spec.Stage
+    if (-not $base -or $base.Contains('$')) { return $false }
+    $layerFormat = '{{range .RootFS.Layers}}{{println .}}{{end}}'
+    $baseLayers = Invoke-DockerCapture -DockerArgs @('image', 'inspect', '--format', $layerFormat, $base)
+    $imageLayers = Invoke-DockerCapture -DockerArgs @('image', 'inspect', '--format', $layerFormat, $Spec.Image)
+    if (-not $baseLayers -or -not $imageLayers) { return $false }
+    $baseList = @($baseLayers -split "`n" | Where-Object { $_.Trim() })
+    $imageList = @($imageLayers -split "`n" | Where-Object { $_.Trim() })
+    if ($baseList.Count -eq 0 -or $imageList.Count -lt $baseList.Count) { return $false }
+    for ($n = 0; $n -lt $baseList.Count; $n++) { if ($baseList[$n].Trim() -ne $imageList[$n].Trim()) { return $false } }
+
+    $history = Invoke-DockerCapture -DockerArgs @('image', 'history', '--no-trunc', '--format', '{{.CreatedBy}}', $Spec.Image)
+    if (-not $history) { return $false }
+    $flat = $history -replace '\s+', ''
+    foreach ($command in @(Get-DockerfileRunCommands -Lines $lines)) {
+        $needle = $command
+        if ($needle.StartsWith('[')) {
+            try { $needle = (@($needle | ConvertFrom-Json) | ForEach-Object { $_ }) -join ' ' } catch { }
+        }
+        if (-not $flat.Contains(($needle -replace '\s+', ''))) { return $false }
+    }
+    $stageArgs = Get-DockerfileStageArgs -Lines $lines -BuildArgs $Spec.BuildArgs
+    foreach ($key in @($stageArgs.Keys)) {
+        if (-not $flat.Contains(("$key=$($stageArgs[$key])" -replace '\s+', ''))) { return $false }
+    }
+    foreach ($file in @($Spec.InputFiles)) {
+        $inside = $Spec.ImageDir.TrimEnd('/') + '/' + [System.IO.Path]::GetFileName($file)
+        $out = Invoke-DockerCapture -DockerArgs @('run', '--rm', '--pull', 'never', '--network', 'none', '--entrypoint', 'sha256sum', $Spec.Image, $inside)
+        if (-not $out) { return $false }
+        if ((($out.Trim() -split '\s+')[0]).ToLowerInvariant() -ne (Get-FileSha256 -Path $file)) { return $false }
+    }
+    foreach ($probe in @($Spec.Probes)) {
+        if (-not $probe.Expect) { return $false }
+        $out = Invoke-DockerCapture -DockerArgs (@('run', '--rm', '--pull', 'never', '--network', 'none', '--entrypoint', $probe.Entrypoint, $Spec.Image) + @($probe.Args))
+        if (-not $out -or -not $out.Contains($probe.Expect)) { return $false }
+    }
+    return $true
+}
+
+function Set-DependencyImageLabel {
+    # Add the fingerprint label to an existing image. Only the image config changes: no layer is
+    # rebuilt and nothing is downloaded.
+    param([string]$Image, [string]$Fingerprint)
+    $dir = Join-Path ([System.IO.Path]::GetTempPath()) ('aetheris-label-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    try {
+        [System.IO.File]::WriteAllText((Join-Path $dir 'Dockerfile'), "FROM $Image`n")
+        Invoke-Docker -Title "Mark $Image as reusable (label only; nothing is reinstalled)" -DockerArgs @(
+            'build', '--label', "$($script:DependencyLabel)=$Fingerprint", '-t', $Image, $dir)
+    } finally {
+        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Ensure-DependencyImage {
+    # Build a dependency stage only when what it installs changed (Dockerfile stage, requirement
+    # files, build arguments) or when -RefreshDependencies/-NoCache asks for it. A matching image is
+    # reused as is, even after Docker Desktop pruned its build cache, so nothing is downloaded again.
+    param($Spec, [switch]$Reuse)
+    $fingerprint = Get-DependencyFingerprint -Dockerfile $Spec.Dockerfile -Stage $Spec.Stage -InputFiles $Spec.InputFiles -BuildArgs $Spec.BuildArgs
+    if ($Reuse -and -not ($RefreshDependencies -or $NoCache)) {
+        if ((Get-DockerImageLabelValue -Image $Spec.Image -Label $script:DependencyLabel) -eq $fingerprint) {
+            Write-Ok "$($Spec.Name): libraries already installed in $($Spec.Image); reused, nothing downloaded."
+            return
+        }
+        $adopt = $false
+        try { $adopt = [bool](Test-DependencyImageAdoptable -Spec $Spec) } catch { $adopt = $false }
+        if ($adopt) {
+            try {
+                Set-DependencyImageLabel -Image $Spec.Image -Fingerprint $fingerprint
+                Write-Ok "$($Spec.Name): existing $($Spec.Image) already has these libraries; reused, nothing downloaded."
+                return
+            } catch {
+                Write-Warn "Could not mark $($Spec.Image) as reusable: $($_.Exception.Message)"
+            }
+        }
+        Write-Warn "$($Spec.Name): its dependency files changed or no matching image exists; building the library stage (Docker reuses its build cache where it still has it)."
+    }
+    $buildArgs = @('-f', $Spec.Dockerfile, '--target', $Spec.Stage)
+    foreach ($key in @($Spec.BuildArgs.Keys | Sort-Object)) { $buildArgs += @('--build-arg', "$key=$($Spec.BuildArgs[$key])") }
+    $buildArgs += @('--label', "$($script:DependencyLabel)=$fingerprint", '-t', $Spec.Image, $Spec.Context)
+    Invoke-DockerImageBuild -Title "Build $($Spec.Name) libraries" -BuildArgs $buildArgs
+}
+
+function Get-DockerImageLabelValue {
+    param([string]$Image, [string]$Label)
+    $out = Invoke-DockerCapture -DockerArgs @('image', 'inspect', '--format', ('{{ index .Config.Labels "' + $Label + '" }}'), $Image)
+    if (-not $out) { return '' }
+    $value = $out.Trim()
+    if ($value -eq '<no value>') { return '' }
+    return $value
+}
+
 function Invoke-DockerImageBuild {
-    param([string]$Title, [string[]]$BuildArgs)
+    param([string]$Title, [string[]]$BuildArgs, [switch]$NoPull)
     $dockerArgs = @('build')
-    if ($RefreshDependencies -or $NoCache) { $dockerArgs += @('--pull', '--no-cache') }
+    if ($RefreshDependencies -or $NoCache) {
+        # An application build that starts FROM a dependency image built on this PC must not --pull it.
+        if ($NoPull) { $dockerArgs += @('--no-cache') } else { $dockerArgs += @('--pull', '--no-cache') }
+    }
     Invoke-Docker -Title $Title -DockerArgs ($dockerArgs + $BuildArgs)
 }
 
 function Invoke-OneServiceBuild {
-    param([string]$Title, [string[]]$ComposeArgs, [string]$Service, [string]$BuildId)
-    $args = @($ComposeArgs) + @(Get-AppBuildArgs -BuildId $BuildId -RefreshDependencies:($RefreshDependencies -or $NoCache)) + @($Service)
-    Invoke-Docker -Title $Title -DockerArgs $args
+    param([string]$Title, [string[]]$ComposeArgs, [string]$Service, [string]$BuildId, [string]$DepsImage = '')
+    $args = @($ComposeArgs) + @(Get-AppBuildArgs -BuildId $BuildId -RefreshDependencies:($RefreshDependencies -or $NoCache) -NoPull:([bool]$DepsImage))
+    if ($DepsImage) { $args += @('--build-arg', "AETHERIS_DEPS_IMAGE=$DepsImage") }
+    Invoke-Docker -Title $Title -DockerArgs ($args + @($Service))
 }
 
 function Invoke-BuildProdApplications {
@@ -708,34 +880,50 @@ function Invoke-BuildProdApplications {
     $torch = Get-TorchIndexUrl
     Write-Step 'Build shared libraries once, then each application image once'
     Write-Ok 'Forensic, Android, iOS, and the vulnerability API share one backend image. It is not built four times.'
+    $refresh = [bool]($RefreshDependencies -or $NoCache)
+    $specs = @{}
+    foreach ($spec in @(Get-DependencyImageSpecs -TorchIndexUrl $torch)) { $specs[$spec.Key] = $spec }
 
-    Invoke-DockerImageBuild -Title 'Build shared backend libraries (NVIDIA CUDA, apt, PyTorch, Python requirements)' -BuildArgs @(
-        '-f', 'backend/Dockerfile', '--target', 'dependencies',
+    # V1.29.1: application images start FROM the dependency images, so an ordinary launch
+    # never re-runs apt/pip/npm, even after Docker Desktop pruned its build cache.
+    $useDeps = [bool](Test-LocalImageBuilds)
+    if (-not $useDeps) {
+        Write-Warn 'The active Docker builder is not the default "docker" driver, so builds cannot start FROM local images. Library stages rely on the Docker build cache.'
+    }
+    $backendDeps = if ($useDeps) { 'aetheris-backend-deps' } else { '' }
+    $frontendDeps = if ($useDeps) { 'aetheris-frontend-deps' } else { '' }
+    $malwareDeps = if ($useDeps) { 'aetheris-malware-deps' } else { '' }
+    $scannerDeps = if ($useDeps) { 'aetheris-scanner-deps' } else { '' }
+
+    Ensure-DependencyImage -Spec $specs['backend'] -Reuse:$useDeps
+    $backendApp = @('-f', 'backend/Dockerfile',
         '--build-arg', "TORCH_INDEX_URL=$torch",
-        '-t', 'aetheris-backend-deps', 'backend')
-    Invoke-DockerImageBuild -Title 'Build shared backend application' -BuildArgs @(
-        '-f', 'backend/Dockerfile',
-        '--build-arg', "TORCH_INDEX_URL=$torch",
-        '--build-arg', "AETHERIS_APP_BUILD_ID=$BuildId",
-        '-t', 'rag_new2-api', 'backend')
+        '--build-arg', "AETHERIS_APP_BUILD_ID=$BuildId")
+    if ($backendDeps) { $backendApp += @('--build-arg', "AETHERIS_DEPS_IMAGE=$backendDeps") }
+    Invoke-DockerImageBuild -Title 'Build shared backend application' -NoPull:([bool]$backendDeps) -BuildArgs ($backendApp + @('-t', 'rag_new2-api', 'backend'))
     foreach ($tag in @('aetheris-mobile-android-app', 'aetheris-mobile-ios-app')) {
         Invoke-Docker -Title "Tag shared backend as $tag" -DockerArgs @('tag', 'rag_new2-api', $tag)
     }
 
-    Invoke-DockerImageBuild -Title 'Build shared website libraries (npm ci, once)' -BuildArgs @(
-        '-f', 'frontend/Dockerfile', '--target', 'dependencies',
-        '-t', 'aetheris-frontend-deps', 'frontend')
+    Ensure-DependencyImage -Spec $specs['frontend'] -Reuse:$useDeps
+    if ($refresh -and $frontendDeps) {
+        # The website runtime stage starts from nginx; refresh it explicitly because the website
+        # builds below cannot use --pull together with the local dependency image.
+        Invoke-Docker -Title 'Refresh nginx:1.27-alpine for the website runtime' -DockerArgs @('pull', 'nginx:1.27-alpine')
+    }
 
     $malwareArgs = @(Get-StackComposeArgs -Root $root -Name 'mobile-malware')
-    Invoke-OneServiceBuild -Title 'Build malware application (analysis libraries on the shared pip cache)' -ComposeArgs $malwareArgs -Service 'api' -BuildId $BuildId
+    if ($malwareDeps) { Ensure-DependencyImage -Spec $specs['malware'] -Reuse:$useDeps }
+    Invoke-OneServiceBuild -Title 'Build malware application (analysis libraries on the shared pip cache)' -ComposeArgs $malwareArgs -Service 'api' -BuildId $BuildId -DepsImage $malwareDeps
     Invoke-OneServiceBuild -Title 'Build ClamAV image' -ComposeArgs $malwareArgs -Service 'clamav-update' -BuildId $BuildId
 
     $vulnArgs = @(Get-StackComposeArgs -Root $root -Name 'vuln')
-    Invoke-OneServiceBuild -Title 'Build vulnerability scanner worker' -ComposeArgs $vulnArgs -Service 'worker-nessus' -BuildId $BuildId
+    if ($scannerDeps) { Ensure-DependencyImage -Spec $specs['scanner'] -Reuse:$useDeps }
+    Invoke-OneServiceBuild -Title 'Build vulnerability scanner worker' -ComposeArgs $vulnArgs -Service 'worker-nessus' -BuildId $BuildId -DepsImage $scannerDeps
 
-    Invoke-OneServiceBuild -Title 'Build HTTPS gateway website' -ComposeArgs @(Get-PublicGatewayArgs) -Service 'gateway' -BuildId $BuildId
-    Invoke-OneServiceBuild -Title 'Build Android website' -ComposeArgs @(Get-StackComposeArgs -Root $root -Name 'mobile-android') -Service 'frontend' -BuildId $BuildId
-    Invoke-OneServiceBuild -Title 'Build iOS website' -ComposeArgs @(Get-StackComposeArgs -Root $root -Name 'mobile-ios') -Service 'frontend' -BuildId $BuildId
+    Invoke-OneServiceBuild -Title 'Build HTTPS gateway website' -ComposeArgs @(Get-PublicGatewayArgs) -Service 'gateway' -BuildId $BuildId -DepsImage $frontendDeps
+    Invoke-OneServiceBuild -Title 'Build Android website' -ComposeArgs @(Get-StackComposeArgs -Root $root -Name 'mobile-android') -Service 'frontend' -BuildId $BuildId -DepsImage $frontendDeps
+    Invoke-OneServiceBuild -Title 'Build iOS website' -ComposeArgs @(Get-StackComposeArgs -Root $root -Name 'mobile-ios') -Service 'frontend' -BuildId $BuildId -DepsImage $frontendDeps
     Write-Ok 'Application images are built. Later Compose starts use --no-build.'
 }
 
@@ -1424,6 +1612,217 @@ function Stop-AcmeBootstrap {
     } catch { Write-Warn $_.Exception.Message }
 }
 
+function Get-CaddyListenerProcess {
+    # The Caddy process listening on TCP 443 or 80 on this PC: its executable and command line.
+    foreach ($port in @(443, 80)) {
+        foreach ($listener in @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)) {
+            $proc = Get-CimInstance -ClassName Win32_Process -Filter ('ProcessId={0}' -f [int]$listener.OwningProcess) -ErrorAction SilentlyContinue
+            if ($proc -and [string]$proc.Name -match '^caddy') {
+                return [pscustomobject]@{ Pid = [int]$proc.ProcessId; Exe = [string]$proc.ExecutablePath; CommandLine = [string]$proc.CommandLine }
+            }
+        }
+    }
+    return $null
+}
+
+function Resolve-PublicHttpsProxyMode {
+    # 'caddy' or 'builtin' for this launch (PUBLIC_HTTPS_PROXY, default auto).
+    param([string]$Root)
+    $setting = Get-PublicHttpsProxySetting -Root $Root
+    if ($setting -ne 'auto') { return $setting }
+    try { if (Get-CaddyListenerProcess) { return 'caddy' } } catch { }
+    return 'builtin'
+}
+
+function Invoke-CaddyCapture {
+    # Run caddy.exe and return its exit code and combined output. Never throws.
+    param([string]$Exe, [string[]]$Arguments)
+    $saved = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $out = @(& $Exe @Arguments 2>&1 | ForEach-Object {
+            if ($_ -is [System.Management.Automation.ErrorRecord]) { [string]$_.Exception.Message } else { [string]$_ }
+        })
+        $code = $LASTEXITCODE
+        if ($null -eq $code) { $code = 0 }
+        return [pscustomobject]@{ Code = [int]$code; Output = ($out -join "`n") }
+    } catch {
+        return [pscustomobject]@{ Code = 1; Output = $_.Exception.Message }
+    } finally {
+        $ErrorActionPreference = $saved
+    }
+}
+
+function Get-CaddyOutputTail {
+    param([string]$Text, [int]$Lines = 12)
+    $rows = @(([string]$Text) -split "`r?`n" | Where-Object { $_.Trim() })
+    return (($rows | Select-Object -Last $Lines) -join "`n")
+}
+
+function Resolve-CaddySetup {
+    # Where the running Caddy and its Caddyfile are. CADDY_EXE / CADDY_CONFIG in .env win; otherwise they
+    # come from the Caddy process that holds TCP 443/80. Throws with the fix when they cannot be found.
+    param([string]$Root)
+    $dotEnv = Read-DotEnvValues -Root $Root
+    $upstream = [string]$dotEnv['PUBLIC_HTTPS_UPSTREAM']
+    if (-not $upstream) { $upstream = '127.0.0.1:3001' }
+    $manage = @('false', '0', 'no', 'off') -notcontains ([string]$dotEnv['CADDY_MANAGE_CONFIG']).Trim().ToLowerInvariant()
+    $setup = [pscustomobject]@{ Exe = ''; Config = ''; Dir = ''; Version = $null; Upstream = $upstream; Manage = $manage; Running = $false }
+    if (-not $manage) { return $setup }
+
+    $proc = $null
+    try { $proc = Get-CaddyListenerProcess } catch { $proc = $null }
+    $setup.Running = [bool]$proc
+    $exe = [string]$dotEnv['CADDY_EXE']
+    if (-not $exe -and $proc -and $proc.Exe) { $exe = $proc.Exe }
+    if (-not $exe) {
+        $cmd = Get-Command caddy -ErrorAction SilentlyContinue
+        if ($cmd) { $exe = [string]$cmd.Source }
+    }
+    if (-not $exe -or -not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+        throw 'Caddy was not found. Set CADDY_EXE in .env to caddy.exe (for example CADDY_EXE=C:\caddy\caddy.exe), or run the launcher as Administrator so it can see the Caddy service.'
+    }
+    $config = [string]$dotEnv['CADDY_CONFIG']
+    $adapter = ([string]$dotEnv['CADDY_ADAPTER']).Trim().ToLowerInvariant()
+    if (-not $config -and $proc) {
+        $parsed = Get-CaddyConfigFromCommandLine -CommandLine $proc.CommandLine
+        if ($parsed.Config -and [System.IO.Path]::IsPathRooted($parsed.Config)) { $config = $parsed.Config }
+        if (-not $adapter) { $adapter = $parsed.Adapter }
+    }
+    if (-not $config) {
+        throw 'Cannot tell which Caddyfile the running Caddy uses (it was started without an absolute --config path, or the launcher cannot read its command line). Set CADDY_CONFIG in .env to that file, for example CADDY_CONFIG=C:\caddy\Caddyfile.'
+    }
+    if (-not (Test-Path -LiteralPath $config -PathType Leaf)) { throw "The Caddy config file was not found: $config. Set CADDY_CONFIG in .env." }
+    $config = (Resolve-Path -LiteralPath $config).ProviderPath
+    if (-not $adapter) { $adapter = if ($config -match '\.json$') { 'json' } else { 'caddyfile' } }
+    if ($adapter -ne 'caddyfile') {
+        throw "The running Caddy uses a $adapter config ($config). Polaron joins Caddy through a Caddyfile import. Use a Caddyfile, or set CADDY_MANAGE_CONFIG=false and add the sites of deployment\caddy\polaron.caddy to your config yourself."
+    }
+    if (-not $proc) { Write-Warn 'No Caddy process is listening on TCP 80/443 on this PC; Caddy must be running for the reload.' }
+    $version = ConvertTo-CaddyVersion (Invoke-CaddyCapture -Exe $exe -Arguments @('version')).Output
+    if (-not $version) {
+        Write-Warn "Could not read the version of $exe."
+    } elseif ($version -lt [version]'2.10.0') {
+        throw "Caddy $version cannot request IP certificates (ACME profiles need Caddy 2.10 or later). Update Caddy (for example: caddy upgrade), then start again. Nothing was changed."
+    } elseif ($version -lt [version]'2.11.0') {
+        Write-Warn "Caddy $version had IP-certificate issuance bugs that later releases fixed. If https://<IP>/ stays untrusted, update Caddy (caddy upgrade)."
+    }
+    $setup.Exe = $exe
+    $setup.Config = $config
+    $setup.Dir = Split-Path -Parent $config
+    $setup.Version = $version
+    return $setup
+}
+
+function Publish-CaddySite {
+    # Add Polaron's IP/domain sites to the running Caddy without touching its other sites: polaron.caddy
+    # next to the Caddyfile and one "import polaron*.caddy" line, checked with caddy validate and applied
+    # with caddy reload (atomic). On any error both files are restored and Caddy keeps its current config.
+    param($Caddy, [string]$IP, [string]$DNS, [string]$Email)
+    $site = Get-CaddySiteConfig -PublicIP $IP -Domain $DNS -Email $Email -Upstream $Caddy.Upstream
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    if (-not $Caddy.Manage) {
+        $out = Join-Path $root 'deployment/caddy/polaron.caddy'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $out) -Force | Out-Null
+        [System.IO.File]::WriteAllText($out, $site, $utf8)
+        Write-Warn "CADDY_MANAGE_CONFIG=false: Caddy was not changed. Add the site blocks of $out to your Caddy config (or copy the file next to your Caddyfile and add the line: import polaron*.caddy), then reload Caddy."
+        return
+    }
+    $configPath = $Caddy.Config
+    $sitePath = Join-Path $Caddy.Dir 'polaron.caddy'
+    $oldConfig = [System.IO.File]::ReadAllBytes($configPath)
+    $oldSite = if (Test-Path -LiteralPath $sitePath -PathType Leaf) { [System.IO.File]::ReadAllBytes($sitePath) } else { $null }
+    $bom = ($oldConfig.Length -ge 3 -and $oldConfig[0] -eq 0xEF -and $oldConfig[1] -eq 0xBB -and $oldConfig[2] -eq 0xBF)
+    $skip = if ($bom) { 3 } else { 0 }
+    $text = $utf8.GetString($oldConfig, $skip, $oldConfig.Length - $skip)
+    $newText = Add-CaddyImportLine -Text $text
+    $configChanged = ($newText -ne $text)
+    if ($configChanged) {
+        $backup = '{0}.polaron-backup-{1}' -f $configPath, (Get-Date).ToString('yyyyMMdd-HHmmss')
+        [System.IO.File]::WriteAllBytes($backup, $oldConfig)
+        Write-Ok "Backed up $configPath to $backup"
+    }
+    try {
+        [System.IO.File]::WriteAllText($sitePath, $site, $utf8)
+        if ($configChanged) {
+            $bytes = $utf8.GetBytes($newText)
+            if ($bom) { $bytes = [byte[]](@(0xEF, 0xBB, 0xBF) + $bytes) }
+            [System.IO.File]::WriteAllBytes($configPath, $bytes)
+        }
+        $check = Invoke-CaddyCapture -Exe $Caddy.Exe -Arguments @('validate', '--config', $configPath, '--adapter', 'caddyfile')
+        if ($check.Code -ne 0) {
+            throw ("Caddy rejected the configuration with Polaron's sites (for example, another site already uses https://$IP/):`n" + (Get-CaddyOutputTail $check.Output))
+        }
+        $reload = Invoke-CaddyCapture -Exe $Caddy.Exe -Arguments @('reload', '--config', $configPath, '--adapter', 'caddyfile')
+        if ($reload.Code -ne 0) {
+            throw ("Caddy did not accept the reload. Its admin API must be enabled (no 'admin off'):`n" + (Get-CaddyOutputTail $reload.Output))
+        }
+    } catch {
+        [System.IO.File]::WriteAllBytes($configPath, $oldConfig)
+        if ($null -eq $oldSite) { Remove-Item -LiteralPath $sitePath -Force -ErrorAction SilentlyContinue }
+        else { [System.IO.File]::WriteAllBytes($sitePath, $oldSite) }
+        throw "Caddy was left unchanged; Polaron was not started. $($_.Exception.Message)"
+    }
+    $names = "https://$IP/"
+    if ($DNS) { $names += " and https://$DNS/" }
+    Write-Ok "Caddy now serves $names from $sitePath (its other sites are unchanged). Caddy obtains and renews the certificates."
+}
+
+function Start-CaddyBackedGateway {
+    # Caddy owns TCP 80/443. The Polaron gateway serves HTTP on 127.0.0.1:3000/3001 only (the local
+    # gateway configuration with every route). Polaron's own certificate containers are removed.
+    $public = @(Get-PublicGatewayArgs)
+    try {
+        Invoke-Docker -Title 'Remove Polaron certificate containers (Caddy manages HTTPS)' -DockerArgs (
+            $public + @('--profile', 'acme-bootstrap', 'rm', '-sf', 'acme-bootstrap', 'certbot-renewer'))
+    } catch { Write-Warn $_.Exception.Message }
+    Invoke-StackUp -Name 'gateway' -ComposeArgs @(Get-LocalGatewayArgs)
+    if (-not (Wait-ComposeServiceReady -ProjectName 'aetheris-gateway' -Service 'gateway' -TimeoutSeconds 120)) {
+        throw 'The Polaron gateway on 127.0.0.1:3001 did not become healthy, so Caddy would answer 502. Check: docker logs of aetheris-gateway.'
+    }
+    Write-Ok 'Polaron gateway is listening on 127.0.0.1:3001 behind Caddy.'
+}
+
+function Test-CaddyServedHttps {
+    # Best-effort check that Caddy serves Polaron with trusted certificates. Caddy obtains certificates in
+    # the background, so this waits briefly and never fails startup. The domain is checked from Docker
+    # (connecting to this PC with the domain name); the IP needs the router to loop the public IP back.
+    param([string]$IP, [string]$DNS, [int]$TimeoutSeconds = 60)
+    if ("$env:CADDY_VERIFY_SECONDS" -match '^\d+$') { $TimeoutSeconds = [int]$env:CADDY_VERIFY_SECONDS }
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+    $composeArgs = @(Get-PublicGatewayArgs)
+    $domainOk = -not $DNS
+    $ipOk = $false
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        if (-not $domainOk) {
+            try {
+                Invoke-CertificateTool -ComposeArgs $composeArgs -ToolArgs @('probe', '--identity', $DNS) | Out-Null
+                $domainOk = $true
+                Write-Ok "https://$DNS/ answers through Caddy with a trusted certificate."
+            } catch { }
+        }
+        if (-not $ipOk) {
+            try {
+                $response = Invoke-WebRequest -UseBasicParsing -Uri "https://$IP/" -TimeoutSec 10
+                if ([int]$response.StatusCode -eq 200) {
+                    $ipOk = $true
+                    Write-Ok "https://$IP/ answers through Caddy with a trusted certificate."
+                }
+            } catch { }
+        }
+        if ($domainOk -and $ipOk) { break }
+        Start-Sleep -Seconds 5
+    } while ((Get-Date) -lt $deadline)
+    if (-not $ipOk) {
+        Write-Warn "https://$IP/ could not be confirmed from this PC. Caddy requests its certificate in the background (Let's Encrypt must reach public TCP 80 of $IP), and many routers do not loop the public IP back into the LAN. Open https://$IP/ from outside (for example a phone on mobile data); Caddy's log shows the certificate status."
+    }
+    if (-not $domainOk) {
+        Write-Warn "https://$DNS/ does not answer with a trusted certificate yet. Its DNS A record must point to $IP; Caddy keeps retrying. Caddy's log shows why."
+    }
+    return [pscustomobject]@{ IP = $ipOk; Domain = $domainOk }
+}
+
 function Get-PublicCertificateIdentities {
     # The certificates the HTTPS gateway serves: the IP always, the domain when configured.
     param([string]$IP, [string]$DNS)
@@ -1618,7 +2017,10 @@ try {
     & $opensearchPortGuard -ProjectRoot $root
 
     $settings = Get-DeploymentSettings -Root $root -Profile $Profile -PublicIP $PublicIP -Domain $Domain -AcmeEmail $AcmeEmail
-    if ($isPublic -and -not $settings.AcmeEmail) {
+    # V1.30: who serves HTTPS on TCP 80/443 (PUBLIC_HTTPS_PROXY): the Caddy already running on this PC,
+    # or Polaron's own nginx gateway with Certbot. Caddy needs no email (it is optional there).
+    $script:HttpsProxyMode = if ($isPublic) { Resolve-PublicHttpsProxyMode -Root $root } else { 'none' }
+    if ($isPublic -and -not $settings.AcmeEmail -and $script:HttpsProxyMode -eq 'builtin') {
         if (-not [Environment]::UserInteractive) {
             throw 'Set PUBLIC_HTTPS_EMAIL in .env (prod), acmeEmail in script_docker/start_docker.settings.json, or CERTBOT_EMAIL before public startup.'
         }
@@ -1632,6 +2034,12 @@ try {
         if ($Profile -eq 'prod' -and -not $settings.IPFromDotEnv) {
             Write-Warn "Move this address into .env: PUBLIC_HTTPS_IP=$($settings.PublicIP) and PUBLIC_HTTPS_DOMAIN=$($settings.Domain) (empty = IP only)."
         }
+    }
+    if ($script:HttpsProxyMode -eq 'caddy') {
+        # Before any Polaron container stops: if Caddy cannot take the sites, nothing goes down.
+        Write-Step 'Add Polaron to the running Caddy (Caddy serves HTTPS and renews the certificates)'
+        $script:CaddySetup = Resolve-CaddySetup -Root $root
+        Publish-CaddySite -Caddy $script:CaddySetup -IP $settings.PublicIP -DNS $settings.Domain -Email $settings.AcmeEmail
     }
 
     # Provision the host OCR service BEFORE stopping active Polaron containers.
@@ -1718,9 +2126,15 @@ try {
 
     # Public edge intentionally comes before database/application products. This makes the
     # TLS endpoint deterministic and keeps certificate validation independent of product startup.
-    if ($isPublic) {
+    if ($isPublic -and $script:HttpsProxyMode -eq 'caddy') {
+        Write-Step 'Start the Polaron gateway on 127.0.0.1:3001 behind Caddy'
+        Start-CaddyBackedGateway
+        $script:AetherisServedDomain = $settings.Domain
+    } elseif ($isPublic) {
         Write-Step 'Validate trusted public certificates and start HTTPS gateway first'
         $null = Ensure-PublicHttpsEdge -IP $settings.PublicIP -DNS $settings.Domain -Email $settings.AcmeEmail
+    }
+    if ($isPublic) {
         $publicGatewayStarted = $true
         # Emailed activation/reset/login links must open the public HTTPS site, not localhost.
         $publicHost = if ($script:AetherisServedDomain) { $script:AetherisServedDomain } else { $settings.PublicIP }
@@ -1807,7 +2221,10 @@ try {
     }
     Write-Ok ("Required containers are up ({0} running)." -f $report.Running)
 
-    if ($isPublic) {
+    if ($isPublic -and $script:HttpsProxyMode -eq 'caddy') {
+        Write-Step 'Check HTTPS through Caddy'
+        $null = Test-CaddyServedHttps -IP $settings.PublicIP -DNS $settings.Domain
+    } elseif ($isPublic) {
         $renewer = Get-ComposeServiceContainerState -ProjectName 'aetheris-gateway' -Service 'certbot-renewer'
         if (-not $renewer -or $renewer.Status -ne 'running') {
             throw 'Certificate renewal container certbot-renewer is not running. HTTPS would not renew the IP certificate.'
@@ -1826,8 +2243,13 @@ try {
         } elseif ($settings.Domain) {
             Write-Host "NOT YET: https://$($settings.Domain)/ has no certificate yet (see the warning above); https://$($settings.PublicIP)/ works." -ForegroundColor Yellow
         }
-        Write-Host "This PC and LAN: http://localhost:3001/ and http://<WINDOWS_LAN_IP>:3001/ redirect to the HTTPS address (the router must support NAT loopback for the public IP)." -ForegroundColor Yellow
-        Write-Host "Certificates renew automatically (certbot-renewer checks every 6 hours)." -ForegroundColor DarkGray
+        if ($script:HttpsProxyMode -eq 'caddy') {
+            Write-Host "This PC: http://localhost:3001/ (loopback only; Caddy publishes the HTTPS address)." -ForegroundColor Yellow
+            Write-Host "Certificates are obtained and renewed by Caddy (site file: $(Join-Path $script:CaddySetup.Dir 'polaron.caddy'))." -ForegroundColor DarkGray
+        } else {
+            Write-Host "This PC and LAN: http://localhost:3001/ and http://<WINDOWS_LAN_IP>:3001/ redirect to the HTTPS address (the router must support NAT loopback for the public IP)." -ForegroundColor Yellow
+            Write-Host "Certificates renew automatically (certbot-renewer checks every 6 hours)." -ForegroundColor DarkGray
+        }
     } else {
         # V1.10.8: local uses the same stacks and gateway as prod, without HTTPS.
         Write-Host "READY (frontend HTTP): http://localhost:3001/" -ForegroundColor Green
@@ -1847,7 +2269,14 @@ catch {
         Write-Host 'HTTPS gateway and certificate renewal remain running; product startup did not fully complete.' -ForegroundColor Yellow
     }
     if ($isPublic) {
-        Write-Host 'If the error above is HTTPS-related, check router TCP 80/443 forwarding, Windows Firewall, DNS, and ISP inbound TCP 80.' -ForegroundColor Yellow
+        if ($script:HttpsProxyMode -eq 'caddy') {
+            Write-Host 'HTTPS is served by Caddy: check the Caddy message above or Caddy''s log; set PUBLIC_HTTPS_PROXY=builtin in .env only if Caddy no longer holds TCP 80/443.' -ForegroundColor Yellow
+        } else {
+            Write-Host 'If the error above is HTTPS-related, check router TCP 80/443 forwarding, Windows Firewall, DNS, and ISP inbound TCP 80.' -ForegroundColor Yellow
+        }
+        if ("$($_.Exception.Message)" -match 'TCP (80|443) is held by caddy') {
+            Write-Host 'Caddy already serves TCP 80/443 here. Set PUBLIC_HTTPS_PROXY=caddy (or auto) in .env so Polaron joins Caddy instead.' -ForegroundColor Yellow
+        }
         Write-Host 'If the error names Redis/Postgres/MinIO or another container, use that container error/log instead; HTTPS may already be healthy.' -ForegroundColor Yellow
     }
 }

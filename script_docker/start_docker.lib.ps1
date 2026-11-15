@@ -621,10 +621,14 @@ function Get-ComposePullFlag {
 }
 
 function Get-AppBuildArgs {
-    param([string]$BuildId, [switch]$RefreshDependencies)
+    # -NoPull: the build starts FROM a dependency image built on this PC, which --pull would try to
+    # fetch from Docker Hub. The dependency image itself was already refreshed with --pull.
+    param([string]$BuildId, [switch]$RefreshDependencies, [switch]$NoPull)
     if (-not $BuildId) { throw "Application build ID is required." }
     $buildOptions = @("build", "--build-arg", "AETHERIS_APP_BUILD_ID=$BuildId")
-    if ($RefreshDependencies) { $buildOptions += @("--pull", "--no-cache") }
+    if ($RefreshDependencies) {
+        if ($NoPull) { $buildOptions += @("--no-cache") } else { $buildOptions += @("--pull", "--no-cache") }
+    }
     return $buildOptions
 }
 
@@ -672,6 +676,204 @@ function Get-StableAppBuildId {
     } finally {
         $sha.Dispose()
     }
+}
+
+function Get-DockerfileStageLines {
+    # Dockerfile lines from the top to the end of stage $Stage (that stage and every stage above it).
+    param([string]$Path, [string]$Stage)
+    $lines = @([System.IO.File]::ReadAllLines($Path))
+    $start = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match ('^\s*FROM\s+(?:--\S+\s+)*\S+\s+AS\s+' + [regex]::Escape($Stage) + '\s*$')) { $start = $i; break }
+    }
+    if ($start -lt 0) { throw "Stage '$Stage' is missing from $Path." }
+    $end = $lines.Count
+    for ($i = $start + 1; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '^\s*FROM\s') { $end = $i; break }
+    }
+    return $lines[0..($end - 1)]
+}
+
+function Get-DependencyFingerprint {
+    # Hash of what a dependency stage installs: its Dockerfile lines (comments and blank lines ignored),
+    # the files it copies in and the build arguments. Application source is not part of it, so code
+    # changes never reinstall libraries.
+    param([string]$Dockerfile, [string]$Stage, [string[]]$InputFiles, [hashtable]$BuildArgs)
+    $text = New-Object System.Text.StringBuilder
+    [void]$text.Append("aetheris-dependencies-v1`n")
+    foreach ($line in @(Get-DockerfileStageLines -Path $Dockerfile -Stage $Stage)) {
+        if ($line -match '^\s*(#|$)') { continue }
+        [void]$text.Append($line.TrimEnd()).Append("`n")
+    }
+    foreach ($file in @($InputFiles)) {
+        [void]$text.Append('== ' + [System.IO.Path]::GetFileName($file) + "`n")
+        [void]$text.Append(([System.IO.File]::ReadAllText($file) -replace "`r`n", "`n")).Append("`n")
+    }
+    if ($BuildArgs) {
+        foreach ($key in @($BuildArgs.Keys | Sort-Object)) { [void]$text.Append("ARG $key=$($BuildArgs[$key])`n") }
+    }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($text.ToString()))
+        return ([System.BitConverter]::ToString($hash) -replace '-', '').Substring(0, 32).ToLowerInvariant()
+    } finally { $sha.Dispose() }
+}
+
+function Get-DockerfileRunCommands {
+    # RUN commands as BuildKit records them in image history: continuation lines joined, whole-line
+    # comments inside them dropped, RUN flags such as --mount=type=cache removed.
+    param([string[]]$Lines)
+    $commands = New-Object System.Collections.Generic.List[string]
+    $i = 0
+    while ($i -lt $Lines.Count) {
+        $text = [string]$Lines[$i]
+        $i++
+        if ($text -notmatch '^\s*RUN\s') { continue }
+        while ($text -match '\\\s*$') {
+            $text = $text -replace '\\\s*$', ''
+            while ($i -lt $Lines.Count -and $Lines[$i] -match '^\s*#') { $i++ }
+            if ($i -ge $Lines.Count) { break }
+            $text += [string]$Lines[$i]
+            $i++
+        }
+        $body = $text -replace '^\s*RUN\s+', ''
+        while ($body -match '^--[A-Za-z-]+=\S+\s+') { $body = $body -replace '^--[A-Za-z-]+=\S+\s+', '' }
+        $commands.Add($body.Trim())
+    }
+    return $commands.ToArray()
+}
+
+function Get-DockerfileStageArgs {
+    # Effective values of the ARGs declared inside stages: the given build argument, else the default.
+    param([string[]]$Lines, [hashtable]$BuildArgs)
+    $values = [ordered]@{}
+    $inStage = $false
+    foreach ($line in $Lines) {
+        if ($line -match '^\s*FROM\s') { $inStage = $true; continue }
+        if (-not $inStage) { continue }
+        if ($line -match '^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)(?:=(.*))?\s*$') {
+            $name = $Matches[1]
+            $value = ([string]$Matches[2]).Trim().Trim('"').Trim("'")
+            if ($BuildArgs -and $BuildArgs.ContainsKey($name)) { $value = [string]$BuildArgs[$name] }
+            if ($value) { $values[$name] = $value }
+        }
+    }
+    return $values
+}
+
+function Get-DockerfileGlobalArg {
+    # Default of an ARG declared before the first FROM (for example TRIVY_VERSION), else ''.
+    param([string]$Path, [string]$Name)
+    foreach ($line in [System.IO.File]::ReadAllLines($Path)) {
+        if ($line -match '^\s*FROM\s') { break }
+        if ($line -match ('^\s*ARG\s+' + [regex]::Escape($Name) + '=(.+?)\s*$')) { return $Matches[1].Trim('"').Trim("'") }
+    }
+    return ''
+}
+
+function Get-DockerfileRootBase {
+    # External image a stage chain starts from (the FROM of its first ancestor stage), else $null.
+    param([string[]]$Lines, [string]$Stage)
+    $bases = @{}
+    foreach ($line in $Lines) {
+        if ($line -match '^\s*FROM\s+(?:--\S+\s+)*(\S+)\s+AS\s+(\S+)\s*$') { $bases[$Matches[2].ToLowerInvariant()] = $Matches[1] }
+    }
+    $name = $Stage.ToLowerInvariant()
+    for ($n = 0; $n -lt 20 -and $bases.ContainsKey($name); $n++) {
+        $base = [string]$bases[$name]
+        if (-not $bases.ContainsKey($base.ToLowerInvariant())) { return $base }
+        $name = $base.ToLowerInvariant()
+    }
+    return $null
+}
+
+function Get-PublicHttpsProxySetting {
+    # PUBLIC_HTTPS_PROXY in .env decides who serves HTTPS on TCP 80/443:
+    #   caddy   - the Caddy already running on this PC (it obtains and renews the certificates)
+    #   builtin - Polaron's own nginx gateway with Certbot
+    #   auto    - (default) caddy when a Caddy process already listens on TCP 80/443, else builtin
+    param([string]$Root)
+    $value = ([string](Read-DotEnvValues -Root $Root)['PUBLIC_HTTPS_PROXY']).Trim().ToLowerInvariant()
+    if (-not $value) { return 'auto' }
+    if (@('auto', 'caddy', 'builtin') -notcontains $value) {
+        throw "PUBLIC_HTTPS_PROXY in .env must be auto, caddy or builtin (found '$value')."
+    }
+    return $value
+}
+
+function Get-CaddyConfigFromCommandLine {
+    # The --config and --adapter values of a "caddy run|start" command line ('' when absent).
+    param([string]$CommandLine)
+    $result = [pscustomobject]@{ Config = ''; Adapter = '' }
+    if (-not $CommandLine) { return $result }
+    $m = [regex]::Match($CommandLine, '(?:^|\s)(?:--?config|-c)(?:=|\s+)(?:"([^"]+)"|''([^'']+)''|(\S+))')
+    if ($m.Success) { $result.Config = $m.Groups[1].Value + $m.Groups[2].Value + $m.Groups[3].Value }
+    $m = [regex]::Match($CommandLine, '(?:^|\s)(?:--?adapter|-a)(?:=|\s+)(?:"([^"]+)"|(\S+))')
+    if ($m.Success) { $result.Adapter = ($m.Groups[1].Value + $m.Groups[2].Value).ToLowerInvariant() }
+    return $result
+}
+
+function ConvertTo-CaddyVersion {
+    # "v2.11.4 h1:..." -> [version] 2.11.4; $null when no version is found.
+    param([string]$Text)
+    $m = [regex]::Match([string]$Text, 'v?(\d+)\.(\d+)\.(\d+)')
+    if (-not $m.Success) { return $null }
+    return [version]('{0}.{1}.{2}' -f $m.Groups[1].Value, $m.Groups[2].Value, $m.Groups[3].Value)
+}
+
+function Get-CaddySiteConfig {
+    # Caddy site blocks for Polaron. The IP gets a Let's Encrypt short-lived IP certificate over HTTP-01
+    # on Caddy's TCP 80; the domain (when set) gets Caddy's default certificate. Caddy obtains and renews
+    # both. Every request goes to the Polaron gateway, which listens on the loopback upstream only.
+    param([string]$PublicIP, [string]$Domain, [string]$Email, [string]$Upstream = '127.0.0.1:3001')
+    $parsed = $null
+    if (-not [System.Net.IPAddress]::TryParse($PublicIP, [ref]$parsed) -or $PublicIP -notmatch '^\d{1,3}(\.\d{1,3}){3}$') {
+        throw "Invalid public IPv4 address for Caddy: $PublicIP"
+    }
+    if ($Domain -and -not (Test-PublicDomainName $Domain)) { throw "Invalid domain for Caddy: $Domain" }
+    if ($Email -and $Email -notmatch '^[^\s{}"#;]+@[^\s{}"#;]+\.[^\s{}"#;]+$') { throw "Invalid email for Caddy: $Email" }
+    if ($Upstream -notmatch '^[A-Za-z0-9.\-]+:\d{1,5}$') { throw "Invalid PUBLIC_HTTPS_UPSTREAM: $Upstream" }
+    $nl = "`n"; $t = "`t"
+    $proxy = "${t}reverse_proxy $Upstream {$nl$t${t}flush_interval -1$nl$t}$nl"
+    $text = "# Polaron forensic suite - generated by script_docker/start_docker.ps1 from the root .env$nl" +
+        "# (PUBLIC_HTTPS_IP / PUBLIC_HTTPS_DOMAIN / PUBLIC_HTTPS_EMAIL). Do not edit: the next launch$nl" +
+        "# rewrites this file. Caddy obtains and renews the certificates; the Polaron gateway listens on$nl" +
+        "# $Upstream only.$nl$nl" +
+        "https://$PublicIP {$nl" +
+        "${t}tls {$nl" +
+        "$t$t# Let's Encrypt issues IP certificates only with the short-lived profile (about 6 days;$nl" +
+        "$t$t# Caddy renews them automatically). HTTP-01 runs on Caddy's TCP 80.$nl" +
+        "$t${t}issuer acme https://acme-v02.api.letsencrypt.org/directory {$nl"
+    if ($Email) { $text += "$t$t${t}email $Email$nl" }
+    $text += "$t$t${t}profile shortlived$nl" +
+        "$t$t${t}disable_tlsalpn_challenge$nl" +
+        "$t$t}$nl" +
+        "$t}$nl" + $proxy + "}$nl"
+    if ($Domain) {
+        $text += "${nl}https://$Domain {$nl"
+        if ($Email) { $text += "${t}tls $Email$nl" }
+        $text += $proxy + "}$nl"
+    }
+    return $text
+}
+
+function Test-CaddyImportPresent {
+    # True when the Caddyfile already imports polaron.caddy (as polaron*.caddy or polaron.caddy).
+    param([string]$Text)
+    return [bool]($Text -match '(?m)^[ \t]*import[ \t]+["'']?polaron\*?\.caddy["'']?[ \t]*\r?$')
+}
+
+function Add-CaddyImportLine {
+    # Caddyfile text with "import polaron*.caddy" appended once (same line endings). A glob that
+    # matches no file is only a warning in Caddy, so a deleted polaron.caddy never stops Caddy.
+    param([string]$Text)
+    if (Test-CaddyImportPresent -Text $Text) { return $Text }
+    $nl = if ($Text -match "`r`n") { "`r`n" } else { "`n" }
+    $body = [string]$Text
+    if ($body.Length -gt 0 -and -not $body.EndsWith("`n")) { $body += $nl }
+    return $body + $nl +
+        '# Polaron forensic suite: its sites are in polaron.caddy (written by script_docker/start_docker.ps1).' + $nl +
+        'import polaron*.caddy' + $nl
 }
 
 function Get-PublicNginxConfig {
