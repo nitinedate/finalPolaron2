@@ -1143,22 +1143,77 @@ function Invoke-HostExportPackages {
     return $out
 }
 
-function Wait-AdbDevice {
-    param($Adb, [string]$LogPath, [int]$Seconds = 50)
-    $lines = @()
+function Set-MobileUsbHostAwake {
+    if (-not ('AetherisStayAwake' -as [type])) {
+        Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public static class AetherisStayAwake { [DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags); }'
+    }
+    # ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED for this collection process.
+    try { [AetherisStayAwake]::SetThreadExecutionState([uint32]0x80000003) | Out-Null } catch {}
+}
+
+function Get-AdbLineState {
+    param($Adb)
+    $state = "none"
+    $serial = ""
     try { $lines = @(& $Adb devices 2>$null) } catch { $lines = @() }
     foreach ($line in $lines) {
         $t = ([string]$line).Trim()
-        if ($t -match '\s+device$') {
-            Write-AcquireLog $LogPath ("adb device already ready: {0}" -f $t)
+        if ($t -match '^(\S+)\s+device$') { return @{ state = "device"; serial = $Matches[1] } }
+        if ($t -match '^(\S+)\s+unauthorized$') { $state = "unauthorized"; $serial = $Matches[1] }
+        elseif ($t -match '^(\S+)\s+offline$' -and $state -eq "none") { $state = "offline"; $serial = $Matches[1] }
+    }
+    return @{ state = $state; serial = $serial }
+}
+
+function Stop-AdbKeepAlive {
+    if ($script:AdbKeepAliveJob) {
+        try { Stop-Job $script:AdbKeepAliveJob -ErrorAction SilentlyContinue } catch {}
+        try { Remove-Job $script:AdbKeepAliveJob -Force -ErrorAction SilentlyContinue } catch {}
+        $script:AdbKeepAliveJob = $null
+    }
+}
+
+function Start-AdbKeepAlive {
+    param($Adb, [string]$Serial, [string]$LogPath)
+    Stop-AdbKeepAlive
+    if (-not $Adb -or -not $Serial) { return }
+    $script:AdbKeepAliveJob = Start-Job -Name "aetheris-adb-keepalive" -ScriptBlock {
+        param($Exe, $Serial)
+        while ($true) {
+            Start-Sleep -Seconds 20
+            try { & $Exe -s $Serial get-state 1>$null 2>$null } catch {}
+        }
+    } -ArgumentList $Adb, $Serial
+    Write-AcquireLog $LogPath ("adb keepalive started for {0} so a long copy does not idle the USB link." -f $Serial)
+}
+
+function Wait-AdbDevice {
+    param($Adb, [string]$LogPath, [int]$Seconds = 50)
+    $seen = Get-AdbLineState -Adb $Adb
+    if ($seen.state -eq "device") {
+        Write-AcquireLog $LogPath ("adb device already ready: {0}" -f $seen.serial)
+        return "device"
+    }
+    if ($seen.state -eq "unauthorized") {
+        Write-AcquireLog $LogPath "Phone is in adb unauthorized - unlock and tap Allow USB debugging. The adb server was left running so the prompt stays up."
+        return "unauthorized"
+    }
+    # A phone that just switched to File transfer often appears a few seconds late.
+    # Killing adb here used to reset the USB gadget and drop the session.
+    $gentle = (Get-Date).AddSeconds(8)
+    while ((Get-Date) -lt $gentle) {
+        Start-Sleep -Seconds 2
+        $seen = Get-AdbLineState -Adb $Adb
+        if ($seen.state -eq "device") {
+            Write-AcquireLog $LogPath ("adb device ready without restarting adb: {0}" -f $seen.serial)
             return "device"
         }
+        if ($seen.state -eq "unauthorized") {
+            Write-AcquireLog $LogPath "Phone is in adb unauthorized - unlock and tap Allow USB debugging."
+            return "unauthorized"
+        }
     }
-    Write-AcquireLog $LogPath "Restarting adb so USB debugging is visible beside MTP/file-transfer..."
-    try {
-        Get-Process -Name adb -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    } catch {}
-    Start-Sleep -Milliseconds 800
+    Write-AcquireLog $LogPath "adb did not list the phone; restarting the adb server once."
     try { & $Adb kill-server 2>$null | Out-Null } catch {}
     Start-Sleep -Milliseconds 800
     try { & $Adb start-server 2>$null | Out-Null } catch {}
@@ -1517,6 +1572,7 @@ function Invoke-AndroidAdbAcquire {
         return @{ ok = $false; method = $null; error = "adb_not_found"; adb_state = "none"; app_private = $false }
     }
     Write-AcquireLog $LogPath ("Using adb: {0}" -f $adb)
+    Set-MobileUsbHostAwake
     $adbState = Wait-AdbDevice -Adb $adb -LogPath $LogPath -Seconds 50
     if ($adbState -eq "unauthorized") {
         Write-AcquireLog $LogPath "adb unauthorized - unlock phone and tap Allow USB debugging. Falling back to MTP if available."
@@ -1527,6 +1583,8 @@ function Invoke-AndroidAdbAcquire {
         return @{ ok = $false; method = "android_adb"; error = "adb_no_device"; adb_state = "none"; app_private = $false }
     }
     Invoke-AdbDeviceStateDump -Adb $adb -OutDir $OutDir -LogPath $LogPath
+    $ready = Get-AdbLineState -Adb $adb
+    if ($ready.serial) { Start-AdbKeepAlive -Adb $adb -Serial $ready.serial -LogPath $LogPath }
 
     # Collect small private WhatsApp keys before the large shared-media copies.
     # The helper uses existing root/su or permitted run-as, never writes to the phone,
@@ -1805,6 +1863,7 @@ function Invoke-AndroidAdbAcquire {
     if ($appPrivate) { $selectedMethod = "adb_android_full_file_system" }
     elseif ($sharedComplete) { $selectedMethod = "adb_android_file_system" }
     Write-AcquireLog $LogPath ("adb Android acquire finished: {0} file(s), app_private={1}, sms_providers={2}, shared_complete={3}" -f $count, $appPrivate, $smsOk, $sharedComplete)
+    Stop-AdbKeepAlive
     return @{
         ok               = $ok
         method           = $selectedMethod
@@ -1850,6 +1909,7 @@ function Invoke-IosToolAcquire {
         [string]$RunName = "",
         [string]$Stamp = ""
     )
+    Set-MobileUsbHostAwake
     $mdsPresent = Test-AppleMobileDeviceSupport
     if (-not $mdsPresent) {
         Write-AcquireLog $LogPath "Apple Mobile Device Support folder/service not found. Trying usbmux via pymobiledevice3 anyway (WPD/MTP is not a substitute for iTunes backup)."
@@ -2345,6 +2405,7 @@ function Invoke-IosAfcAcquire {
         [int64]$BackupBytes = 0,
         [int]$BackupFiles = 0
     )
+    Set-MobileUsbHostAwake
     $py = Find-IosKitPython
     $scriptPath = Join-Path (Get-RepoRoot) "scripts\ios_usbmux_afc.py"
     if (-not $py -or -not (Test-Path -LiteralPath $scriptPath)) {

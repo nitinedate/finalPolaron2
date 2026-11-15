@@ -312,12 +312,28 @@ def main() -> int:
 
         # Query the device before choosing a staging volume.  The previous fixed
         # 80 GiB floor allowed a ~120 GiB-used phone to fill F:\ib near the end.
+        # Keep this lockdown for the first backup attempt. Closing it and opening
+        # a second session is a common reason the iPhone drops off USB.
         sizing_lockdown = create_using_usbmux(serial=udid)
-        need_bytes, sizing = required_backup_free_bytes(sizing_lockdown, args.required_free_bytes)
         try:
-            sizing_lockdown.close()
+            need_bytes, sizing = required_backup_free_bytes(sizing_lockdown, args.required_free_bytes)
         except Exception:
-            pass
+            try:
+                sizing_lockdown.close()
+            except Exception:
+                pass
+            raise
+        held_lockdown = sizing_lockdown
+
+        def _release_held() -> None:
+            nonlocal held_lockdown
+            if held_lockdown is None:
+                return
+            try:
+                held_lockdown.close()
+            except Exception:
+                pass
+            held_lockdown = None
         preferred = str(dest.resolve())[:1] if len(str(dest.resolve())) > 1 and str(dest.resolve())[1:2] == ":" else ""
         _emit({
             "stage": "storage_preflight",
@@ -341,6 +357,7 @@ def main() -> int:
                 payload["required_free_bytes"] = need_bytes
                 payload["volumes"] = _volume_inventory()
                 _emit(payload)
+                _release_held()
                 return 1
             staged = True
             _emit({"stage": "short_path", "dest": str(write_root), "requested_dest": str(dest)})
@@ -363,6 +380,7 @@ def main() -> int:
             payload["required_free_bytes"] = need_bytes
             payload["volumes"] = _volume_inventory()
             _emit(payload)
+            _release_held()
             return 1
 
         last_exc: BaseException | None = None
@@ -373,7 +391,10 @@ def main() -> int:
             force_full = False
             try:
                 _emit({"stage": "attempt", "attempt": attempt, "full": full, "dest": str(write_root)})
-                lockdown = create_using_usbmux(serial=udid)
+                lockdown = held_lockdown
+                held_lockdown = None
+                if lockdown is None:
+                    lockdown = create_using_usbmux(serial=udid)
                 try:
                     svc = Mobilebackup2Service(lockdown)
                     svc.backup(full=full, backup_directory=str(write_root), progress_callback=_progress)

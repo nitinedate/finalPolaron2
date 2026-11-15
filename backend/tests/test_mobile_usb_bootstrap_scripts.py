@@ -20,6 +20,24 @@ def test_network_repair_replaces_stale_urlacl_for_current_user():
     assert "netsh.exe http add urlacl" in text
 
 
+def test_helper_refresh_does_not_reset_usb():
+    helper = (ROOT / "scripts" / "host-drive-helper.ps1").read_text(encoding="utf-8")
+    ensure = (ROOT / "scripts" / "ensure-host-drive-helper.ps1").read_text(encoding="utf-8")
+    assert 'HelperVersion = "5.60"' in helper
+    assert 'ExpectedHelperVersion = "5.60"' in ensure
+    assert "proc.Kill()" not in helper
+    assert "Test-UsbTransferActive" in helper
+    assert "EnumFresh" in helper
+    acquire = (ROOT / "scripts" / "host-mobile-acquire.ps1").read_text(encoding="utf-8")
+    assert "Get-Process -Name adb" not in acquire
+    assert "Start-AdbKeepAlive" in acquire
+    assert "restarting the adb server once" in acquire
+    backup = (ROOT / "scripts" / "ios_usbmux_backup.py").read_text(encoding="utf-8")
+    assert "held_lockdown" in backup
+    listing = (ROOT / "backend" / "app" / "services" / "mobile_acquire" / "ios_usbmux.py").read_text(encoding="utf-8")
+    assert "Opening lockdown here" in listing
+
+
 def test_mobile_usb_repair_self_elevates_and_checks_pnp():
     text = (ROOT / "scripts" / "repair-mobile-usb.ps1").read_text(encoding="utf-8")
     assert "-Verb RunAs" in text

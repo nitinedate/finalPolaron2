@@ -33,15 +33,11 @@ def test_list_ios_devices_uses_usbmux(monkeypatch):
     async def fake_list():
         return [_Dev("00008150-0002659C0CBB401C")]
 
-    class _Lock:
-        udid = "00008150-0002659C0CBB401C"
-        display_name = "iPhone 17"
-        product_type = "iPhone18,3"
-        product_version = "26.6"
+    calls = {"n": 0}
 
     async def fake_lockdown(**kwargs):
-        assert kwargs.get("serial") == "00008150-0002659C0CBB401C"
-        return _Lock()
+        calls["n"] += 1
+        raise AssertionError("listing devices must not open lockdown")
 
     fake_usbmux = SimpleNamespace(list_devices=fake_list)
     fake_ld = SimpleNamespace(create_using_usbmux=fake_lockdown)
@@ -49,10 +45,12 @@ def test_list_ios_devices_uses_usbmux(monkeypatch):
     monkeypatch.setitem(__import__("sys").modules, "pymobiledevice3.lockdown", fake_ld)
 
     devices = ios_usbmux.list_ios_devices()
+    assert calls["n"] == 0
     assert len(devices) == 1
     assert devices[0]["udid"] == "00008150-0002659C0CBB401C"
-    assert devices[0]["name"] == "iPhone 17"
+    assert devices[0]["name"] == ""
     assert ios_usbmux.list_ios_udids() == ["00008150-0002659C0CBB401C"]
+    assert calls["n"] == 0
 
 
 def test_list_ios_devices_empty_on_import_error(monkeypatch):
@@ -70,13 +68,8 @@ def test_list_ios_devices_accepts_sync_usbmux(monkeypatch):
     def fake_list():
         return [_Dev("ABCD-SYNC")]
 
-    class _Lock:
-        display_name = "iPhone"
-        product_type = "iPhone15,2"
-        product_version = "18.0"
-
     def fake_lockdown(**kwargs):
-        return _Lock()
+        raise AssertionError("listing devices must not open lockdown")
 
     fake_usbmux = SimpleNamespace(list_devices=fake_list)
     fake_ld = SimpleNamespace(create_using_usbmux=fake_lockdown)
@@ -85,7 +78,8 @@ def test_list_ios_devices_accepts_sync_usbmux(monkeypatch):
 
     devices = ios_usbmux.list_ios_devices()
     assert devices[0]["udid"] == "ABCD-SYNC"
-    assert devices[0]["name"] == "iPhone"
+    assert devices[0]["name"] == ""
+    assert devices[0]["connection"] == "USB"
 
 
 def test_apply_ios_identity_clears_unknown_fields():
