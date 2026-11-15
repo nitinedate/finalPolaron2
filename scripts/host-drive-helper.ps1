@@ -1215,6 +1215,7 @@ function Get-StartedUsbInstanceIds {
     $err = $tmp + ".err"
     $pnputil = Join-Path $env:SystemRoot "System32\pnputil.exe"
     $pnputilOk = $false
+    $finished = $false
     try {
         if (Test-Path -LiteralPath $pnputil) {
             $proc = Start-Process -FilePath $pnputil -ArgumentList @("/enum-devices", "/connected", "/ids") `
