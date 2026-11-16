@@ -801,6 +801,57 @@ function Get-PublicHttpsProxySetting {
     return $value
 }
 
+function Get-CaddyAutostartSetting {
+    # V1.31.1: CADDY_AUTOSTART in .env - what the launcher does when Caddy is not running:
+    #   auto    - (default) start Caddy's Windows service or scheduled task; if it has none, start
+    #             caddy.exe in the background with the Caddyfile
+    #   service - like auto, but register Caddy as a Windows service (starts with Windows) when it has none
+    #   off     - never start Caddy; stop with instructions
+    param([string]$Root)
+    $value = ([string](Read-DotEnvValues -Root $Root)['CADDY_AUTOSTART']).Trim().ToLowerInvariant()
+    if (-not $value -or @('true', 'yes', '1', 'on') -contains $value) { return 'auto' }
+    if (@('false', 'no', '0') -contains $value) { return 'off' }
+    if (@('auto', 'service', 'off') -notcontains $value) {
+        throw "CADDY_AUTOSTART in .env must be auto, service or off (found '$value')."
+    }
+    return $value
+}
+
+function Get-CaddyAdminAddress {
+    # The admin API address set in the Caddyfile's global options block ('admin <address>' or 'admin off'),
+    # or Caddy's default localhost:2019. 'caddy reload' needs this API.
+    param([string]$Text)
+    $default = 'localhost:2019'
+    $lines = @((([string]$Text) -replace "`r", '') -split "`n")
+    $i = 0
+    while ($i -lt $lines.Count -and ($lines[$i].Trim() -eq '' -or $lines[$i].Trim().StartsWith('#'))) { $i++ }
+    if ($i -ge $lines.Count -or $lines[$i].Trim() -ne '{') { return $default }
+    $depth = 1
+    for ($j = $i + 1; $j -lt $lines.Count; $j++) {
+        $line = ($lines[$j] -replace '\s+#.*$', '').Trim()
+        if ($depth -eq 1 -and $line -match '^admin(?:\s+([^\s{]+))?') {
+            $value = ([string]$Matches[1]).Trim('"')
+            if (-not $value) { return $default }
+            return $value
+        }
+        $depth += ([regex]::Matches($line, '\{')).Count - ([regex]::Matches($line, '\}')).Count
+        if ($depth -le 0) { break }
+    }
+    return $default
+}
+
+function ConvertTo-CaddyAdminUrl {
+    # http://host:port/config/ for an admin address, or '' when it cannot be reached over TCP (off, unix socket).
+    param([string]$Address)
+    $a = ([string]$Address).Trim() -replace '^tcp/', ''
+    if (-not $a -or $a -eq 'off' -or $a -match '^unix/') { return '' }
+    $a = $a -replace '^https?://', ''
+    if ($a -notmatch '^(.*):(\d+)$') { return '' }
+    $hostPart = $Matches[1]; $port = $Matches[2]
+    if (-not $hostPart -or @('localhost', '0.0.0.0', '[::]', '[::1]', '::1', '::') -contains $hostPart) { $hostPart = '127.0.0.1' }
+    return "http://${hostPart}:$port/config/"
+}
+
 function Get-CaddyConfigFromCommandLine {
     # The --config and --adapter values of a "caddy run|start" command line ('' when absent).
     param([string]$CommandLine)

@@ -40,7 +40,7 @@ export type BrowserPickedFolder = {
   truncated: boolean;
   skipped: number;
   /** How the folder was chosen. */
-  via: "directory-picker" | "input";
+  via: "directory-picker" | "input" | "files";
 };
 
 export type BrowserManifestFile = { path: string; size: number; mtime_ms: number };
@@ -196,6 +196,58 @@ export function folderFromInputFiles(list: File[]): BrowserPickedFolder | null {
     for (let i = 1; i < parts.length; i += 1) dirSet.add(parts.slice(0, i).join("/"));
   }
   return { name, files, dirs: Array.from(dirSet), truncated, skipped: 0, via: "input" };
+}
+
+/** Image files chosen one by one (for example every segment of an E01 set at the root of a USB disk). */
+export function folderFromLooseFiles(list: File[]): BrowserPickedFolder | null {
+  const sorted = [...list].sort((a, b) => ordinal(a.name, b.name));
+  const files: BrowserPickedFile[] = [];
+  const seen = new Set<string>();
+  let truncated = false;
+  for (const file of sorted) {
+    if (!safeRelative(file.name) || file.name.includes("/") || seen.has(file.name)) continue;
+    if (files.length >= MAX_BROWSER_FILES) {
+      truncated = true;
+      break;
+    }
+    seen.add(file.name);
+    files.push({ path: file.name, file });
+  }
+  if (!files.length) return null;
+  const lead = files.find((f) => IMAGE_FILE_RE.test(f.path)) ?? files[0];
+  const name = lead.path.replace(/\.[^.]+$/, "") || lead.path;
+  return { name, files, dirs: [], truncated, skipped: 0, via: "files" };
+}
+
+const IMAGE_FILE_RE = /\.(?:e01|ex01|l01|lx01|s01|001|dd|raw|img|bin|iso|vmdk|vhdx?|aff4?|dmg|ufdx?|pas|zip|tar|ad1)$/i;
+
+function pickFilesWithInput(): Promise<File[] | null> {
+  return new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.multiple = true;
+    input.style.display = "none";
+    let done = false;
+    const finish = (value: File[] | null) => {
+      if (done) return;
+      done = true;
+      input.remove();
+      resolve(value);
+    };
+    input.addEventListener("change", () => finish(input.files ? Array.from(input.files) : null));
+    input.addEventListener("cancel", () => finish(null));
+    document.body.appendChild(input);
+    input.click();
+  });
+}
+
+/**
+ * Open this computer's file window and take the selected image files. Unlike a folder, files can be
+ * chosen anywhere, including the root of a drive (browsers refuse a whole drive as a folder).
+ */
+export async function pickBrowserFiles(): Promise<BrowserPickedFolder | null> {
+  const list = await pickFilesWithInput();
+  return list && list.length ? folderFromLooseFiles(list) : null;
 }
 
 /**

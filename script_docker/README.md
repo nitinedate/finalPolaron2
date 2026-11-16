@@ -169,6 +169,25 @@ process holds TCP 80/443. Then `start_docker_prod.cmd`:
 untouched, for administrators who edit Caddy themselves. `PUBLIC_HTTPS_PROXY=builtin` uses Polaron's own
 nginx and Certbot on TCP 80/443.
 
+**Caddy not running (V1.31.1).** `caddy reload` needs a running Caddy (its admin API, `localhost:2019` by
+default). When nothing listens on TCP 80/443 and the admin API does not answer, the launcher starts Caddy
+once the new Caddyfile has passed `caddy validate`, then reloads:
+- **Windows service** for Caddy (sc.exe, WinSW or NSSM): started. A service set to *Manual* gets a warning,
+  because it stays stopped after a reboot (`Set-Service -Name caddy -StartupType Automatic`).
+- **Scheduled task** that runs Caddy: run.
+- **Neither:** `caddy.exe run --config <CADDY_CONFIG> --adapter caddyfile` in its own hidden console, with
+  its log in `deployment\caddy\caddy-background.log`. It keeps running when the launcher window closes,
+  but not after a reboot or sign-out. `CADDY_AUTOSTART=service` registers the Windows service `caddy`
+  (automatic start, restart on crash) instead.
+- **TCP 80/443 held by another program** (IIS/http.sys, another web server, a container): startup stops
+  and names it. Polaron's own builtin-mode gateway is the exception: it is stopped so Caddy can listen,
+  and started again if Caddy fails.
+- A Caddyfile with `admin off` is reported before anything is changed.
+
+If Polaron's sites cannot be added, everything is put back: both files are restored, the Caddy that was
+started is stopped again (a service it registered is removed), and Polaron's own gateway is restarted.
+`CADDY_AUTOSTART=off` turns this off; `CADDY_START_SECONDS` (default 45) is how long the launcher waits.
+
 ## HTTPS and renewal
 
 The public profiles use pinned **Certbot v5.8.0** in Linux Docker and the

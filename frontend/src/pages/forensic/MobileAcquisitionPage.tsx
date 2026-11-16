@@ -2426,6 +2426,7 @@ export function MobileAcquisitionPage() {
         caseDir: folder.path,
         caseId: form.case_id.trim() || folder.name,
         scope: importScope,
+        browser: folder.browser,
         onProgress: setClientImport,
         signal: importAbortRef.current.signal,
       });
@@ -2866,6 +2867,7 @@ export function MobileAcquisitionPage() {
               mobile
               actionLabel="Copy this folder to the forensic server"
               listMaxHeight="max-h-56"
+              allowBrowserFiles={false}
               onUseFolder={(folder) => void pullFromClient(folder)}
             />
           ) : null}

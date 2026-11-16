@@ -1559,6 +1559,8 @@ export interface ClientImportStartPayload {
   total_bytes: number;
   manifest_sha256: string;
   relay: boolean;
+  /** V1.31.2: the folder was chosen in the browser and this tab serves it. */
+  browser?: boolean;
   skipped?: number;
   agent_version?: string;
   case_id?: string;

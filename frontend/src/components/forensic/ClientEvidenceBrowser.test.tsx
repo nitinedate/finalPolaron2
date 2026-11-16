@@ -218,6 +218,35 @@ describe("This computer without the agent (browser folder window)", () => {
     expect(confirmed[0].browser?.files.map((f) => f.path).sort()).toEqual(["laptop.E01", "laptop.E02", "notes/readme.txt"]);
   });
 
+  it("takes image files chosen one by one, for an image at the root of a drive", async () => {
+    installFakeAgent("offline");
+    vi.stubGlobal("showDirectoryPicker", vi.fn());
+    const segments = [new File(["aaaa"], "laptop.E01"), new File(["bb"], "laptop.E02"), new File(["c"], "laptop.E03")];
+    const click = vi.spyOn(HTMLInputElement.prototype, "click").mockImplementation(function (this: HTMLInputElement) {
+      expect(this.type).toBe("file");
+      expect(this.hasAttribute("webkitdirectory")).toBe(false);
+      Object.defineProperty(this, "files", { configurable: true, value: segments });
+      this.dispatchEvent(new Event("change"));
+    });
+    let confirmed: ClientSelectedFolder[] = [];
+    render(<ClientBrowseFolderDialog open mobile={false} onClose={() => undefined} onConfirm={(f) => (confirmed = f)} />);
+    expect(await screen.findByText(/Browsers do not accept a whole drive as a folder/)).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: /Choose image files/ }));
+    expect(await screen.findByText(/laptop · chosen in this browser · 3 files/)).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Start extraction (1 directory)" }));
+    expect(confirmed[0].evidenceCount).toBe(3);
+    expect(confirmed[0].browser?.via).toBe("files");
+    click.mockRestore();
+  });
+
+  it("does not offer single files where a whole case folder is needed", async () => {
+    installFakeAgent("offline");
+    vi.stubGlobal("showDirectoryPicker", vi.fn());
+    render(<ClientEvidenceBrowser mobile allowBrowserFiles={false} onUseFolder={() => undefined} />);
+    expect(await screen.findByRole("button", { name: /Choose folder on this computer/ })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Choose image files/ })).toBeNull();
+  });
+
   it("says when the browser blocks this site from an installed agent", async () => {
     installFakeAgent("offline");
     vi.stubGlobal("showDirectoryPicker", vi.fn());

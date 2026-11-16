@@ -513,8 +513,13 @@ def start_import(
     request_ip: str | None,
     user_email: str,
     platform: str | None,
+    browser_share: bool = False,
 ) -> dict[str, Any]:
-    """Validate the client share, pick the run, and start the copy in the background."""
+    """Validate the client share, pick the run, and start the copy in the background.
+
+    browser_share (V1.31.2): the folder was chosen in the examiner's browser, and that tab answers
+    through the outbound relay only, so no LAN address of the PC is tried.
+    """
     from app.services.client_evidence import agent_client, registry, relay
 
     if not enabled():
@@ -541,10 +546,19 @@ def start_import(
 
     import_id = uuid.uuid4().hex[:20]
     pseudo_job = f"acqimport-{import_id}"
-    candidates, rejected = agent_client.build_candidates(
-        port=port, explicit_url=agent_url, request_ip=request_ip, addresses=addresses, hostname=hostname,
-    )
-    use_relay = relay_supported and relay.enabled()
+    if browser_share:
+        if not relay.enabled():
+            raise ClientEvidenceError(
+                "A folder chosen in the browser reaches the server through the outbound connection, which is "
+                "turned off on this server (CLIENT_EVIDENCE_RELAY_ENABLED=false). Turn it on, or install the "
+                "Client Evidence Agent on this computer."
+            )
+        candidates, rejected = [], []
+    else:
+        candidates, rejected = agent_client.build_candidates(
+            port=port, explicit_url=agent_url, request_ip=request_ip, addresses=addresses, hostname=hostname,
+        )
+    use_relay = (relay_supported or browser_share) and relay.enabled()
     if use_relay:
         candidates.append(relay.RELAY_URL)
     if not candidates:
@@ -613,6 +627,7 @@ def start_import(
         "share_id": share_id,
         "manifest_sha256": record.manifest_sha256,
         "agent_version": agent_version or str(manifest.get("agent_version") or ""),
+        "browser_share": bool(browser_share),
         "skipped_on_client": int(skipped or 0),
         "total_files": len(selection.files),
         "total_bytes": sum(f.size for f in selection.files),

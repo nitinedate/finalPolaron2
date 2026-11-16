@@ -7,6 +7,7 @@ import {
   createBrowserShare,
   encodeForWire,
   folderFromInputFiles,
+  folderFromLooseFiles,
   isAllZero,
   markBrowserShareRegistered,
   reconnectBrowserShare,
@@ -91,6 +92,25 @@ describe("frozen file list (same as the Client Evidence Agent)", () => {
     expect(f.name).toBe("Case-0423");
     expect(f.files.map((x) => x.path).sort()).toEqual(["Case/notes.txt", "laptop.E01"]);
     expect(f.dirs).toEqual(["Case"]);
+  });
+});
+
+describe("image files chosen one by one (image at the root of a drive)", () => {
+  it("serves the selected segments as a flat list named after the image", async () => {
+    const pick = [
+      new File(["bb"], "laptop.E02", { lastModified: 2 }),
+      new File(["aaaa"], "laptop.E01", { lastModified: 1 }),
+      new File(["notes"], "acquisition-log.txt", { lastModified: 3 }),
+      new File(["dup"], "laptop.E01", { lastModified: 4 }),
+    ];
+    const f = folderFromLooseFiles(pick) as BrowserPickedFolder;
+    expect(f.name).toBe("laptop");
+    expect(f.via).toBe("files");
+    expect(f.dirs).toEqual([]);
+    expect(f.files.map((x) => x.path)).toEqual(["acquisition-log.txt", "laptop.E01", "laptop.E02"]);
+    const manifest = await buildBrowserManifest(f);
+    expect(manifest.totalBytes).toBe(11);
+    expect(folderFromLooseFiles([])).toBeNull();
   });
 });
 

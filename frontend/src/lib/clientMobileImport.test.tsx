@@ -15,6 +15,7 @@ vi.mock("./hostDriveHelper", async (importOriginal) => {
 });
 
 import { acquisitionApi } from "./forensicApi";
+import { activeBrowserShares, folderFromInputFiles } from "./browserEvidenceShare";
 import { isBrowserOnOfficeHost } from "./hostDriveHelper";
 import {
   ClientAgentRequiredError,
@@ -195,6 +196,42 @@ describe("copying the client image to the forensic server", () => {
       copyClientRunToServer({ caseDir: "C:\\evidence\\CASE-2026-001", caseId: "CASE-2026-001" }),
     ).rejects.toThrow(/older than this release/);
     expect(calls.some((c) => c.method === "DELETE" && c.url.endsWith(`/shares/${SHARE.share_id}`))).toBe(true);
+  });
+
+  it("copies a case folder chosen in this browser without the agent: this tab serves it, then stops", async () => {
+    const calls = installFakes({ agent: "offline" });
+    api.startClientImport.mockResolvedValue({ import_id: "e".repeat(20), status: "completed", run_name: "R", result: { ok: true } });
+    const files = [
+      ["02_Original_Extraction/R/phone.ufd", "ufd"],
+      ["07_Logs/R/collection_summary.json", "{}"],
+    ].map(([path, data]) => {
+      const file = new File([data], path.split("/").pop() as string, { lastModified: 1_731_000_000_000 });
+      Object.defineProperty(file, "webkitRelativePath", { value: `CASE-2026-001/${path}` });
+      return file;
+    });
+    const folder = folderFromInputFiles(files);
+    expect(folder).not.toBeNull();
+    const state = await copyClientRunToServer({ caseDir: "CASE-2026-001", caseId: "CASE-2026-001", browser: folder ?? undefined });
+    expect(state.status).toBe("completed");
+    const payload = api.startClientImport.mock.calls[0][0];
+    expect(payload).toMatchObject({
+      browser: true, relay: true, addresses: [], client_root: "CASE-2026-001", file_count: 2, total_bytes: 5,
+      agent_version: "browser-1.0.0", case_id: "CASE-2026-001", scope: "full",
+    });
+    expect(payload.share_id).toMatch(/^ce[0-9a-f]{24}$/);
+    expect(calls.some((c) => /:9877\//.test(c.url))).toBe(false);
+    expect(activeBrowserShares().some((s) => s.shareId === payload.share_id)).toBe(false);
+  });
+
+  it("stops serving the browser folder when the server refuses the copy", async () => {
+    installFakes({ agent: "offline" });
+    api.startClientImport.mockRejectedValue(new Error("Run X has no files to copy."));
+    const file = new File(["x"], "a.txt", { lastModified: 1 });
+    Object.defineProperty(file, "webkitRelativePath", { value: "CASE-9/a.txt" });
+    await expect(
+      copyClientRunToServer({ caseDir: "CASE-9", caseId: "CASE-9", browser: folderFromInputFiles([file]) ?? undefined }),
+    ).rejects.toThrow(/no files to copy/);
+    expect(activeBrowserShares()).toHaveLength(0);
   });
 
   it("explains what to install when the Client Evidence Agent is missing, unpaired or local-only", async () => {

@@ -14,6 +14,7 @@ echo             Both come from the root .env. An empty domain means IP only.
 echo  Certs    : trusted Let's Encrypt certificates, renewed automatically.
 echo  Caddy    : if Caddy already serves TCP 80/443 here, Polaron joins it
 echo             (PUBLIC_HTTPS_PROXY in .env); Caddy then renews the certificates.
+echo             A stopped Caddy is started first (CADDY_AUTOSTART in .env).
 echo  Common   : PostgreSQL, Redis, MinIO, OpenSearch, pgAdmin,
 echo             MailHog - shared with other projects, not stopped.
 echo  Neo4j    : Polaron-owned Docker service.

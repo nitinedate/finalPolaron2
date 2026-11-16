@@ -150,6 +150,8 @@ class ClientImportRequest(BaseModel):
     manifest_sha256: str = Field(default="", max_length=64)
     agent_url: str | None = Field(default=None, max_length=200)
     relay: bool = False
+    # V1.31.2: the folder was chosen in the browser and this tab serves it (outbound connection only).
+    browser: bool = False
     skipped: int = Field(default=0, ge=0)
     agent_version: str = Field(default="", max_length=40)
     # Which run to copy. Empty run_name = newest sealed run in the folder.
@@ -783,6 +785,7 @@ def start_client_import(
             manifest_sha256=payload.manifest_sha256,
             agent_url=payload.agent_url,
             relay_supported=payload.relay,
+            browser_share=payload.browser,
             skipped=payload.skipped,
             agent_version=payload.agent_version,
             case_id=payload.case_id,

@@ -12,6 +12,7 @@
 
 import { ClientAgentError, clientAgentStatus, clientRelayTargetForService, createClientShare, joinClientPath, listClientDirectory, revokeClientShare } from "./clientEvidenceAgent";
 import { inferApiService } from "./apiRouting";
+import { createBrowserShare, stopBrowserShare, type BrowserPickedFolder } from "./browserEvidenceShare";
 import { acquisitionApi } from "./forensicApi";
 import { getLocalHelperIdentity, isBrowserOnOfficeHost } from "./hostDriveHelper";
 import type { ClientImportCapabilities, ClientImportState } from "./types/forensic";
@@ -175,7 +176,10 @@ export async function copyClientRunToServer(opts: {
   scope?: ClientImportScope;
   onProgress?: (state: ClientImportState) => void;
   signal?: AbortSignal;
+  /** V1.31.2: a case folder chosen in this browser (no agent): this tab serves it to the server. */
+  browser?: BrowserPickedFolder;
 }): Promise<ClientImportState> {
+  if (opts.browser) return copyBrowserFolderToServer({ ...opts, browser: opts.browser });
   const agent = await clientAgentStatus(2_500);
   if (agent.state !== "online") {
     throw new ClientAgentRequiredError(
@@ -228,6 +232,56 @@ export async function copyClientRunToServer(opts: {
   } finally {
     // The server revokes the share when the copy ends; this is a second, local attempt.
     void revokeClientShare(share.share_id);
+  }
+}
+
+/**
+ * V1.31.2: the same server copy, for a case folder chosen in the browser. This tab answers the server's
+ * reads over the outbound relay (like the agent since V1.22), so it must stay open until the copy ends.
+ */
+async function copyBrowserFolderToServer(opts: {
+  caseId: string;
+  runName?: string;
+  scope?: ClientImportScope;
+  onProgress?: (state: ClientImportState) => void;
+  signal?: AbortSignal;
+  browser: BrowserPickedFolder;
+}): Promise<ClientImportState> {
+  const service = inferApiService("/api/acquisition/client-import");
+  const share = await createBrowserShare({
+    folder: opts.browser,
+    jobId: `mobile-image-${opts.caseId}`.slice(0, 80),
+    relay: clientRelayTargetForService(service),
+  });
+  let started: ClientImportState;
+  try {
+    started = await acquisitionApi.startClientImport({
+      share_id: share.share_id,
+      token: share.token,
+      port: share.port,
+      addresses: [],
+      hostname: share.hostname,
+      client_root: share.root,
+      file_count: share.file_count,
+      total_bytes: share.total_bytes,
+      manifest_sha256: share.manifest_sha256,
+      relay: true,
+      browser: true,
+      skipped: share.skipped || 0,
+      agent_version: share.agent_version,
+      case_id: opts.caseId,
+      run_name: opts.runName || "",
+      scope: opts.scope || "full",
+    });
+  } catch (e) {
+    stopBrowserShare(share.share_id);
+    throw e;
+  }
+  try {
+    return await follow(started, opts.onProgress, opts.signal);
+  } finally {
+    // The server revokes the share when the copy ends; this stops serving in this tab as well.
+    stopBrowserShare(share.share_id);
   }
 }
 

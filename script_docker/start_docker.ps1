@@ -1667,12 +1667,16 @@ function Resolve-CaddySetup {
     $upstream = [string]$dotEnv['PUBLIC_HTTPS_UPSTREAM']
     if (-not $upstream) { $upstream = '127.0.0.1:3001' }
     $manage = @('false', '0', 'no', 'off') -notcontains ([string]$dotEnv['CADDY_MANAGE_CONFIG']).Trim().ToLowerInvariant()
-    $setup = [pscustomobject]@{ Exe = ''; Config = ''; Dir = ''; Version = $null; Upstream = $upstream; Manage = $manage; Running = $false }
+    $startSeconds = 45
+    if ([string]$dotEnv['CADDY_START_SECONDS'] -match '^\s*(\d+)\s*$') { $startSeconds = [Math]::Max(5, [int]$Matches[1]) }
+    $setup = [pscustomobject]@{
+        Exe = ''; Config = ''; Dir = ''; Version = $null; Upstream = $upstream; Manage = $manage; Running = $false
+        Admin = 'localhost:2019'; Autostart = (Get-CaddyAutostartSetting -Root $Root); StartSeconds = $startSeconds
+    }
     if (-not $manage) { return $setup }
 
     $proc = $null
     try { $proc = Get-CaddyListenerProcess } catch { $proc = $null }
-    $setup.Running = [bool]$proc
     $exe = [string]$dotEnv['CADDY_EXE']
     if (-not $exe -and $proc -and $proc.Exe) { $exe = $proc.Exe }
     if (-not $exe) {
@@ -1689,6 +1693,9 @@ function Resolve-CaddySetup {
         if ($parsed.Config -and [System.IO.Path]::IsPathRooted($parsed.Config)) { $config = $parsed.Config }
         if (-not $adapter) { $adapter = $parsed.Adapter }
     }
+    if (-not $config -and -not $proc) {
+        throw 'Caddy is not running on this PC, and CADDY_CONFIG is not set, so the launcher does not know which Caddyfile to use. Set CADDY_CONFIG in .env (for example CADDY_CONFIG=C:\caddy\Caddyfile); the launcher then starts Caddy with it.'
+    }
     if (-not $config) {
         throw 'Cannot tell which Caddyfile the running Caddy uses (it was started without an absolute --config path, or the launcher cannot read its command line). Set CADDY_CONFIG in .env to that file, for example CADDY_CONFIG=C:\caddy\Caddyfile.'
     }
@@ -1698,7 +1705,15 @@ function Resolve-CaddySetup {
     if ($adapter -ne 'caddyfile') {
         throw "The running Caddy uses a $adapter config ($config). Polaron joins Caddy through a Caddyfile import. Use a Caddyfile, or set CADDY_MANAGE_CONFIG=false and add the sites of deployment\caddy\polaron.caddy to your config yourself."
     }
-    if (-not $proc) { Write-Warn 'No Caddy process is listening on TCP 80/443 on this PC; Caddy must be running for the reload.' }
+    $setup.Admin = Get-CaddyAdminAddress -Text ([System.IO.File]::ReadAllText($config))
+    if ($setup.Admin -eq 'off') {
+        throw "The Caddyfile $config turns Caddy's admin API off ('admin off'). Polaron adds its sites with 'caddy reload', which needs that API. Remove 'admin off' (the API then listens on localhost:2019 only), or set CADDY_MANAGE_CONFIG=false and add deployment\caddy\polaron.caddy to Caddy yourself. Nothing was changed."
+    }
+    $setup.Running = [bool]$proc
+    if (-not $setup.Running) { $setup.Running = Test-CaddyAdminApi -Address $setup.Admin }
+    if (-not $setup.Running) {
+        Write-Warn ("Caddy is not running on this PC (nothing listens on TCP 80/443 and its admin API at {0} does not answer). CADDY_AUTOSTART={1}." -f $setup.Admin, $setup.Autostart)
+    }
     $version = ConvertTo-CaddyVersion (Invoke-CaddyCapture -Exe $exe -Arguments @('version')).Output
     if (-not $version) {
         Write-Warn "Could not read the version of $exe."
@@ -1712,6 +1727,246 @@ function Resolve-CaddySetup {
     $setup.Dir = Split-Path -Parent $config
     $setup.Version = $version
     return $setup
+}
+
+function Test-CaddyAdminApi {
+    # True when Caddy's admin API answers at the address (any HTTP reply counts: Caddy is running).
+    param([string]$Address)
+    $url = ConvertTo-CaddyAdminUrl -Address $Address
+    if (-not $url) { return $false }
+    try {
+        Invoke-WebRequest -UseBasicParsing -Uri $url -TimeoutSec 3 -ErrorAction Stop | Out-Null
+        return $true
+    } catch {
+        return [bool]($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response)
+    }
+}
+
+function Test-LauncherIsAdministrator {
+    try {
+        $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { return $false }
+}
+
+function Find-CaddyService {
+    # The Windows service that runs Caddy (by name, display name or command line), preferring the one
+    # that runs this caddy.exe. Covers sc.exe, WinSW and NSSM installs.
+    param([string]$Exe)
+    $all = @(Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue | Where-Object {
+        ('{0} {1} {2}' -f $_.Name, $_.DisplayName, $_.PathName) -match 'caddy'
+    })
+    if ($all.Count -eq 0) { return $null }
+    $pick = @($all | Where-Object { $Exe -and ([string]$_.PathName).IndexOf($Exe, [StringComparison]::OrdinalIgnoreCase) -ge 0 } | Select-Object -First 1)
+    if ($pick.Count -eq 0) { $pick = @($all | Select-Object -First 1) }
+    $s = $pick[0]
+    return [pscustomobject]@{ Name = [string]$s.Name; StartMode = [string]$s.StartMode; State = [string]$s.State; PathName = [string]$s.PathName }
+}
+
+function Find-CaddyScheduledTask {
+    # A Task Scheduler task that starts Caddy (another common way to run it at boot).
+    param([string]$Exe)
+    $tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
+        $_.State -ne 'Disabled' -and @($_.Actions | Where-Object { ('{0} {1}' -f $_.Execute, $_.Arguments) -match 'caddy' }).Count -gt 0
+    } | Select-Object -First 1)
+    if ($tasks.Count -eq 0) { return $null }
+    return [pscustomobject]@{ TaskName = [string]$tasks[0].TaskName; TaskPath = [string]$tasks[0].TaskPath }
+}
+
+function Get-CaddyServiceCommand {
+    # The service command line for this caddy.exe and Caddyfile (a service starts in System32, so the
+    # Caddyfile is always given by full path).
+    param($Caddy)
+    return ('"{0}" run --config "{1}" --adapter caddyfile' -f $Caddy.Exe, $Caddy.Config)
+}
+
+function Register-CaddyService {
+    # CADDY_AUTOSTART=service: register Caddy as the Windows service 'caddy' (Caddy runs natively as a
+    # service: caddyserver.com/docs/running), started with Windows and restarted after a crash.
+    param($Caddy)
+    if (-not (Test-LauncherIsAdministrator)) {
+        throw 'CADDY_AUTOSTART=service needs Administrator to register the Caddy service. Run the launcher as Administrator, or set CADDY_AUTOSTART=auto.'
+    }
+    New-Service -Name 'caddy' -DisplayName 'Caddy web server' -StartupType Automatic -BinaryPathName (Get-CaddyServiceCommand -Caddy $Caddy) `
+        -Description 'Caddy (HTTPS for Polaron and the other sites in its Caddyfile). Registered by the Polaron launcher (CADDY_AUTOSTART=service).' | Out-Null
+    & sc.exe failure caddy reset= 86400 actions= restart/5000/restart/10000/restart/30000 | Out-Null
+    Write-Ok "Registered the Windows service 'caddy' (starts with Windows): $(Get-CaddyServiceCommand -Caddy $Caddy)"
+    return [pscustomobject]@{ Name = 'caddy'; StartMode = 'Auto'; State = 'Stopped'; PathName = (Get-CaddyServiceCommand -Caddy $Caddy) }
+}
+
+function Start-CaddyService {
+    # Ask Windows to start the service without blocking; Wait-CaddyReady decides when Caddy is up.
+    param([string]$Name)
+    $service = Get-Service -Name $Name -ErrorAction Stop
+    if ([string]$service.Status -eq 'Running') { return }
+    try { $service.Start() } catch {
+        $why = $_.Exception.Message
+        if ($_.Exception.InnerException) { $why = $_.Exception.InnerException.Message }
+        throw "Windows could not start the service '$Name': $why (starting a service needs the launcher to run as Administrator)."
+    }
+}
+
+function Start-CaddyProcessInBackground {
+    # No service or task: run caddy.exe with the Caddyfile in its own hidden console, so it keeps running
+    # after this launcher window closes. Caddy's log goes to deployment\caddy\caddy-background.log.
+    param($Caddy)
+    $logDir = Join-Path $root 'deployment/caddy'
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    $log = Join-Path $logDir 'caddy-background.log'
+    Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue
+    $arguments = @('run', '--config', ('"{0}"' -f $Caddy.Config), '--adapter', 'caddyfile')
+    $process = Start-Process -FilePath $Caddy.Exe -ArgumentList $arguments -WorkingDirectory $Caddy.Dir `
+        -WindowStyle Hidden -RedirectStandardError $log -PassThru -ErrorAction Stop
+    $state = [pscustomobject]@{ Pid = [int]$process.Id; Exe = $Caddy.Exe; Config = $Caddy.Config; Started = (Get-Date).ToString('o'); Log = $log }
+    [System.IO.File]::WriteAllText((Join-Path $logDir 'caddy-background.json'), ($state | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
+    return [pscustomobject]@{ Process = $process; Log = $log }
+}
+
+function Get-HttpsPortHolders {
+    # What, other than Caddy, holds TCP 80/443 here: Docker containers (by published port) and processes.
+    # PolaronGateway marks Polaron's own HTTPS gateway (PUBLIC_HTTPS_PROXY=builtin), which the launcher may move.
+    $holders = New-Object System.Collections.Generic.List[object]
+    $ids = @()
+    try { $ids = @(& docker ps -q 2>$null | Where-Object { $_ }) } catch { $ids = @() }
+    foreach ($id in $ids) {
+        $item = $null
+        try { $item = @(Get-DockerJson -DockerArgs @('inspect', $id))[0] } catch { $item = $null }
+        if (-not $item) { continue }
+        $project = [string]$item.Config.Labels.'com.docker.compose.project'
+        foreach ($prop in @($item.HostConfig.PortBindings.PSObject.Properties)) {
+            foreach ($bind in @($prop.Value)) {
+                $port = 0
+                if (-not [int]::TryParse([string]$bind.HostPort, [ref]$port)) { continue }
+                if (@(80, 443) -contains $port) {
+                    $holders.Add([pscustomobject]@{ Port = $port; Kind = 'container'; Name = ([string]$item.Name).TrimStart('/'); PolaronGateway = ($project -eq 'aetheris-gateway') })
+                }
+            }
+        }
+    }
+    foreach ($port in @(80, 443)) {
+        foreach ($listener in @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)) {
+            $owner = [int]$listener.OwningProcess
+            $proc = Get-Process -Id $owner -ErrorAction SilentlyContinue
+            $name = if ($proc) { [string]$proc.ProcessName } else { "PID $owner" }
+            if ($name -match '^caddy' -or $name -match '^(docker|dockerd|vpnkit|wsl|wslservice|wslrelay|com\.docker)') { continue }
+            if ($owner -eq 4) { $name = 'Windows HTTP Server (http.sys: IIS, WinRM, WSUS or another service; see: netsh http show servicestate)' }
+            $holders.Add([pscustomobject]@{ Port = $port; Kind = 'process'; Name = ('{0} (PID {1})' -f $name, $owner); PolaronGateway = $false })
+        }
+    }
+    return $holders.ToArray()
+}
+
+function Wait-CaddyReady {
+    # Caddy is up when it listens on TCP 80/443 or its admin API answers. Fails fast when the started
+    # process exits or the service stops, with the end of Caddy's log.
+    param($Caddy, $Process = $null, [string]$ServiceName = '', [string]$LogPath = '')
+    $began = Get-Date
+    $deadline = $began.AddSeconds([int]$Caddy.StartSeconds)
+    $tail = {
+        if ($LogPath -and (Test-Path -LiteralPath $LogPath -PathType Leaf)) {
+            $text = ''
+            try { $text = Get-Content -LiteralPath $LogPath -Raw -ErrorAction Stop } catch { }
+            if ($text) { return "`n" + (Get-CaddyOutputTail $text) }
+        }
+        return ''
+    }
+    do {
+        if (Get-CaddyListenerProcess) { return }
+        if (Test-CaddyAdminApi -Address $Caddy.Admin) { return }
+        if ($Process -and $Process.HasExited) {
+            throw ("Caddy stopped right after starting (exit code {0}). Caddy said:{1}" -f $Process.ExitCode, (& $tail))
+        }
+        if ($ServiceName -and ((Get-Date) - $began).TotalSeconds -ge 5) {
+            $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+            if ($service -and [string]$service.Status -eq 'Stopped') {
+                throw "The Windows service '$ServiceName' stopped right after starting. See Windows Event Viewer (Windows Logs > System, source Service Control Manager) or Caddy's own log."
+            }
+        }
+        Start-Sleep -Milliseconds 500
+    } while ((Get-Date) -lt $deadline)
+    throw ("Caddy did not start within {0} s: nothing listens on TCP 80/443 and its admin API at {1} does not answer (CADDY_START_SECONDS raises the wait).{2}" -f $Caddy.StartSeconds, $Caddy.Admin, (& $tail))
+}
+
+function Start-StoppedCaddy {
+    # V1.31.1: Caddy serves HTTPS for Polaron (PUBLIC_HTTPS_PROXY=caddy) but is not running: start it the
+    # way it is installed (Windows service, scheduled task) or, without either, in the background.
+    # Returns what was done, so Undo-CaddyStart can put everything back if Polaron's sites fail.
+    param($Caddy)
+    $done = [pscustomobject]@{ Kind = ''; Name = ''; Process = $null; CreatedService = $false; StoppedContainers = @() }
+    if ($Caddy.Autostart -eq 'off') {
+        throw ("Caddy is not running on this PC (nothing listens on TCP 80/443 and its admin API at {0} does not answer), and CADDY_AUTOSTART=off. Start Caddy (for example: sc.exe start caddy), then run the launcher again." -f $Caddy.Admin)
+    }
+    $holders = @(Get-HttpsPortHolders)
+    $others = @($holders | Where-Object { -not $_.PolaronGateway })
+    if ($others.Count -gt 0) {
+        $list = (@($others | ForEach-Object { 'TCP {0}: {1}' -f $_.Port, $_.Name }) | Select-Object -Unique) -join '; '
+        throw "Caddy is not running and cannot start, because another program holds the HTTPS ports ($list). Stop or reconfigure that program so Caddy can listen on TCP 80/443, or set PUBLIC_HTTPS_PROXY=builtin in .env if Polaron should serve HTTPS itself."
+    }
+    try {
+        $gateway = @($holders | Where-Object { $_.PolaronGateway } | ForEach-Object { $_.Name } | Select-Object -Unique)
+        foreach ($name in $gateway) {
+            Write-Warn "Polaron's own HTTPS gateway ($name) holds TCP 80/443 from a builtin-mode start; stopping it so Caddy can listen there (it is started again if Caddy fails)."
+            Invoke-Docker -Title "Stop $name so Caddy can take TCP 80/443" -DockerArgs @('stop', $name)
+            $done.StoppedContainers = @($done.StoppedContainers) + $name
+        }
+        $service = Find-CaddyService -Exe $Caddy.Exe
+        if (-not $service -and $Caddy.Autostart -eq 'service') {
+            $service = Register-CaddyService -Caddy $Caddy
+            $done.CreatedService = $true
+        }
+        if ($service) {
+            if ($service.StartMode -eq 'Disabled') {
+                throw "The Windows service '$($service.Name)' that runs Caddy is disabled. Enable it (as Administrator: Set-Service -Name '$($service.Name)' -StartupType Automatic), or set CADDY_AUTOSTART=off and start Caddy yourself."
+            }
+            Write-Step "Start Caddy's Windows service '$($service.Name)'"
+            Start-CaddyService -Name $service.Name
+            $done.Kind = 'service'; $done.Name = $service.Name
+            Wait-CaddyReady -Caddy $Caddy -ServiceName $service.Name
+            Write-Ok "Caddy is running (Windows service '$($service.Name)')."
+            if ($service.StartMode -ne 'Auto') {
+                Write-Warn "The service '$($service.Name)' is set to start manually, so Caddy stays stopped after a reboot. Make it start with Windows (as Administrator): Set-Service -Name '$($service.Name)' -StartupType Automatic"
+            }
+            return $done
+        }
+        $task = Find-CaddyScheduledTask -Exe $Caddy.Exe
+        if ($task) {
+            Write-Step "Start Caddy's scheduled task '$($task.TaskPath)$($task.TaskName)'"
+            Start-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction Stop
+            $done.Kind = 'task'; $done.Name = $task.TaskName
+            Wait-CaddyReady -Caddy $Caddy
+            Write-Ok "Caddy is running (scheduled task '$($task.TaskName)')."
+            return $done
+        }
+        Write-Step 'Start Caddy in the background with its Caddyfile (no Caddy service or scheduled task on this PC)'
+        $started = Start-CaddyProcessInBackground -Caddy $Caddy
+        $done.Kind = 'process'; $done.Process = $started.Process
+        Wait-CaddyReady -Caddy $Caddy -Process $started.Process -LogPath $started.Log
+        Write-Ok ("Caddy is running in the background (PID {0}); its log: {1}" -f $started.Process.Id, $started.Log)
+        Write-Warn ("This Caddy stops when Windows restarts or this user signs out. To have Windows start it, set CADDY_AUTOSTART=service in .env (the launcher then registers it once it is stopped), or register it yourself as Administrator: sc.exe create caddy start= auto binPath= ""{0}""" -f ((Get-CaddyServiceCommand -Caddy $Caddy) -replace '"', '\"'))
+        return $done
+    } catch {
+        $message = $_.Exception.Message
+        Undo-CaddyStart -Done $done
+        throw "Caddy could not be started: $message"
+    }
+}
+
+function Undo-CaddyStart {
+    # Put back what Start-StoppedCaddy did: stop the Caddy it started, remove a service it registered and
+    # restart Polaron's own gateway if it was stopped. Never throws.
+    param($Done)
+    if (-not $Done) { return }
+    try {
+        switch ($Done.Kind) {
+            'process' { if ($Done.Process -and -not $Done.Process.HasExited) { Stop-Process -Id $Done.Process.Id -Force -ErrorAction SilentlyContinue } }
+            'service' { Stop-Service -Name $Done.Name -Force -ErrorAction SilentlyContinue }
+            'task' { Stop-ScheduledTask -TaskName $Done.Name -ErrorAction SilentlyContinue }
+        }
+    } catch { }
+    if ($Done.CreatedService) { try { & sc.exe delete caddy | Out-Null } catch { } }
+    foreach ($name in @($Done.StoppedContainers)) {
+        try { Invoke-Docker -Title "Start $name again (Caddy did not take TCP 80/443)" -DockerArgs @('start', $name) } catch { Write-Warn $_.Exception.Message }
+    }
 }
 
 function Publish-CaddySite {
@@ -1742,6 +1997,7 @@ function Publish-CaddySite {
         [System.IO.File]::WriteAllBytes($backup, $oldConfig)
         Write-Ok "Backed up $configPath to $backup"
     }
+    $started = $null
     try {
         [System.IO.File]::WriteAllText($sitePath, $site, $utf8)
         if ($configChanged) {
@@ -1753,15 +2009,31 @@ function Publish-CaddySite {
         if ($check.Code -ne 0) {
             throw ("Caddy rejected the configuration with Polaron's sites (for example, another site already uses https://$IP/):`n" + (Get-CaddyOutputTail $check.Output))
         }
+        if (-not $Caddy.Running) {
+            # V1.31.1: Caddy is stopped (service stopped, reboot without auto-start, console closed). Start it
+            # now that the Caddyfile with Polaron's sites is valid; the reload below then applies that file.
+            $started = Start-StoppedCaddy -Caddy $Caddy
+            $Caddy.Running = $true
+        }
         $reload = Invoke-CaddyCapture -Exe $Caddy.Exe -Arguments @('reload', '--config', $configPath, '--adapter', 'caddyfile')
         if ($reload.Code -ne 0) {
-            throw ("Caddy did not accept the reload. Its admin API must be enabled (no 'admin off'):`n" + (Get-CaddyOutputTail $reload.Output))
+            $why = if ($reload.Output -match 'actively refused|connection refused|No connection could be made') {
+                "Caddy's admin API at $($Caddy.Admin) did not answer, so Caddy is not running (or its admin API listens elsewhere)"
+            } else {
+                "Caddy's admin API at $($Caddy.Admin) refused the new configuration"
+            }
+            throw ("Caddy did not accept the reload: {0}.`n{1}" -f $why, (Get-CaddyOutputTail $reload.Output))
         }
     } catch {
+        $message = $_.Exception.Message
         [System.IO.File]::WriteAllBytes($configPath, $oldConfig)
         if ($null -eq $oldSite) { Remove-Item -LiteralPath $sitePath -Force -ErrorAction SilentlyContinue }
         else { [System.IO.File]::WriteAllBytes($sitePath, $oldSite) }
-        throw "Caddy was left unchanged; Polaron was not started. $($_.Exception.Message)"
+        if ($started) {
+            Undo-CaddyStart -Done $started
+            $Caddy.Running = $false
+        }
+        throw "Caddy was left unchanged; Polaron was not started. $message"
     }
     $names = "https://$IP/"
     if ($DNS) { $names += " and https://$DNS/" }

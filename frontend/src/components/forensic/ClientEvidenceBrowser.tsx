@@ -31,11 +31,7 @@ import {
   type ClientDirListing,
   type ClientDriveVolume,
 } from "../../lib/clientEvidenceAgent";
-import {
-  browserFolderPickerSupport,
-  pickBrowserFolder,
-  type BrowserPickedFolder,
-} from "../../lib/browserEvidenceShare";
+import { browserFolderPickerSupport, pickBrowserFolder, type BrowserPickedFolder, pickBrowserFiles } from "../../lib/browserEvidenceShare";
 
 export type EvidenceLocation = "server" | "client";
 
@@ -225,24 +221,27 @@ export function ClientAgentSetup({
 export function BrowserFolderChooser({
   mobile,
   disabled,
+  allowFiles = true,
   onUseFolder,
 }: {
   mobile?: boolean;
   disabled?: boolean;
+  /** Offer "Choose image files…" too (not for flows that need a whole case folder). */
+  allowFiles?: boolean;
   onUseFolder: (folder: ClientSelectedFolder) => void;
 }) {
   const support = useMemo(() => browserFolderPickerSupport(), []);
-  const [reading, setReading] = useState(false);
+  const [reading, setReading] = useState<"folder" | "files" | null>(null);
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
-  async function choose() {
-    // Called straight from the click: browsers open the folder window only for a user action.
+  async function choose(kind: "folder" | "files") {
+    // Called straight from the click: browsers open the folder/file window only for a user action.
     setError(null);
     setProgress(0);
-    setReading(true);
+    setReading(kind);
     try {
-      const picked = await pickBrowserFolder((count) => setProgress(count));
+      const picked = kind === "files" ? await pickBrowserFiles() : await pickBrowserFolder((count) => setProgress(count));
       if (!picked) return;
       if (!picked.files.length) {
         setError(`${picked.name} contains no files. Choose the folder that holds the evidence.`);
@@ -260,17 +259,20 @@ export function BrowserFolderChooser({
       const name = e instanceof DOMException ? e.name : "";
       setError(
         name === "SecurityError" || name === "NotAllowedError"
-          ? "The browser did not allow this folder (it may contain system files). Choose the evidence folder itself, for example E:\\Case-0423."
+          ? "The browser did not allow this folder (a whole drive such as E:\\, or a folder with system files). Choose the evidence folder itself, for example E:\\Case-0423, or use Choose image files… for an image that sits directly on the drive."
           : e instanceof Error
             ? e.message
             : "Could not open this computer's folder window."
       );
     } finally {
-      setReading(false);
+      setReading(null);
     }
   }
 
   const evidenceWord = mobile ? ".pas / .ufd / .ufdx / .zip" : ".E01 / .E02 / .dd / .raw";
+  const filesHint = mobile
+    ? "Image directly on a drive (for example E:\\phone.zip)? Use Choose image files… and select that .zip or .pas file."
+    : "Image directly on a drive (for example E:\\laptop.E01)? Browsers do not accept a whole drive as a folder: use Choose image files… and select every segment (E01, E02, …).";
   return (
     <div className="space-y-2 rounded-lg border border-brand-200 bg-brand-50/50 px-3 py-3 text-xs text-ink-700" data-testid="browser-folder-chooser">
       <p className="flex items-center gap-1.5 text-sm font-semibold text-ink-800">
@@ -285,10 +287,15 @@ export function BrowserFolderChooser({
       </p>
       {support ? (
         <div className="flex flex-wrap items-center gap-2">
-          <Button variant="brand" className="h-8 px-3 text-xs" disabled={disabled} loading={reading} onClick={() => void choose()}>
+          <Button variant="brand" className="h-8 px-3 text-xs" disabled={disabled || reading !== null} loading={reading === "folder"} onClick={() => void choose("folder")}>
             <FolderOpen className="mr-1 h-3.5 w-3.5" />
             Choose folder on this computer…
           </Button>
+          {allowFiles ? (
+            <Button variant="outline" className="h-8 px-3 text-xs" disabled={disabled || reading !== null} loading={reading === "files"} onClick={() => void choose("files")}>
+              Choose image files…
+            </Button>
+          ) : null}
           {reading && progress ? <span className="text-ink-500">Listing files… {progress.toLocaleString()} so far</span> : null}
           {support === "directory-picker" ? (
             <span className="text-[11px] text-ink-500">The browser asks once whether this site may view the folder&apos;s files.</span>
@@ -299,6 +306,7 @@ export function BrowserFolderChooser({
       ) : (
         <p className="text-amber-900">This browser cannot open a folder window. Use Chrome, Edge or Firefox, or install the Client Evidence Agent below.</p>
       )}
+      {support && allowFiles ? <p className="text-[11px] text-ink-500">{filesHint}</p> : null}
       {error ? (
         <p className="rounded border border-red-200 bg-red-50 px-2 py-1.5 text-red-800" role="alert">
           {error}
@@ -331,6 +339,7 @@ export function ClientEvidenceBrowser({
   busy,
   actionLabel = "Use this directory",
   listMaxHeight = "max-h-56",
+  allowBrowserFiles = true,
   onUseFolder,
 }: {
   mobile?: boolean;
@@ -338,6 +347,8 @@ export function ClientEvidenceBrowser({
   busy?: boolean;
   actionLabel?: string;
   listMaxHeight?: string;
+  /** Offer "Choose image files…" next to the browser folder window. */
+  allowBrowserFiles?: boolean;
   onUseFolder: (folder: ClientSelectedFolder) => void;
 }) {
   const [status, setStatus] = useState<ClientAgentStatus | null>(null);
@@ -420,7 +431,7 @@ export function ClientEvidenceBrowser({
   if (!status || (checking && status.state !== "online")) {
     return (
       <div className="space-y-3">
-        <BrowserFolderChooser mobile={mobile} disabled={disabled || busy} onUseFolder={onUseFolder} />
+        <BrowserFolderChooser mobile={mobile} disabled={disabled || busy} allowFiles={allowBrowserFiles} onUseFolder={onUseFolder} />
         <p className="px-1 text-xs text-ink-500">Looking for the Client Evidence Agent on this computer…</p>
       </div>
     );
@@ -430,7 +441,7 @@ export function ClientEvidenceBrowser({
     // The agent stays available for a drive list that also keeps working with this tab closed.
     return (
       <div className="space-y-3">
-        <BrowserFolderChooser mobile={mobile} disabled={disabled || busy} onUseFolder={onUseFolder} />
+        <BrowserFolderChooser mobile={mobile} disabled={disabled || busy} allowFiles={allowBrowserFiles} onUseFolder={onUseFolder} />
         <details className="group rounded-lg" open={status.state === "unpaired" || status.state === "blocked"}>
           <summary className="cursor-pointer select-none px-1 text-xs font-medium text-ink-600 hover:text-ink-800">
             Optional: show this computer&apos;s drive list with the Client Evidence Agent (one-time install; keeps

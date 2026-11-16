@@ -602,3 +602,54 @@ def test_helper_script_ships_the_import_writer_and_identity():
     # class would be rewritten by PowerShell before compilation.
     cls = text[text.index("public static class AetherisImport"):text.index('"@', text.index("public static class AetherisImport"))]
     assert "$" not in cls and "`" not in cls
+
+
+# ---------------------------------------------------------------------------
+# V1.31.2: case folder chosen in the browser (no Client Evidence Agent)
+# ---------------------------------------------------------------------------
+
+def test_browser_folder_copy_uses_only_the_outbound_connection(env, monkeypatch):
+    from app.services.client_evidence import agent_client, relay
+
+    def no_lan(**kw):
+        raise AssertionError("a browser-served folder must not be looked for on the PC's LAN addresses")
+
+    seen: dict = {}
+
+    def reach(candidates, **kw):
+        seen["candidates"] = list(candidates)
+        return candidates[0], manifest_for(env["client"])
+
+    monkeypatch.setattr(agent_client, "build_candidates", no_lan)
+    monkeypatch.setattr(agent_client, "choose_reachable", reach)
+    started = start(env, addresses=[], relay_supported=True, browser_share=True, agent_version="browser-1.0.0",
+                    hostname="This computer (browser on Windows)", client_root="CASE-1")
+    assert seen["candidates"] == [relay.RELAY_URL]
+    assert started["transport"] == "relay" and started["browser_share"] is True and started["run_name"] == RUN
+    state = wait(started["import_id"])
+    assert state["status"] == "completed", state.get("error")
+    assert env["released"] == [SHARE]
+
+
+def test_browser_folder_copy_needs_the_outbound_connection(env, monkeypatch):
+    from app.services.client_evidence import ClientEvidenceError
+
+    monkeypatch.setenv("CLIENT_EVIDENCE_RELAY_ENABLED", "false")
+    with pytest.raises(ClientEvidenceError, match="CLIENT_EVIDENCE_RELAY_ENABLED"):
+        start(env, addresses=[], relay_supported=True, browser_share=True)
+
+
+def test_endpoint_passes_the_browser_flag(api_client, monkeypatch):
+    from app.services.mobile_acquire import client_import
+
+    seen: dict = {}
+
+    def fake_start(**kw):
+        seen.update(kw)
+        return {"import_id": "b" * 20, "status": "queued"}
+
+    monkeypatch.setattr(client_import, "start_import", fake_start)
+    r = api_client.post("/api/acquisition/client-import", json={**BODY, "addresses": [], "relay": True, "browser": True})
+    assert r.status_code == 200 and seen["browser_share"] is True and seen["relay_supported"] is True
+    r = api_client.post("/api/acquisition/client-import", json=BODY)
+    assert r.status_code == 200 and seen["browser_share"] is False
