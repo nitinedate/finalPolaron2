@@ -409,6 +409,32 @@ async function fromOfficeApiAcquisitionDevices(timeoutMs: number): Promise<{
   }
 }
 
+/** How old this computer's phone list may be before the page says it is not updating (helper 5.61 refreshes every 10-15 s). */
+export const DEVICE_LIST_STALE_MS = 120_000;
+
+/**
+ * V1.31.6: the workstation helper serves its phone list from a cache refreshed in the background.
+ * Say so when that list is old (the watcher stopped) or read in a reduced way, instead of showing an
+ * unplugged phone as connected without comment.
+ */
+export function deviceListFreshnessWarnings(
+  data: { scanned_utc?: string; note?: string },
+  now: number = Date.now(),
+): string[] {
+  const out: string[] = [];
+  const scanned = data.scanned_utc ? Date.parse(data.scanned_utc) : NaN;
+  if (Number.isFinite(scanned) && now - scanned > DEVICE_LIST_STALE_MS) {
+    const minutes = Math.max(2, Math.round((now - scanned) / 60_000));
+    const at = new Date(scanned).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    out.push(
+      `This computer's phone list was last read at ${at} (${minutes} min ago) and is not updating: a phone plugged in since then is not shown, and an unplugged one may still be listed. ` +
+        "Restart the workstation helper on this computer (scripts\\ensure-host-drive-helper.ps1 -ForceRestart), but not while a collection is running.",
+    );
+  }
+  if (data.note) out.push(data.note);
+  return out;
+}
+
 async function fromLocalHelperAcquisitionDevices(timeoutMs: number): Promise<{
   ok: boolean;
   devices: HostAcquisitionDevice[];
@@ -428,11 +454,14 @@ async function fromLocalHelperAcquisitionDevices(timeoutMs: number): Promise<{
       devices?: HostAcquisitionDevice[];
       warnings?: string[];
       error?: string;
+      scanned_utc?: string;
+      source?: string;
+      note?: string;
     };
     return {
       ok: Boolean(res.ok && data.ok !== false),
       devices: tagAttachHost(data.devices ?? [], "this_pc"),
-      warnings: data.warnings ?? [],
+      warnings: [...(data.warnings ?? []), ...deviceListFreshnessWarnings(data)],
       error: data.error,
     };
   } catch (e: unknown) {

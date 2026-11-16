@@ -269,7 +269,7 @@ $script:HelperComputerName = [string]$env:COMPUTERNAME
 # the same case root server-side collections use. HOST_IMPORT_CASE_ROOT overrides it.
 $script:ImportCasesRootOverride = [string]$env:HOST_IMPORT_CASE_ROOT
 $script:ImportCasesRoot = $(if ($script:ImportCasesRootOverride) { $script:ImportCasesRootOverride } else { Join-Path $root "evidence\cases" })
-$script:HelperVersion = "5.60"  # 5.60 do not kill pnputil or re-enumerate USB during a phone copy; 5.59 C# taskkill fallbacks keep `$_ (stop USB collection works)
+$script:HelperVersion = "5.61"  # 5.61 phone list follows the cables during a copy (registry read) and ignores leftover copy processes; 5.60 do not kill pnputil or re-enumerate USB during a phone copy; 5.59 C# taskkill fallbacks keep `$_ (stop USB collection works)
 $script:DeviceCacheAt = [datetime]::MinValue
 $script:DeviceCache = @()
 $script:DeviceScanBusy = $false
@@ -1274,7 +1274,30 @@ function Get-StartedUsbInstanceIds {
             }
         }
     } catch {}
+    $script:LastConnectedUsbLines = @(Get-RegistryUsbLines -Ids $ids)
     return $ids
+}
+
+function Get-RegistryUsbLines {
+    # V1.31.6: pnputil-style lines (Instance ID / Device Description / Status / Compatible IDs) read from
+    # the registry for the USB devices Windows is running, so USB-debugging phones are still recognised
+    # (interface class FF/42/01) when pnputil is not used. Reading the registry never touches USB.
+    param($Ids)
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($id in @($Ids)) {
+        if (-not $id) { continue }
+        $props = Get-ItemProperty -LiteralPath ("HKLM:\SYSTEM\CurrentControlSet\Enum\" + $id) -ErrorAction SilentlyContinue
+        $desc = ""
+        if ($props -and $props.PSObject.Properties['DeviceDesc']) { $desc = [string]$props.DeviceDesc }
+        if ($desc -match ';(.+)$') { $desc = $Matches[1] }
+        $lines.Add("Instance ID:                $id")
+        $lines.Add("Device Description:         $desc")
+        $lines.Add("Status:                     Started")
+        if ($props -and $props.PSObject.Properties['CompatibleIDs']) {
+            foreach ($c in @($props.CompatibleIDs)) { if ($c) { $lines.Add("Compatible IDs:             $c") } }
+        }
+    }
+    return [string[]]$lines.ToArray()
 }
 
 function Test-WpdIdCurrentlyAttached {
@@ -1443,7 +1466,7 @@ function Write-MobileDeviceCaches {
             connection  = $conn
         }
     }
-    $acqBody = @{ ok = $true; devices = $acq; warnings = @(); count = $acq.Count }
+    $acqBody = @{ ok = $true; devices = $acq; warnings = @(); count = $acq.Count; scanned_utc = (Get-Date).ToUniversalTime().ToString("o"); source = "startup" }
     [System.IO.File]::WriteAllText($script:AcqDevicesCacheFile, ($acqBody | ConvertTo-Json -Compress -Depth 6))
     $script:DeviceCache = $list
     $script:DeviceCacheAt = Get-Date
@@ -1493,8 +1516,50 @@ function Start-MobileDeviceRefresh {
             }
             return $ids
         }
+        function Get-RegistryUsbLines {
+            param($Ids)
+            $lines = New-Object System.Collections.Generic.List[string]
+            foreach ($id in @($Ids)) {
+                if (-not $id) { continue }
+                $props = Get-ItemProperty -LiteralPath ("HKLM:\SYSTEM\CurrentControlSet\Enum\" + $id) -ErrorAction SilentlyContinue
+                $desc = ""
+                if ($props -and $props.PSObject.Properties['DeviceDesc']) { $desc = [string]$props.DeviceDesc }
+                if ($desc -match ';(.+)$') { $desc = $Matches[1] }
+                $lines.Add("Instance ID:                $id")
+                $lines.Add("Device Description:         $desc")
+                $lines.Add("Status:                     Started")
+                if ($props -and $props.PSObject.Properties['CompatibleIDs']) {
+                    foreach ($c in @($props.CompatibleIDs)) { if ($c) { $lines.Add("Compatible IDs:             $c") } }
+                }
+            }
+            return [string[]]$lines.ToArray()
+        }
+        function Get-RegistryStartedUsbIds {
+            # The USB devices Windows is running, from each driver's Enum key. No USB traffic at all.
+            $ids = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            Get-ChildItem -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services" -ErrorAction SilentlyContinue | ForEach-Object {
+                $enumPath = Join-Path $_.PSPath "Enum"
+                if (-not (Test-Path -LiteralPath $enumPath)) { return }
+                $enum = Get-ItemProperty -LiteralPath $enumPath -ErrorAction SilentlyContinue
+                if (-not $enum) { return }
+                $count = 0
+                try { $count = [int]$enum.Count } catch { $count = 0 }
+                for ($i = 0; $i -lt $count; $i++) {
+                    $id = [string]$enum."$i"
+                    if ($id -match '(?i)USB\\VID_') { [void]$ids.Add($id) }
+                }
+            }
+            $script:LastConnectedUsbLines = @(Get-RegistryUsbLines -Ids $ids)
+            return $ids
+        }
         function Get-StartedUsbInstanceIds {
+            param([switch]$RegistryOnly)
             $script:EnumFresh = $false
+            if ($RegistryOnly) {
+                $ids = Get-RegistryStartedUsbIds
+                $script:EnumFresh = $true
+                return $ids
+            }
             if ($script:PnputilProc -and -not $script:PnputilProc.HasExited) {
                 return (New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase))
             }
@@ -1528,20 +1593,8 @@ function Start-MobileDeviceRefresh {
                     }
                 } catch {}
             }
-            $ids = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            $ids = Get-RegistryStartedUsbIds
             $script:EnumFresh = $true
-            Get-ChildItem -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services" -ErrorAction SilentlyContinue | ForEach-Object {
-                $enumPath = Join-Path $_.PSPath "Enum"
-                if (-not (Test-Path -LiteralPath $enumPath)) { return }
-                $enum = Get-ItemProperty -LiteralPath $enumPath -ErrorAction SilentlyContinue
-                if (-not $enum) { return }
-                $count = 0
-                try { $count = [int]$enum.Count } catch { $count = 0 }
-                for ($i = 0; $i -lt $count; $i++) {
-                    $id = [string]$enum."$i"
-                    if ($id -match '(?i)USB\\VID_') { [void]$ids.Add($id) }
-                }
-            }
             return $ids
         }
         function Get-ConnectedAdbPhones {
@@ -1616,7 +1669,8 @@ function Start-MobileDeviceRefresh {
             return $false
         }
         function Read-WpdPhones {
-            $started = Get-StartedUsbInstanceIds
+            param([switch]$RegistryOnly)
+            $started = Get-StartedUsbInstanceIds -RegistryOnly:$RegistryOnly
             $list = @()
             $seen = @{}
             foreach ($regRoot in @(
@@ -1678,16 +1732,33 @@ function Start-MobileDeviceRefresh {
             }
             return $list
         }
-        function Test-UsbTransferActive {
+        function Get-UsbTransferProcesses {
+            # V1.31.6: phone copies in progress on this PC. A copy process whose parent is gone is a
+            # leftover of a stopped or crashed collection, not a copy in progress: it no longer counts.
+            # (Before, any leftover froze the phone list, so an unplugged iPhone stayed listed and a
+            # newly plugged Android never appeared.)
+            $out = @()
             try {
-                $procs = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-                    $cmd = [string]$_.CommandLine
-                    if ($cmd -match 'ios_usbmux_backup|ios_usbmux_afc|native_ios_job|native_mtp_job|host-mobile-acquire|acq_run_') { return $true }
-                    if (([string]$_.Name) -match '^(adb|adb\.exe)$' -and $cmd -match '\s(pull|backup|exec-out|shell)\b') { return $true }
-                    return $false
-                })
-                return $procs.Count -gt 0
-            } catch { return $false }
+                $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+                $alive = @{}
+                foreach ($p in $all) { $alive[[int]$p.ProcessId] = $true }
+                foreach ($p in $all) {
+                    $cmd = [string]$p.CommandLine
+                    if (-not $cmd) { continue }
+                    if ($cmd -match '--verify\b' -or $cmd -match 'recover-stalled-ios-backup') { continue }
+                    $what = ""
+                    if ($cmd -match 'ios_usbmux_backup') { $what = "iPhone backup" }
+                    elseif ($cmd -match 'ios_usbmux_afc') { $what = "iPhone shared files" }
+                    elseif ($cmd -match 'native_ios_job') { $what = "iPhone collection" }
+                    elseif ($cmd -match 'native_mtp_job') { $what = "Android collection" }
+                    elseif ($cmd -match 'host-mobile-acquire|acq_run_') { $what = "phone collection" }
+                    elseif (([string]$p.Name) -match '^(adb|adb\.exe)$' -and $cmd -match '\s(pull|backup|exec-out|shell)\b') { $what = "Android copy" }
+                    if (-not $what) { continue }
+                    if (-not $alive.ContainsKey([int]$p.ParentProcessId)) { continue }
+                    $out += [pscustomobject]@{ Pid = [int]$p.ProcessId; What = $what }
+                }
+            } catch { }
+            return $out
         }
         function Set-UsbStayAwake {
             param([bool]$On)
@@ -1697,44 +1768,68 @@ function Start-MobileDeviceRefresh {
             $flags = $(if ($On) { [uint32]0x80000003 } else { [uint32]0x80000000 })
             try { [AetherisStayAwake]::SetThreadExecutionState($flags) | Out-Null } catch {}
         }
-        while ($true) {
-            try {
-                if (Test-UsbTransferActive) {
-                    Set-UsbStayAwake $true
-                    Start-Sleep -Seconds 15
-                    continue
+        function Write-DeviceCacheFiles {
+            param($List, [string]$Source, [string]$Note)
+            $list = @($List)
+            $json = if ($list.Count -eq 0) { "[]" } elseif ($list.Count -eq 1) { "[" + ($list[0] | ConvertTo-Json -Compress -Depth 6) + "]" } else { ($list | ConvertTo-Json -Compress -Depth 6) }
+            [System.IO.File]::WriteAllText($CacheFile, $json)
+            $acq = @()
+            foreach ($d in $list) {
+                $os = [string]$d.os_hint
+                $conn = [string]$d.connection
+                $adapter = "android_mtp"
+                $status = "wpd"
+                if ($os -eq "ios") { $adapter = "ios_lockdown" }
+                elseif ($conn -eq "adb") { $adapter = "android_adb"; $status = "adb" }
+                $acq += @{
+                    adapter     = $adapter
+                    device_id   = [string]$d.id
+                    label       = [string]$d.name
+                    status      = $status
+                    os_family   = $(if ($os) { $os } else { "android" })
+                    instance_id = [string]$d.instance_id
+                    connection  = $conn
                 }
+            }
+            $acqBody = @{
+                ok          = $true
+                devices     = $acq
+                warnings    = @()
+                count       = $acq.Count
+                scanned_utc = (Get-Date).ToUniversalTime().ToString("o")
+                source      = $Source
+                note        = $Note
+            }
+            [System.IO.File]::WriteAllText($AcqFile, ($acqBody | ConvertTo-Json -Compress -Depth 6))
+        }
+        function Update-DeviceCacheOnce {
+            # One refresh of the phone lists the page reads. pnputil is not run during a phone copy
+            # (it can reset USB); the registry lists the devices Windows is running without touching
+            # USB, so the list follows the cables during a copy too, and when pnputil is busy.
+            $transfer = @(Get-UsbTransferProcesses)
+            $source = "pnputil"
+            $note = ""
+            if ($transfer.Count -gt 0) {
+                $list = @(Read-WpdPhones -RegistryOnly)
+                $source = "registry"
+                $note = "A phone copy is running on this computer (" + ((@($transfer | ForEach-Object { $_.What }) | Select-Object -Unique) -join ", ") + "); phones are listed from Windows without re-scanning USB."
+            } else {
                 $list = @(Read-WpdPhones)
                 if (-not $script:EnumFresh) {
-                    Set-UsbStayAwake $true
-                    Start-Sleep -Seconds 10
-                    continue
+                    $list = @(Read-WpdPhones -RegistryOnly)
+                    $source = "registry"
+                    $note = "Windows USB enumeration (pnputil) is busy; phones are listed from the registry meanwhile."
                 }
-                Set-UsbStayAwake ($list.Count -gt 0)
-                $json = if ($list.Count -eq 0) { "[]" } elseif ($list.Count -eq 1) { "[" + ($list[0] | ConvertTo-Json -Compress -Depth 6) + "]" } else { ($list | ConvertTo-Json -Compress -Depth 6) }
-                [System.IO.File]::WriteAllText($CacheFile, $json)
-                $acq = @()
-                foreach ($d in $list) {
-                    $os = [string]$d.os_hint
-                    $conn = [string]$d.connection
-                    $adapter = "android_mtp"
-                    $status = "wpd"
-                    if ($os -eq "ios") { $adapter = "ios_lockdown" }
-                    elseif ($conn -eq "adb") { $adapter = "android_adb"; $status = "adb" }
-                    $acq += @{
-                        adapter     = $adapter
-                        device_id   = [string]$d.id
-                        label       = [string]$d.name
-                        status      = $status
-                        os_family   = $(if ($os) { $os } else { "android" })
-                        instance_id = [string]$d.instance_id
-                        connection  = $conn
-                    }
-                }
-                $acqBody = @{ ok = $true; devices = $acq; warnings = @(); count = $acq.Count }
-                [System.IO.File]::WriteAllText($AcqFile, ($acqBody | ConvertTo-Json -Compress -Depth 6))
-            } catch {}
-            Start-Sleep -Seconds 15
+            }
+            Set-UsbStayAwake (($list.Count -gt 0) -or ($transfer.Count -gt 0))
+            Write-DeviceCacheFiles -List $list -Source $source -Note $note
+            return $source
+        }
+        if ($env:AETHERIS_DEVICE_REFRESH_FUNCTIONS_ONLY -eq "1") { return }
+        while ($true) {
+            $source = "pnputil"
+            try { $source = Update-DeviceCacheOnce } catch {}
+            Start-Sleep -Seconds $(if ($source -eq "registry") { 10 } else { 15 })
         }
     } -ArgumentList $script:DeviceCacheFile, $script:AcqDevicesCacheFile
 }

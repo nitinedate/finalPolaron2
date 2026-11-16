@@ -2756,6 +2756,13 @@ export function MobileAcquisitionPage() {
                     ? `A phone is connected, and it is not an ${fixedPlatformLabel} device. Open its own acquisition page so the evidence stays in the right backend.`
                     : "A phone of another type is connected."}
                 </p>
+                {fixedPlatform === "android" && devices.length === 0 ? (
+                  <p className="text-xs text-ink-500" data-testid="android-not-detected-hint">
+                    No Android phone is detected yet. Unlock it and use a data cable, then on the phone choose USB:
+                    File transfer, or turn on USB debugging and tap Allow. Unplug the other phone if it is not part of
+                    this collection, then Rescan.
+                  </p>
+                ) : null}
                 {otherDevices.map((d) => {
                   const kind = mobileKindLabel(d.os_family);
                   const dest = otherAcquirePath(d.os_family);

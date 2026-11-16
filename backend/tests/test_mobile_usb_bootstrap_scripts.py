@@ -23,14 +23,17 @@ def test_network_repair_replaces_stale_urlacl_for_current_user():
 def test_helper_refresh_does_not_reset_usb():
     helper = (ROOT / "scripts" / "host-drive-helper.ps1").read_text(encoding="utf-8")
     ensure = (ROOT / "scripts" / "ensure-host-drive-helper.ps1").read_text(encoding="utf-8")
-    assert 'HelperVersion = "5.60"' in helper
-    assert 'ExpectedHelperVersion = "5.60"' in ensure
+    assert 'HelperVersion = "5.61"' in helper
+    assert 'ExpectedHelperVersion = "5.61"' in ensure
     refresh = helper.split("function Start-MobileDeviceRefresh", 1)[1].split("function Write-HostAdapterCache", 1)[0]
     parent = helper.split("function Get-StartedUsbInstanceIds", 1)[1].split("function Test-WpdIdCurrentlyAttached", 1)[0]
     assert "proc.Kill()" not in refresh
     assert "proc.Kill()" not in parent
     assert "Killing pnputil mid-enum" in refresh
-    assert "Test-UsbTransferActive" in refresh
+    # V1.31.6: during a copy pnputil is still not run; the list is read from the registry instead
+    # (no USB traffic) so it keeps following the cables, and leftover copy processes do not count.
+    assert "Get-UsbTransferProcesses" in refresh
+    assert "Read-WpdPhones -RegistryOnly" in refresh
     assert "EnumFresh" in refresh
     assert "WaitForExit(20000)" in parent
     acquire = (ROOT / "scripts" / "host-mobile-acquire.ps1").read_text(encoding="utf-8")
