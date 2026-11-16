@@ -629,6 +629,27 @@ export function MobileAcquisitionPage() {
         // name this computer, so it must not reach "Start analysis". The copy step finishes it.
         finishingRef.current = false;
         setClientCollected(true);
+        // V1.31.5: the collection itself IS finished. Show that, instead of leaving the last
+        // in-flight numbers (for example "95%, acquire") on screen while only the copy is left.
+        const rec = (result.acquisition_record || {}) as { output_size?: number; file_count?: number };
+        setRun((prev) =>
+          prev
+            ? {
+                ...prev,
+                progress: {
+                  ...prev.progress,
+                  stage: "complete",
+                  category: "Complete",
+                  item: "",
+                  detail: "Image created on this computer. What is left: copy it to the forensic server for processing.",
+                  progress_pct: 100,
+                  bytes_done: Math.max(Number(rec.output_size || 0), Number(prev.progress?.bytes_done || 0)),
+                  files_seen: Math.max(Number(rec.file_count || 0), Number(prev.progress?.files_seen || 0)),
+                  updated_utc: new Date().toISOString(),
+                },
+              }
+            : prev,
+        );
         return false;
       }
       const collected = filesCollected(result);
@@ -1812,12 +1833,18 @@ export function MobileAcquisitionPage() {
                     hostJob?.progress_pct ??
                     0,
                 );
+                // The evidence ZIP is written after the collection ("Writing full evidence ZIP…",
+                // "Packaging the evidence ZIP…"): label it as packaging with its real percentage
+                // (90-99.5), not as "acquire", and not as 100% before it is done (V1.31.5).
                 const sealing =
                   itemText === "export_packages" ||
-                  /package|seal/i.test(detailText) ||
+                  stageText === "seal" ||
+                  /package|seal|evidence zip/i.test(detailText) ||
                   /package|seal/i.test(String(itemText));
                 const pct = sealing
-                  ? 100
+                  ? hostPct > 0
+                    ? Math.min(99.5, Math.max(90, hostPct))
+                    : 90
                   : hostPct > 0
                     ? Math.min(100, hostPct)
                     : bytes > 0
@@ -2558,11 +2585,23 @@ export function MobileAcquisitionPage() {
           <div className="mt-2">
             <Notice tone="error" title="The copy to the forensic server did not finish">
               <p>{clientImportError}</p>
-              <div className="pt-2">
+              <div className="flex flex-wrap gap-2 pt-2">
                 <Button variant="brand" disabled={importRunning || pulling} onClick={retry}>
                   <RefreshCw className="h-4 w-4" /> Copy to the forensic server again
                 </Button>
+                {clientAgentMissing ? (
+                  <Button variant="outline" disabled={importRunning || pulling} onClick={() => setPullOpen(true)}>
+                    <Laptop className="h-4 w-4" /> Copy through this browser instead (no install)
+                  </Button>
+                ) : null}
               </div>
+              {clientAgentMissing ? (
+                <p className="pt-2 text-xs">
+                  Without the agent: choose the case folder in this browser, and keep this tab open until the copy
+                  finishes (it goes through this computer&apos;s upload). For large images the agent is faster and keeps
+                  copying when the tab is closed.
+                </p>
+              ) : null}
             </Notice>
           </div>
         )}
@@ -3423,7 +3462,7 @@ export function MobileAcquisitionPage() {
             <p className="text-xs font-semibold uppercase tracking-wide text-brand-800">
               {ownerAgentForFamily(selected?.os_family || preview?.device_profile?.os_family)?.label
                 || "Phone agent"}{" "}
-              currently fetching
+              {run.progress?.stage === "complete" ? "finished on this computer" : "currently fetching"}
             </p>
             <p className="mt-1 font-medium text-ink-900">
               {run.progress?.category || "Preparing"}
