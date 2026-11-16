@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   ChevronRight,
@@ -31,6 +31,11 @@ import {
   type ClientDirListing,
   type ClientDriveVolume,
 } from "../../lib/clientEvidenceAgent";
+import {
+  browserFolderPickerSupport,
+  pickBrowserFolder,
+  type BrowserPickedFolder,
+} from "../../lib/browserEvidenceShare";
 
 export type EvidenceLocation = "server" | "client";
 
@@ -39,6 +44,8 @@ export type ClientSelectedFolder = {
   name: string;
   files: Array<{ name: string; size: number }>;
   evidenceCount: number;
+  /** Chosen in the browser's own folder window: this tab serves the files (no agent needed). */
+  browser?: BrowserPickedFolder;
 };
 
 /* ------------------------------------------------------------------------ */
@@ -137,6 +144,7 @@ export function ClientAgentSetup({
   const command = clientAgentInstallCommand(origin);
   const [copied, setCopied] = useState(false);
   const unpaired = status?.state === "unpaired";
+  const blocked = status?.state === "blocked";
 
   async function copyCommand() {
     try {
@@ -154,10 +162,16 @@ export function ClientAgentSetup({
         <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
         <div className="min-w-0">
           <p className="text-sm font-semibold">
-            {unpaired ? "Pair this console with the Client Evidence Agent" : "Install the Client Evidence Agent on this computer (one time)"}
+            {unpaired
+              ? "Pair this console with the Client Evidence Agent"
+              : blocked
+                ? "This browser blocks this site from the Client Evidence Agent"
+                : "Install the Client Evidence Agent on this computer (one time)"}
           </p>
           <p className="mt-1 text-amber-900">
-            {unpaired
+            {blocked
+              ? `The browser does not let ${origin} reach apps on this computer, so an installed agent cannot answer. Click the icon to the left of the address bar, open Site settings, set "Local network access" (or "Apps on this device") to Allow, then use Check again.`
+              : unpaired
               ? `Directories stay hidden because the agent is running but does not accept requests from ${origin}. Run the installer again to add this console.`
               : "Directories stay hidden because nothing is answering at 127.0.0.1:9877. The agent lets the forensic server read the folder you select here. Files are opened read-only and stay on this computer; the server reads them over the network and makes no copy of the image. A failed check is remembered and is not raised as an error."}
           </p>
@@ -200,6 +214,96 @@ export function ClientAgentSetup({
         </Button>
         <span className="text-[11px] text-amber-800">Windows 10 or 11. Use Chrome, Edge or Firefox for this mode.</span>
       </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------------ */
+/* Choose a folder in the browser's own folder window (no agent)             */
+/* ------------------------------------------------------------------------ */
+
+export function BrowserFolderChooser({
+  mobile,
+  disabled,
+  onUseFolder,
+}: {
+  mobile?: boolean;
+  disabled?: boolean;
+  onUseFolder: (folder: ClientSelectedFolder) => void;
+}) {
+  const support = useMemo(() => browserFolderPickerSupport(), []);
+  const [reading, setReading] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+
+  async function choose() {
+    // Called straight from the click: browsers open the folder window only for a user action.
+    setError(null);
+    setProgress(0);
+    setReading(true);
+    try {
+      const picked = await pickBrowserFolder((count) => setProgress(count));
+      if (!picked) return;
+      if (!picked.files.length) {
+        setError(`${picked.name} contains no files. Choose the folder that holds the evidence.`);
+        return;
+      }
+      const top = picked.files.filter((f) => !f.path.includes("/"));
+      onUseFolder({
+        path: picked.name,
+        name: picked.name,
+        files: top.map((f) => ({ name: f.path, size: f.file.size })),
+        evidenceCount: picked.files.filter((f) => EVIDENCE_FILE_RE.test(f.path)).length,
+        browser: picked,
+      });
+    } catch (e) {
+      const name = e instanceof DOMException ? e.name : "";
+      setError(
+        name === "SecurityError" || name === "NotAllowedError"
+          ? "The browser did not allow this folder (it may contain system files). Choose the evidence folder itself, for example E:\\Case-0423."
+          : e instanceof Error
+            ? e.message
+            : "Could not open this computer's folder window."
+      );
+    } finally {
+      setReading(false);
+    }
+  }
+
+  const evidenceWord = mobile ? ".pas / .ufd / .ufdx / .zip" : ".E01 / .E02 / .dd / .raw";
+  return (
+    <div className="space-y-2 rounded-lg border border-brand-200 bg-brand-50/50 px-3 py-3 text-xs text-ink-700" data-testid="browser-folder-chooser">
+      <p className="flex items-center gap-1.5 text-sm font-semibold text-ink-800">
+        <FolderOpen className="h-4 w-4 text-brand-600" />
+        Choose a folder on this computer
+      </p>
+      <p className="text-ink-600">
+        Opens this computer&apos;s own folder window with all of its drives (C:, D:, USB and mapped network drives).
+        Nothing to install. Pick the folder that holds the {evidenceWord} files. The forensic server then reads the
+        files through this browser tab while it extracts, parses and indexes them, and makes no copy of the image, so
+        keep this tab open and the computer awake until processing finishes.
+      </p>
+      {support ? (
+        <div className="flex flex-wrap items-center gap-2">
+          <Button variant="brand" className="h-8 px-3 text-xs" disabled={disabled} loading={reading} onClick={() => void choose()}>
+            <FolderOpen className="mr-1 h-3.5 w-3.5" />
+            Choose folder on this computer…
+          </Button>
+          {reading && progress ? <span className="text-ink-500">Listing files… {progress.toLocaleString()} so far</span> : null}
+          {support === "directory-picker" ? (
+            <span className="text-[11px] text-ink-500">The browser asks once whether this site may view the folder&apos;s files.</span>
+          ) : (
+            <span className="text-[11px] text-ink-500">The browser may say &quot;upload&quot;: files are only read when the server needs them.</span>
+          )}
+        </div>
+      ) : (
+        <p className="text-amber-900">This browser cannot open a folder window. Use Chrome, Edge or Firefox, or install the Client Evidence Agent below.</p>
+      )}
+      {error ? (
+        <p className="rounded border border-red-200 bg-red-50 px-2 py-1.5 text-red-800" role="alert">
+          {error}
+        </p>
+      ) : null}
     </div>
   );
 }
@@ -314,10 +418,30 @@ export function ClientEvidenceBrowser({
   }, []);
 
   if (!status || (checking && status.state !== "online")) {
-    return <p className="px-1 py-3 text-xs text-ink-500">Looking for the Client Evidence Agent on this computer…</p>;
+    return (
+      <div className="space-y-3">
+        <BrowserFolderChooser mobile={mobile} disabled={disabled || busy} onUseFolder={onUseFolder} />
+        <p className="px-1 text-xs text-ink-500">Looking for the Client Evidence Agent on this computer…</p>
+      </div>
+    );
   }
   if (status.state !== "online") {
-    return <ClientAgentSetup status={status} checking={checking} onRetry={() => void check()} />;
+    // No agent answering: the browser's own folder window works without installing anything.
+    // The agent stays available for a drive list that also keeps working with this tab closed.
+    return (
+      <div className="space-y-3">
+        <BrowserFolderChooser mobile={mobile} disabled={disabled || busy} onUseFolder={onUseFolder} />
+        <details className="group rounded-lg" open={status.state === "unpaired" || status.state === "blocked"}>
+          <summary className="cursor-pointer select-none px-1 text-xs font-medium text-ink-600 hover:text-ink-800">
+            Optional: show this computer&apos;s drive list with the Client Evidence Agent (one-time install; keeps
+            working when this tab is closed)
+          </summary>
+          <div className="mt-2">
+            <ClientAgentSetup status={status} checking={checking} onRetry={() => void check()} />
+          </div>
+        </details>
+      </div>
+    );
   }
 
   const health = status.health;
@@ -514,7 +638,9 @@ export function ClientBrowseFolderDialog({
 
   function addFolder(next: ClientSelectedFolder) {
     setFolders((prev) =>
-      prev.some((f) => f.path.toLowerCase() === next.path.toLowerCase()) ? prev : [...prev, next],
+      prev.some((f) => f.path.toLowerCase() === next.path.toLowerCase() && Boolean(f.browser) === Boolean(next.browser))
+        ? prev
+        : [...prev, next],
     );
   }
 
@@ -545,6 +671,12 @@ export function ClientBrowseFolderDialog({
           and connected until extraction finishes.
         </p>
         {open ? <ClientEvidenceBrowser mobile={mobile} actionLabel="Use this directory" listMaxHeight="max-h-44" onUseFolder={addFolder} /> : null}
+        {folders.some((f) => f.browser) ? (
+          <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900" role="status">
+            Folders chosen in this browser are read through this tab: keep it open until extraction and indexing
+            finish. Closing or reloading it pauses processing until you reconnect the folder from the job page.
+          </p>
+        ) : null}
         <div className="rounded-xl border border-ink-300 bg-white p-3">
           <p className="mb-2 text-xs font-semibold text-ink-700">Selected directories ({folders.length})</p>
           {folders.length ? (
@@ -556,7 +688,10 @@ export function ClientBrowseFolderDialog({
                       {index + 1}. {folder.name}
                     </p>
                     <p className="truncate font-mono text-[10px] text-ink-500">
-                      {folder.path} · {folder.evidenceCount} evidence file{folder.evidenceCount === 1 ? "" : "s"}
+                      {folder.browser
+                        ? `${folder.name} · chosen in this browser · ${folder.browser.files.length.toLocaleString()} file${folder.browser.files.length === 1 ? "" : "s"}`
+                        : folder.path}{" "}
+                      · {folder.evidenceCount} evidence file{folder.evidenceCount === 1 ? "" : "s"}
                     </p>
                   </div>
                   <button
@@ -572,13 +707,13 @@ export function ClientBrowseFolderDialog({
             </ul>
           ) : (
             <p className="rounded-lg border border-dashed border-ink-300 px-4 py-4 text-center text-xs text-ink-500">
-              Open a drive on this computer, go to the evidence directory, then choose <strong>Use this directory</strong>.
+              Choose a folder on this computer, or open a drive in the agent&apos;s list and choose <strong>Use this directory</strong>.
             </p>
           )}
         </div>
         <p className="flex items-center gap-1.5 text-xs text-ink-500">
           <ShieldCheck className="h-3.5 w-3.5 text-emerald-600" />
-          Nothing is uploaded. The server opens the files read-only and stops if any of them change.
+          Nothing is copied in advance. The server reads the files in place, read-only, and stops if any of them change.
         </p>
       </div>
     </Modal>

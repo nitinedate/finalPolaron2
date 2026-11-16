@@ -86,6 +86,7 @@ def attach_client_source(
     user_email: str = "",
     replace_existing: bool = True,
     relay_supported: bool = False,
+    browser_share: bool = False,
 ) -> dict[str, Any]:
     from app.services.disk_build_log import write_disk_log
 
@@ -101,14 +102,24 @@ def attach_client_source(
     if str(ds.get("intake") or "") == "browser_upload" and str(ds.get("upload_status") or "") in {"receiving", "verifying"}:
         raise ClientEvidenceError("A browser upload is still running for this job. Stop it first.")
 
-    candidates, rejected = agent_client.build_candidates(
-        port=port,
-        explicit_url=agent_url,
-        request_ip=request_ip,
-        addresses=addresses,
-        hostname=hostname,
-    )
-    use_relay = relay_supported and relay.enabled()
+    if browser_share:
+        # Served by the examiner's browser tab: nothing listens on the PC, so it is never
+        # dialed; the tab answers through the outbound connection only.
+        if not relay.enabled():
+            raise ClientEvidenceError(
+                "Folders chosen in the browser need the outbound agent connection, which is disabled on this "
+                "server (CLIENT_EVIDENCE_RELAY_ENABLED). Install the Client Evidence Agent instead."
+            )
+        candidates, rejected = [], []
+    else:
+        candidates, rejected = agent_client.build_candidates(
+            port=port,
+            explicit_url=agent_url,
+            request_ip=request_ip,
+            addresses=addresses,
+            hostname=hostname,
+        )
+    use_relay = (relay_supported or browser_share) and relay.enabled()
     if use_relay:
         # Fallback when the server cannot open a connection to the PC (home, other site, NAT).
         candidates.append(relay.RELAY_URL)
@@ -174,6 +185,7 @@ def attach_client_source(
         "virtual_root": virtual_root(share_id),
         "connected_at": datetime.now(timezone.utc).isoformat(),
         "agent_version": str(manifest.get("agent_version") or ""),
+        "browser_share": bool(browser_share),
     }
     shares = _job_share_map(ds)
     shares[share_id] = entry
@@ -183,7 +195,9 @@ def attach_client_source(
     _save_ds(db, job_id, ds)
     transport = "relay" if relay.is_relay_url(url) else "direct"
     via = (
-        "an outbound connection from that computer to this server"
+        "the examiner's browser tab on that computer (outbound connection to this server)"
+        if browser_share
+        else "an outbound connection from that computer to this server"
         if transport == "relay"
         else url
     )
@@ -225,6 +239,7 @@ def attach_client_source(
         "truncated": record.truncated,
         "manifest_sha256": record.manifest_sha256,
         "mounted": str(mp),
+        "browser_share": bool(browser_share),
     }
 
 
@@ -364,6 +379,8 @@ def client_source_status(db: Session, job_id: str, *, probe: bool = True) -> dic
         # Bytes the server has read from the PC so far vs the selected evidence size.
         "transfer": registry.read_transfer_stats(share_id) if is_valid_share_id(share_id) else {},
         "job_status": status,
+        # Served by the examiner's browser tab (no agent): the UI offers "Reconnect" after a reload.
+        "browser_share": bool(cs.get("browser_share")) or str(cs.get("agent_version") or "").startswith("browser"),
     }
     out["transport"] = "relay" if record and relay.is_relay_url(record.agent_url) else "direct"
     if probe and record:

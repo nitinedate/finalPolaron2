@@ -27,7 +27,8 @@ export const EVIDENCE_FILE_RE =
 
 export const HIDDEN_CLIENT_DIR_RE = /^(?:\$recycle\.bin|system volume information|recovery|config\.msi)$/i;
 
-export type ClientAgentState = "online" | "unpaired" | "offline";
+/** blocked = the agent may be running, but the browser refuses this site access to apps on this computer. */
+export type ClientAgentState = "online" | "unpaired" | "offline" | "blocked";
 
 export type ClientAgentHealth = {
   ok: boolean;
@@ -186,6 +187,26 @@ export async function clientAgentStatus(
   return healthInFlight;
 }
 
+/**
+ * Browsers gate requests from a public site to 127.0.0.1 behind a per-site permission ("Local
+ * network access", Chrome 142+; split into local-network / loopback-network in Chrome 145, with
+ * the old name kept as an alias). A denied permission looks exactly like a missing agent unless
+ * it is checked. Returns null when the browser has no such permission.
+ */
+export async function loopbackPermissionState(): Promise<PermissionState | null> {
+  const perms = typeof navigator !== "undefined" ? navigator.permissions : undefined;
+  if (!perms?.query) return null;
+  for (const name of ["loopback-network", "local-network-access"]) {
+    try {
+      const status = await perms.query({ name } as unknown as PermissionDescriptor);
+      return status.state;
+    } catch {
+      /* unknown permission name in this browser */
+    }
+  }
+  return null;
+}
+
 async function probeClientAgent(timeoutMs: number): Promise<ClientAgentStatus> {
   try {
     const health = await agentJson<ClientAgentHealth>("/health", {}, timeoutMs);
@@ -197,6 +218,7 @@ async function probeClientAgent(timeoutMs: number): Promise<ClientAgentStatus> {
     offlineStreak += 1;
     const wait = Math.min(8_000 * 1.5 ** Math.max(offlineStreak - 1, 0), 30_000);
     if (HEALTH_BACKOFF) offlineUntilMs = Date.now() + wait;
+    if ((await loopbackPermissionState()) === "denied") return { state: "blocked", health: null };
     return { state: "offline", health: null };
   }
 }

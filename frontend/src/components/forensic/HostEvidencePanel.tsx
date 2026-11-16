@@ -22,6 +22,7 @@ import {
   type EvidenceLocation,
 } from "./ClientEvidenceBrowser";
 import { clientRelayTarget, createClientShare, revokeClientShare, type ClientShare } from "../../lib/clientEvidenceAgent";
+import { createBrowserShare, markBrowserShareRegistered, stopBrowserShare } from "../../lib/browserEvidenceShare";
 import { forensicApi } from "../../lib/forensicApi";
 import { jobUploadSession } from "../../lib/jobUploadSession";
 import {
@@ -1427,6 +1428,8 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
    * "This computer": publish each folder through the local Client Evidence
    * Agent, let the forensic server connect to it and mount it read-only, then
    * run the same List folder → register → extract flow as a server drive path.
+   * A folder chosen in the browser's own folder window is served by this tab
+   * instead (no agent): same relay protocol, same registration and pipeline.
    */
   async function registerClientFolders(folders: ClientSelectedFolder[]) {
     setClientDialogOpen(false);
@@ -1434,6 +1437,7 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
     const multiple = folders.length > 1;
     for (let index = 0; index < folders.length; index += 1) {
       const folder = folders[index];
+      const viaBrowser = Boolean(folder.browser);
       let share: ClientShare | null = null;
       let connected = false;
       setRegistering(true);
@@ -1450,13 +1454,15 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
             ? `Directory ${index + 1} of ${folders.length}: preparing ${folder.name} on this computer…`
             : `Preparing ${folder.name} on this computer…`
         );
-        share = await createClientShare({
-          path: folder.path,
-          jobId,
-          label: folder.name,
-          relay: clientRelayTarget(jobId),
-        });
-        if (!share.lan_bound && !share.relay_enabled) {
+        share = folder.browser
+          ? await createBrowserShare({ folder: folder.browser, jobId, relay: clientRelayTarget(jobId) })
+          : await createClientShare({
+              path: folder.path,
+              jobId,
+              label: folder.name,
+              relay: clientRelayTarget(jobId),
+            });
+        if (!viaBrowser && !share.lan_bound && !share.relay_enabled) {
           throw new Error(
             "The Client Evidence Agent is listening on this computer only, so the forensic server cannot reach it. Install the latest agent (it connects out to the server) or run the installer again and approve the administrator prompt."
           );
@@ -1480,8 +1486,10 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
           source_type: sourceType === "mobile" ? "mobile" : "disk",
           replace_existing: index === 0,
           relay: Boolean(share.relay_enabled),
+          browser: viaBrowser,
         });
         connected = true;
+        if (viaBrowser) markBrowserShareRegistered(share.share_id);
         // Same in-place boundary as a server drive: no Download Agent / upload UI.
         jobUploadSession.clearInactiveForServerSource(jobId);
         if (share.truncated) {
@@ -1490,9 +1498,11 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
           );
         }
         toastRef.current.success(
-          source.transport === "relay"
-            ? `Forensic server connected to ${source.display_path} through this computer's outbound connection (${source.file_count.toLocaleString()} file(s)). Nothing is copied; speed depends on this computer's upload.`
-            : `Forensic server connected to ${source.display_path} (${source.file_count.toLocaleString()} file(s)). Nothing is copied.`
+          viaBrowser
+            ? `Forensic server connected to ${source.display_path} through this browser tab (${source.file_count.toLocaleString()} file(s)). Keep this tab open until extraction and indexing finish; speed depends on this computer's upload.`
+            : source.transport === "relay"
+              ? `Forensic server connected to ${source.display_path} through this computer's outbound connection (${source.file_count.toLocaleString()} file(s)). Nothing is copied; speed depends on this computer's upload.`
+              : `Forensic server connected to ${source.display_path} (${source.file_count.toLocaleString()} file(s)). Nothing is copied.`
         );
         setManualPath(source.path);
         directoryRegisteredRef.current = false;
@@ -1505,8 +1515,11 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
         }
       } catch (e: unknown) {
         if (!connected) {
-          // The server never accepted this share: withdraw it on the agent too.
-          if (share) void revokeClientShare(share.share_id);
+          // The server never accepted this share: withdraw it on the agent / stop serving it here.
+          if (share) {
+            if (viaBrowser) stopBrowserShare(share.share_id);
+            else void revokeClientShare(share.share_id);
+          }
           const msg = e instanceof Error ? e.message : "Could not connect the folder on this computer";
           onRegisterError?.(msg);
           toastRef.current.error(msg);

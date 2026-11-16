@@ -400,6 +400,8 @@ export type ClientEvidenceSourceStatus = {
   transfer?: { logical_bytes: number; wire_bytes: number; zero_bytes: number; requests: number };
   /** Live reader state written by the server's FUSE reader. */
   reader?: { state?: "ok" | "waiting" | "failed"; detail?: string; bytes_fetched?: number; updated_at?: number };
+  /** The folder is served by the examiner's browser tab (chosen in the browser's folder window). */
+  browser_share?: boolean;
 };
 
 export type HostFolderListing = {
@@ -730,6 +732,8 @@ export const forensicApi = {
       replace_existing?: boolean;
       /** The agent also connects out to this server (works outside the office network). */
       relay?: boolean;
+      /** Served by the examiner's browser tab (no agent): the server uses only the outbound connection. */
+      browser?: boolean;
     }
   ) =>
     api.post<ClientEvidenceSourceResult>(`/api/jobs/${jobId}/evidence/client-source`, payload, {

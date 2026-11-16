@@ -38,6 +38,9 @@ class ClientSourceBody(BaseModel):
     # The agent also keeps an outbound connection to this server for the share
     # (works when the server cannot reach the PC, e.g. at home behind a router).
     relay: bool = False
+    # The folder was chosen in the examiner's browser and that browser tab serves it
+    # (no agent installed): only the outbound connection is used, the PC is never dialed.
+    browser: bool = False
 
 
 class IngestPathBody(BaseModel):

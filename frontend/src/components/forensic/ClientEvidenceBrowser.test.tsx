@@ -168,6 +168,78 @@ describe("ClientBrowseFolderDialog", () => {
 });
 
 /* --------------------------------------------------------------------- */
+/* No agent: choose the folder in the browser's own folder window           */
+/* --------------------------------------------------------------------- */
+
+function fakeDirectory(name: string, files: Array<[string, string]>, sub?: { name: string; files: Array<[string, string]> }) {
+  const fileHandles = files.map(([n, d]) => ({
+    kind: "file" as const,
+    name: n,
+    getFile: async () => new File([d], n, { lastModified: 1_731_000_000_000 }),
+    values: async function* () {},
+  }));
+  const children: unknown[] = [...fileHandles];
+  if (sub) children.push(fakeDirectory(sub.name, sub.files));
+  return {
+    kind: "directory" as const,
+    name,
+    getFile: async () => {
+      throw new Error("directory");
+    },
+    values: async function* () {
+      yield* children;
+    },
+  };
+}
+
+describe("This computer without the agent (browser folder window)", () => {
+  afterEach(() => {
+    Reflect.deleteProperty(navigator, "permissions");
+  });
+
+  it("offers the computer's own folder window first and returns the chosen folder", async () => {
+    installFakeAgent("offline");
+    vi.stubGlobal("showDirectoryPicker", vi.fn(async () =>
+      fakeDirectory("Case-0423", [["laptop.E01", "aaaa"], ["laptop.E02", "bb"]], { name: "notes", files: [["readme.txt", "c"]] }),
+    ));
+    let confirmed: ClientSelectedFolder[] = [];
+    render(<ClientBrowseFolderDialog open mobile={false} onClose={() => undefined} onConfirm={(f) => (confirmed = f)} />);
+    const choose = await screen.findByRole("button", { name: /Choose folder on this computer/ });
+    expect(screen.getByText(/all of its drives \(C:, D:, USB and mapped network drives\)/)).toBeTruthy();
+    // The agent stays available as an option, folded away.
+    expect(screen.getByText(/Optional: show this computer.s drive list/)).toBeTruthy();
+    expect(await screen.findByText(/Install the Client Evidence Agent on this computer/)).toBeTruthy();
+    await userEvent.click(choose);
+    expect(await screen.findByText(/Case-0423 · chosen in this browser · 3 files/)).toBeTruthy();
+    expect(screen.getByText(/keep it open until extraction and indexing finish/)).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Start extraction (1 directory)" }));
+    expect(confirmed).toHaveLength(1);
+    expect(confirmed[0].evidenceCount).toBe(2);
+    expect(confirmed[0].browser?.files.map((f) => f.path).sort()).toEqual(["laptop.E01", "laptop.E02", "notes/readme.txt"]);
+  });
+
+  it("says when the browser blocks this site from an installed agent", async () => {
+    installFakeAgent("offline");
+    vi.stubGlobal("showDirectoryPicker", vi.fn());
+    Object.defineProperty(navigator, "permissions", {
+      configurable: true,
+      value: { query: vi.fn(async ({ name }: { name: string }) => ({ state: name === "loopback-network" ? "denied" : "prompt" })) },
+    });
+    render(<ClientEvidenceBrowser onUseFolder={() => undefined} />);
+    expect(await screen.findByText(/This browser blocks this site from the Client Evidence Agent/)).toBeTruthy();
+    expect(screen.getByText(/Local network access/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Choose folder on this computer/ })).toBeTruthy();
+  });
+
+  it("explains when this browser cannot open a folder window at all", async () => {
+    installFakeAgent("offline");
+    render(<ClientEvidenceBrowser onUseFolder={() => undefined} />);
+    expect(await screen.findByText(/This browser cannot open a folder window/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Choose folder on this computer/ })).toBeNull();
+  });
+});
+
+/* --------------------------------------------------------------------- */
 /* HostEvidencePanel: the whole "This computer" flow                       */
 /* --------------------------------------------------------------------- */
 
@@ -289,6 +361,31 @@ describe("HostEvidencePanel — evidence on this computer", () => {
     expect(order(api.setExtractReviewRequired)).toBeLessThan(order(api.ingestHostPath));
   });
 
+  it("registers a folder chosen in the browser through this tab, without an agent", async () => {
+    installFakeAgent("offline");
+    vi.stubGlobal("showDirectoryPicker", vi.fn(async () => fakeDirectory("Case-0423", [["laptop.E01", "aaaa"], ["laptop.E02", "bb"]])));
+    api.registerClientEvidenceSource.mockResolvedValue({
+      ok: true, share_id: "ce00000000000000000000aaaa", path: "client-evidence://ce00000000000000000000aaaa",
+      display_path: "This computer (browser): Case-0423", hostname: "This computer (browser)", client_root: "Case-0423",
+      agent_url: "relay:", transport: "relay", file_count: 2, total_bytes: 6, truncated: false, manifest_sha256: "a".repeat(64),
+      browser_share: true,
+    });
+    const { HostEvidencePanel } = await import("./HostEvidencePanel");
+    const { stopBrowserShare } = await import("../../lib/browserEvidenceShare");
+    render(<HostEvidencePanel jobId="job-9" embedded autoProcess initialEvidenceLocation="client" />);
+    await userEvent.click(await screen.findByRole("button", { name: /Choose folder on this computer/ }));
+    await waitFor(() => expect(api.ingestHostPath).toHaveBeenCalled());
+    const payload = api.registerClientEvidenceSource.mock.calls[0][1];
+    expect(payload).toEqual(expect.objectContaining({
+      browser: true, relay: true, addresses: [], client_root: "Case-0423", file_count: 2, total_bytes: 6, source_type: "disk",
+    }));
+    expect(payload.share_id).toMatch(/^ce[0-9a-f]{24}$/);
+    expect(payload.manifest_sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(api.listHostFolder).toHaveBeenCalledWith("job-9", { path: "client-evidence://ce00000000000000000000aaaa" });
+    expect(toast.success).toHaveBeenCalledWith(expect.stringContaining("through this browser tab"));
+    stopBrowserShare(payload.share_id);
+  });
+
   it("uses the outbound connection when the agent has no LAN access", async () => {
     installFakeAgent("localhost-only");
     api.registerClientEvidenceSource.mockResolvedValue({
@@ -379,6 +476,33 @@ describe("ClientEvidenceSourceCard", () => {
     expect(line.textContent).toContain("Read from HOME-PC so far: 11.55 GB of the 93.13 GB evidence");
     expect(line.textContent).toContain("6.61 GB sent over the network");
     expect(screen.getByText(/through its outbound connection/)).toBeTruthy();
+  });
+
+  it("offers Reconnect for a browser-served folder after a reload and serves it again from this tab", async () => {
+    vi.stubGlobal("fetch", vi.fn((_input: RequestInfo | URL, init?: RequestInit) =>
+      new Promise<Response>((_, reject) => init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))),
+    ));
+    vi.stubGlobal("showDirectoryPicker", vi.fn(async () => fakeDirectory("Case-0423", [["laptop.E01", "aaaa"], ["laptop.E02", "bb"]])));
+    const before = await import("../../lib/browserEvidenceShare");
+    const picked = await before.pickBrowserFolder();
+    const share = await before.createBrowserShare({
+      folder: picked as NonNullable<typeof picked>, jobId: "job-7", relay: { url: "https://polaron.example/api/client-agent/relay", service: "forensic" },
+    });
+    before.markBrowserShareRegistered(share.share_id);
+    vi.resetModules(); // the page was reloaded: nothing in this tab serves the folder any more
+    (api as unknown as Record<string, unknown>).getClientEvidenceSource = vi.fn(async () => ({
+      configured: true, share_id: share.share_id, browser_share: true, hostname: "This computer (browser on Windows)",
+      client_root: "Case-0423", file_count: 2, total_bytes: 6, agent_online: false, transport: "relay",
+    }));
+    const { ClientEvidenceSourceCard } = await import("./ClientEvidenceSourceCard");
+    render(<ClientEvidenceSourceCard jobId="job-7" active={false} />);
+    expect(await screen.findByText(/This tab is no longer serving Case-0423/)).toBeTruthy();
+    expect(screen.getByText(/through the browser tab that chose the folder/)).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: /Reconnect folder from this computer/ }));
+    expect((await screen.findByTestId("browser-share-serving")).textContent).toContain("Served by this browser tab");
+    const after = await import("../../lib/browserEvidenceShare");
+    after.stopBrowserShare(share.share_id);
+    before.stopBrowserShare(share.share_id);
   });
 });
 
