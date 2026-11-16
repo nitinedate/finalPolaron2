@@ -143,6 +143,12 @@ export type HostDriveLettersResult = {
   message?: string;
   /** V1.10.10: helper online but its list was unavailable; only startup-mounted drives are shown */
   partial?: boolean;
+  /** V1.31.3: false when the list is frozen at the drives Docker mounted at startup (helper unreachable). */
+  live?: boolean;
+  /** V1.31.3: why the forensic server's containers cannot reach the workstation helper. */
+  helper_error?: string | null;
+  helper_errors?: string[];
+  start_hint?: string | null;
 };
 
 export type HostMobileDevicesResult = {

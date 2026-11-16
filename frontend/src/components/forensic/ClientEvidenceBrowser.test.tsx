@@ -9,6 +9,7 @@ import {
   type ClientSelectedFolder,
 } from "./ClientEvidenceBrowser";
 import { clientAgentInstallCommand } from "../../lib/clientEvidenceAgent";
+import { listHostDriveLetters } from "../../lib/hostDriveHelper";
 
 /* --------------------------------------------------------------------- */
 /* Fake Client Evidence Agent on http://127.0.0.1:9877                     */
@@ -573,5 +574,93 @@ describe("ExtractReviewPanel", () => {
     await userEvent.click(screen.getByRole("button", { name: "Continue extraction" }));
     await waitFor(() => expect(onSubmitted).toHaveBeenCalled());
     expect(api.submitExtractReview).toHaveBeenCalledWith("job-r", ["Program Files (x86)", "Users/alice/Downloads/backup.iso"]);
+  });
+});
+
+/* --------------------------------------------------------------------- */
+/* V1.31.3: the forensic server's drive list follows Windows              */
+/* --------------------------------------------------------------------- */
+
+describe("HostEvidencePanel — forensic server drives follow Windows", () => {
+  const vol = (letter: string, extra: Record<string, unknown> = {}) => ({ letter, drive_type: "fixed", ready: true, mounted: true, ...extra });
+  const dirEntry = (name: string) => ({
+    name, kind: "dir", size_bytes: null, selectable: true, ios_backup: false, android_backup: false,
+    segment_base: null, segment_part: null, segment_set: [], segment_count: 0,
+  });
+  let reply: Record<string, unknown>;
+
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    sessionStorage.clear();
+    for (const fn of Object.values(api)) fn.mockReset();
+    toast.info.mockReset();
+    toast.error.mockReset();
+    api.browseHostEvidence.mockImplementation(async (_job: string, q: { drive?: string }) => ({
+      configured: true, host_evidence_path: "", host_root: "", drive_root: q.drive || "", current_path: "",
+      display_path: q.drive ? `${q.drive.toUpperCase()}:\\` : "This PC", parent_path: q.drive ? "" : null,
+      // Like the API: the root lists the drives Docker mounted (the helper's list is merged in by the panel).
+      entries: q.drive
+        ? [dirEntry("Case-0423")]
+        : ((reply.volumes as Array<{ letter: string; mounted?: boolean }>) || [])
+            .filter((v) => v.mounted !== false)
+            .map((v) => ({ ...dirEntry(`${v.letter}:`), kind: "drive", selectable: true, drive_key: v.letter.toLowerCase(), mounted: true })),
+      folder_segment_count: 0, folder_segments: [], drives: [],
+      error: null, mount_hint: null,
+    }));
+    reply = { ok: true, drives: ["C", "D"], volumes: [vol("C"), vol("D")], live: true, helper_online: true };
+    vi.mocked(listHostDriveLetters).mockImplementation(async () => reply as never);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.mocked(listHostDriveLetters).mockReset();
+    vi.mocked(listHostDriveLetters).mockImplementation(async () => ({ ok: true, drives: ["D"], volumes: [] }) as never);
+  });
+
+  it("shows a drive plugged in after startup within seconds and drops it when it is removed", async () => {
+    const { HostEvidencePanel } = await import("./HostEvidencePanel");
+    render(<HostEvidencePanel jobId="job-7" />);
+    expect(await screen.findByRole("button", { name: /^D:/ })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^G:/ })).toBeNull();
+
+    reply = { ...reply, drives: ["C", "D", "G"], volumes: [vol("C"), vol("D"), vol("G", { drive_type: "removable", mounted: false, label: "EVIDENCE" })] };
+    await vi.advanceTimersByTimeAsync(5_100);
+    expect(await screen.findByRole("button", { name: /G: · EVIDENCE/ })).toBeTruthy();
+    expect(toast.info).toHaveBeenCalledWith(expect.stringMatching(/New drive G: on the forensic server.*reads that drive in place/));
+    expect(screen.getByText(/new drives appear automatically/)).toBeTruthy();
+
+    reply = { ...reply, drives: ["C", "D"], volumes: [vol("C"), vol("D")] };
+    await vi.advanceTimersByTimeAsync(5_100);
+    await waitFor(() => expect(screen.queryByRole("button", { name: /^G:/ })).toBeNull());
+    expect(toast.info).toHaveBeenCalledWith("Drive G: removed from the forensic server.");
+  });
+
+  it("goes back to This PC when the drive being browsed is removed", async () => {
+    reply = { ...reply, drives: ["C", "E"], volumes: [vol("C"), vol("E")] };
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    const { HostEvidencePanel } = await import("./HostEvidencePanel");
+    render(<HostEvidencePanel jobId="job-8" />);
+    await user.click(await screen.findByRole("button", { name: /^E:/ }));
+    expect(await screen.findByText("Case-0423")).toBeTruthy();
+
+    reply = { ...reply, drives: ["C"], volumes: [vol("C")] };
+    await vi.advanceTimersByTimeAsync(5_100);
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("Drive E: was removed from the forensic server. Showing This PC."));
+    expect(await screen.findByRole("button", { name: /^C:/ })).toBeTruthy();
+    expect(screen.queryByText("Case-0423")).toBeNull();
+  });
+
+  it("says why new drives are not detected when the server cannot reach the workstation helper", async () => {
+    reply = {
+      ok: true, drives: ["C", "D", "E", "F"], volumes: [vol("C"), vol("D"), vol("E"), vol("F")], live: false, helper_online: false,
+      helper_error: "Nothing listens on port 9876 on the forensic server: the workstation helper is not running.",
+    };
+    const { HostEvidencePanel } = await import("./HostEvidencePanel");
+    render(<HostEvidencePanel jobId="job-9" />);
+    const notice = await screen.findByTestId("server-drive-watch-offline");
+    expect(notice.textContent).toMatch(/connected to the forensic server after Polaron started are not detected/);
+    expect(notice.textContent).toContain("Nothing listens on port 9876");
+    expect(notice.textContent).toContain("start_docker_prod.cmd");
+    expect(screen.queryByText(/new drives appear automatically/)).toBeNull();
   });
 });

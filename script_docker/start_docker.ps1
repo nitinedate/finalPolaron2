@@ -297,6 +297,40 @@ function Ensure-WorkstationHelper {
     }
 }
 
+function Test-ContainersReachWorkstationHelper {
+    # V1.31.3: drives connected to this server after startup reach the evidence browser only through the
+    # workstation helper, which the forensic API asks at http://host.docker.internal:9876. A helper that answers
+    # on this PC can still be unreachable from Docker (no http://+:9876/ reservation, firewall, token), and the
+    # drive list then stays frozen at the drives mounted at startup. Ask from inside the API container. Never fatal.
+    Write-Step 'Check that the forensic containers reach the workstation helper (drives connected later)'
+    $api = Get-ComposeServiceContainerState -ProjectName 'aetheris-forensic' -Service 'api'
+    if (-not $api -or $api.Status -ne 'running') {
+        Write-Warn 'The forensic API container is not running, so the helper connection was not checked.'
+        return $false
+    }
+    $code = "import json;from app.services.hostdrive_agent import probe_helper;r=probe_helper();print('POLARON_HELPER '+json.dumps({'ok':bool(r.get('ok')),'url':r.get('helper_url') or '','drives':r.get('drives') or [],'error':r.get('error') or '','errors':(r.get('errors') or [])[:3]}))"
+    $out = Invoke-DockerCapture -DockerArgs @('exec', '-w', '/app', $api.Id, 'python', '-c', $code)
+    $line = @(([string]$out) -split "`n" | Where-Object { $_ -like 'POLARON_HELPER *' } | Select-Object -Last 1)
+    $result = $null
+    if ($line.Count -gt 0) {
+        try { $result = ($line[0].Substring('POLARON_HELPER '.Length)) | ConvertFrom-Json } catch { $result = $null }
+    }
+    if (-not $result) {
+        Write-Warn 'Could not ask the forensic API container about the workstation helper; drives connected later may not appear until you click Refresh drive mounts.'
+        return $false
+    }
+    if ($result.ok) {
+        $letters = (@($result.drives) | ForEach-Object { '{0}:' -f ([string]$_).TrimEnd(':') }) -join ' '
+        Write-Ok ("The forensic containers reach the workstation helper ({0}); drives connected later appear in the evidence browser by themselves. Drives now: {1}" -f $result.url, $letters)
+        return $true
+    }
+    Write-Warn ("The forensic containers cannot reach the workstation helper: {0}" -f $result.error)
+    foreach ($e in @($result.errors)) { if ($e) { Write-Warn ("    {0}" -f $e) } }
+    Write-Warn 'Until this is fixed, the Forensic server evidence browser lists only the drives Docker mounted at startup; a drive connected later is not shown.'
+    Write-Warn 'Fix: run this launcher as Administrator (it reserves http://+:9876/ for the helper), or once as Administrator: scripts\configure-host-drive-helper-network.ps1, then scripts\ensure-host-drive-helper.ps1 -ForceRestart.'
+    return $false
+}
+
 function Assert-DockerReady {
     $docker = Get-Command docker -ErrorAction SilentlyContinue
     if (-not $docker) {
@@ -2506,6 +2540,7 @@ try {
 
     Assert-RuntimeHealth
     Ensure-WorkstationHelper
+    $null = Test-ContainersReachWorkstationHelper
 
     Write-Host ''
     if ($isPublic) {

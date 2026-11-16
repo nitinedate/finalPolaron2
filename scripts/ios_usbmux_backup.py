@@ -12,6 +12,14 @@ overflows that and pymobiledevice3 raises FileNotFoundError mid-backup.
 A dropped USB session (ConnectionTerminatedError) is retried as a resume
 (full=False). An empty Manifest.plist that pymobiledevice3 touches at start
 is not a finished backup.
+
+V1.31.4: pymobiledevice3 reads the backup connection with no timeout
+(socket.settimeout(None)), so an iPhone that stops talking (screen locked or
+asleep while it finishes, or a USB/usbmux session that died silently) left
+this process waiting forever at "100%". The host helper now watches for that
+and calls this script with --verify to decide whether the backup on disk is
+already complete (then the stuck session is simply closed) or must be resumed
+(--resume continues into the same staging folder instead of a new full backup).
 """
 
 from __future__ import annotations
@@ -283,6 +291,129 @@ def _emit(payload: dict) -> None:
     print(json.dumps(payload), flush=True)
 
 
+def _manifest_entry_size(blob) -> int | None:
+    """File size recorded in a Manifest.db 'file' column (NSKeyedArchiver MBFile), if readable."""
+    if not blob:
+        return None
+    try:
+        import plistlib
+
+        archived = plistlib.loads(bytes(blob))
+        objects = archived.get("$objects") or []
+        root = archived.get("$top", {}).get("root")
+        index = root.data if hasattr(root, "data") else 1
+        entry = objects[index] if isinstance(index, int) and index < len(objects) else None
+        if isinstance(entry, dict) and "Size" in entry:
+            return int(entry["Size"])
+    except Exception:
+        return None
+    return None
+
+
+def verify_backup(backup_dir: Path, since: float = 0.0) -> dict:
+    """Is this iTunes-style backup complete on disk?
+
+    Complete means: the device's own Manifest.db (readable SQLite, written in this session when
+    ``since`` is given) and Manifest.plist are there, and every file Manifest.db lists is present.
+    The iPhone sends Manifest.db last, after every file, so this is exactly "the device finished
+    sending the backup" - whatever happened to the session afterwards.
+    """
+    out: dict = {"path": str(backup_dir), "complete": False}
+    db = backup_dir / "Manifest.db"
+    plist = backup_dir / "Manifest.plist"
+    try:
+        db_stat = db.stat()
+    except OSError:
+        out["reason"] = "manifest_db_missing"
+        return out
+    if db_stat.st_size <= 64:
+        out["reason"] = "manifest_db_empty"
+        return out
+    if since and db_stat.st_mtime + 2 < since:
+        out["reason"] = "manifest_db_older_than_this_session"
+        out["manifest_db_mtime"] = db_stat.st_mtime
+        return out
+    try:
+        if plist.stat().st_size <= 64:
+            out["reason"] = "manifest_plist_empty"
+            return out
+    except OSError:
+        out["reason"] = "manifest_plist_missing"
+        return out
+    encrypted = False
+    try:
+        import plistlib
+
+        with plist.open("rb") as fh:
+            encrypted = bool(plistlib.load(fh).get("IsEncrypted"))
+    except Exception:
+        encrypted = False
+    import sqlite3
+
+    try:
+        con = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            rows = con.execute("SELECT fileID, flags, file FROM Files").fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        out["reason"] = f"manifest_db_unreadable: {exc}"
+        return out
+    files = missing = smaller = 0
+    examples: list[str] = []
+    for file_id, flags, blob in rows:
+        if flags != 1 or not file_id:
+            continue
+        files += 1
+        path = backup_dir / str(file_id)[:2] / str(file_id)
+        try:
+            size = path.stat().st_size
+        except OSError:
+            missing += 1
+            if len(examples) < 5:
+                examples.append(str(file_id))
+            continue
+        if not encrypted:
+            expected = _manifest_entry_size(blob)
+            if expected is not None and size < expected:
+                smaller += 1
+    out.update({
+        "files_in_manifest": files,
+        "missing": missing,
+        "truncated": smaller,
+        "missing_examples": examples,
+        "encrypted": encrypted,
+    })
+    if files == 0:
+        out["reason"] = "manifest_lists_no_files"
+    elif missing or smaller:
+        out["reason"] = "files_missing_or_truncated"
+    else:
+        out["complete"] = True
+        out["reason"] = "complete"
+    return out
+
+
+def existing_staging_root(udid: str, stamp: str) -> Path | None:
+    """The staging folder an earlier attempt of this run used (any volume), for --resume."""
+    tail = "".join(ch for ch in udid if ch.isalnum())[-8:] or "ios"
+    safe_stamp = re.sub(r"[^\w\-]", "", stamp or "")[:20]
+    if not safe_stamp:
+        return None
+    best: tuple[int, Path] | None = None
+    for letter in _CANDIDATE_LETTERS:
+        cand = Path(f"{letter}:/ib") / tail / safe_stamp
+        try:
+            if not (cand / udid).is_dir():
+                continue
+            count = sum(1 for _ in (cand / udid).iterdir())
+        except OSError:
+            continue
+        if best is None or count > best[0]:
+            best = (count, cand)
+    return best[1] if best else None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Backup a paired iPhone over usbmux")
     parser.add_argument("--udid", required=True)
@@ -290,6 +421,8 @@ def main() -> int:
     parser.add_argument("--stamp", default="", help="Unique per-run staging folder name")
     parser.add_argument("--required-free-bytes", type=int, default=0,
                         help="Minimum free bytes required on the iOS staging volume")
+    parser.add_argument("--resume", action="store_true",
+                        help="Continue an earlier attempt of this run in its staging folder (no forced full backup)")
     args = parser.parse_args()
 
     dest = Path(args.dest)
@@ -343,8 +476,15 @@ def main() -> int:
             "requested_dest": str(dest),
         })
 
+        resume_root = existing_staging_root(udid, args.stamp) if args.resume else None
         # Always stage on Windows. Unique stamp keeps leftover X:\ib\<tail> from mixing runs.
-        if os.name == "nt" or backup_tree_would_exceed_max_path(str(dest), udid):
+        if resume_root is not None:
+            # The earlier attempt's data is there: continue it, even if the volume no longer has
+            # room for a whole new backup (it only needs room for what is still missing).
+            write_root = resume_root
+            staged = True
+            _emit({"stage": "resume_staging", "dest": str(write_root), "requested_dest": str(dest)})
+        elif os.name == "nt" or backup_tree_would_exceed_max_path(str(dest), udid):
             try:
                 write_root = short_staging_root(
                     udid, args.stamp, min_free_bytes=need_bytes,
@@ -372,7 +512,7 @@ def main() -> int:
             "drive_free_bytes": free_now,
             "min_free_bytes": need_bytes,
         })
-        if 0 <= free_now < need_bytes:
+        if 0 <= free_now < need_bytes and resume_root is None:
             payload = classify_backup_failure(
                 RuntimeError(f"NotEnoughDiskSpaceError free={free_now} required={need_bytes}"),
                 write_root,
@@ -387,7 +527,7 @@ def main() -> int:
         force_full = False
         nested: Path | None = None
         for attempt in range(1, _MAX_ATTEMPTS + 1):
-            full = attempt == 1 or force_full
+            full = (attempt == 1 and not args.resume) or force_full
             force_full = False
             try:
                 _emit({"stage": "attempt", "attempt": attempt, "full": full, "dest": str(write_root)})
@@ -482,5 +622,17 @@ def main() -> int:
     return 0
 
 
+def verify_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Check whether an iOS backup folder is complete")
+    parser.add_argument("--verify", required=True, help="The <UDID> backup folder")
+    parser.add_argument("--since", type=float, default=0.0, help="Session start (epoch seconds)")
+    args = parser.parse_args(argv)
+    result = verify_backup(Path(args.verify), since=args.since)
+    _emit({"stage": "verify", **result})
+    return 0 if result.get("complete") else 2
+
+
 if __name__ == "__main__":
+    if "--verify" in sys.argv[1:]:
+        raise SystemExit(verify_main(sys.argv[1:]))
     raise SystemExit(main())

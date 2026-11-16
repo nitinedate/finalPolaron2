@@ -1907,7 +1907,9 @@ function Invoke-IosToolAcquire {
         [string]$Udid = "",
         [string]$ProgressFile = "",
         [string]$RunName = "",
-        [string]$Stamp = ""
+        [string]$Stamp = "",
+        # V1.31.4: a retry continues the earlier attempt's staging folder instead of a new full backup.
+        [switch]$Resume
     )
     Set-MobileUsbHostAwake
     $mdsPresent = Test-AppleMobileDeviceSupport
@@ -2071,7 +2073,8 @@ function Invoke-IosToolAcquire {
 
     if ($usePymobileBackup) {
         return Invoke-IosPymobileBackup -OutDir $OutDir -LogPath $LogPath -Udid $Udid -BackupRoot $backupRoot `
-            -ProgressFile $ProgressFile -RunName $RunName -Stamp $Stamp -RequiredFreeBytes ([int64]$iosSizing.required)
+            -ProgressFile $ProgressFile -RunName $RunName -Stamp $Stamp -RequiredFreeBytes ([int64]$iosSizing.required) `
+            -Resume:$Resume
     }
 
     Write-AcquireLog $LogPath ("Starting full iOS backup image into {0} (this can take a long time)..." -f $backupRoot)
@@ -2128,6 +2131,57 @@ function Invoke-IosToolAcquire {
     return @{ ok = $false; method = "idevicebackup2"; error = $errCode; exit = $proc.ExitCode; detail = $combined }
 }
 
+function Get-IosStallMinutes {
+    # V1.31.4: minutes the iPhone may send nothing before the helper checks the backup.
+    # While finishing (backup at 100%) the phone only writes Manifest.db and ends the session, so
+    # a much shorter wait applies. IOS_BACKUP_STALL_MINUTES / IOS_BACKUP_FINALIZE_STALL_MINUTES override.
+    param([bool]$Finishing)
+    $name = $(if ($Finishing) { "IOS_BACKUP_FINALIZE_STALL_MINUTES" } else { "IOS_BACKUP_STALL_MINUTES" })
+    $default = $(if ($Finishing) { 8 } else { 25 })
+    $value = 0.0
+    $raw = [string][Environment]::GetEnvironmentVariable($name)
+    if ([double]::TryParse($raw, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$value) -and $value -gt 0) {
+        return $value
+    }
+    return [double]$default
+}
+
+function Invoke-IosBackupVerify {
+    # V1.31.4: is the backup folder complete on disk? ios_usbmux_backup.py --verify opens Manifest.db
+    # (written by the iPhone after every file, in this session) and checks every file it lists.
+    param([string]$BackupDir, [datetime]$Since = [datetime]::MinValue)
+    $result = [pscustomobject]@{ complete = $false; reason = "verify_unavailable"; files_in_manifest = 0; missing = 0; truncated = 0 }
+    $py = Find-IosKitPython
+    $scriptPath = Join-Path (Get-RepoRoot) "scripts\ios_usbmux_backup.py"
+    if (-not $py -or -not (Test-Path -LiteralPath $scriptPath) -or -not $BackupDir -or -not (Test-Path -LiteralPath $BackupDir)) {
+        return $result
+    }
+    $verifyArgs = @($scriptPath, "--verify", $BackupDir)
+    if ($Since -gt [datetime]::MinValue) { $verifyArgs += @("--since", [string](([DateTimeOffset]$Since).ToUnixTimeSeconds())) }
+    $prev = $env:PYTHONPATH
+    $raw = ""
+    try {
+        $env:PYTHONPATH = Get-KitPythonPathEnv
+        $raw = (& $py @verifyArgs 2>$null | Out-String)
+    } catch {
+        $raw = ""
+    } finally {
+        $env:PYTHONPATH = $prev
+    }
+    $line = ($raw -split "`r?`n" | Where-Object { $_.Trim().StartsWith("{") } | Select-Object -Last 1)
+    if ($line) {
+        try {
+            $obj = $line | ConvertFrom-Json
+            $result.complete = [bool]$obj.complete
+            $result.reason = [string]$obj.reason
+            $result.files_in_manifest = [int]$obj.files_in_manifest
+            $result.missing = [int]$obj.missing
+            $result.truncated = [int]$obj.truncated
+        } catch { $result.reason = "verify_output_unreadable" }
+    }
+    return $result
+}
+
 function Invoke-IosPymobileBackup {
     param(
         [string]$OutDir,
@@ -2137,7 +2191,8 @@ function Invoke-IosPymobileBackup {
         [string]$ProgressFile = "",
         [string]$RunName = "",
         [string]$Stamp = "",
-        [int64]$RequiredFreeBytes = 0
+        [int64]$RequiredFreeBytes = 0,
+        [switch]$Resume
     )
     $py = Find-IosKitPython
     $scriptPath = Join-Path (Get-RepoRoot) "scripts\ios_usbmux_backup.py"
@@ -2153,6 +2208,11 @@ function Invoke-IosPymobileBackup {
     $env:PYTHONPATH = Get-KitPythonPathEnv
     $backupArgs = @($scriptPath, "--udid", $Udid, "--dest", $BackupRoot, "--stamp", $Stamp)
     if ($RequiredFreeBytes -gt 0) { $backupArgs += @("--required-free-bytes", [string]$RequiredFreeBytes) }
+    if ($Resume) {
+        $backupArgs += "--resume"
+        Write-AcquireLog $LogPath "Resuming the earlier attempt of this collection in its staging folder (no new full backup)."
+    }
+    $sessionStart = Get-Date
     $proc = Start-Process -FilePath $py -ArgumentList $backupArgs `
         -PassThru -NoNewWindow -RedirectStandardError $errFile -RedirectStandardOutput $outFile
     $env:PYTHONPATH = $prevPy
@@ -2164,6 +2224,15 @@ function Invoke-IosPymobileBackup {
     $liveNewest = ""
     $lastScan = Get-Date
     $lastScan = $lastScan.AddSeconds(-20)
+    # V1.31.4 stall watchdog. pymobiledevice3 waits for the iPhone with no timeout; when the phone stops
+    # talking (locked/asleep while finishing, or a USB/usbmux session that died silently) this loop used to
+    # run forever at "backup 100%". Activity = new output from the backup tool or a change in the staging tree.
+    $lastActivity = Get-Date
+    $lastOutLength = [int64]-1
+    $lastLiveKey = ""
+    $stalledCompleteDir = ""
+    $stallFailure = $null
+    $stallUsedMinutes = 0
     while ($proc -and -not $proc.HasExited) {
         if ($cancel -and (Test-Path -LiteralPath $cancel)) {
             Write-AcquireLog $LogPath "Cancel file seen - stopping iPhone backup."
@@ -2195,18 +2264,51 @@ function Invoke-IosPymobileBackup {
             }
         }
         $now = Get-Date
+        $outLength = [int64]-1
+        try { $outLength = [int64](Get-Item -LiteralPath $outFile -ErrorAction Stop).Length } catch { }
+        if ($outLength -ne $lastOutLength) { $lastOutLength = $outLength; $lastActivity = $now }
         if ($stagingPath -and (($now - $lastScan).TotalSeconds -ge 8)) {
             $stats = Get-FolderLiveStats -Path $stagingPath
             $liveFiles = [int64]$stats.files
             $liveBytes = [int64]$stats.bytes
             $liveNewest = [string]$stats.newest
             $lastScan = $now
+            $liveKey = "{0}|{1}|{2}" -f $liveFiles, $liveBytes, $liveNewest
+            if ($liveKey -ne $lastLiveKey) { $lastLiveKey = $liveKey; $lastActivity = $now }
+        }
+        $finishing = ($pct -ge 99.5)
+        $stallLimit = Get-IosStallMinutes -Finishing $finishing
+        $idleMinutes = ($now - $lastActivity).TotalMinutes
+        if ($idleMinutes -ge $stallLimit) {
+            $stallUsedMinutes = $stallLimit
+            # Close the stuck session first (no open handles), then check the backup on disk.
+            Write-AcquireLog $LogPath ("No data from the iPhone for {0:N0} min at backup {1:N0}% - closing the stuck session and checking the backup on disk." -f $idleMinutes, $pct)
+            & taskkill.exe /PID $proc.Id /T /F 2>$null | Out-Null
+            try { $null = $proc.WaitForExit(30000) } catch { }
+            $udidDir = $(if ($stagingPath) { Join-Path $stagingPath $Udid } else { "" })
+            $check = Invoke-IosBackupVerify -BackupDir $udidDir -Since $sessionStart
+            if ($check.complete) {
+                $stalledCompleteDir = $udidDir
+                Write-AcquireLog $LogPath ("Backup is complete on disk: Manifest.db lists {0} files, none missing. The iPhone did not end the session; continuing with this backup." -f $check.files_in_manifest)
+            } else {
+                $stallFailure = $check
+                Write-AcquireLog $LogPath ("Backup is not complete on disk ({0}; missing={1}, truncated={2}). The iPhone stopped sending data; the collection resumes into the same staging folder." -f $check.reason, $check.missing, $check.truncated)
+            }
+            break
         }
         if ($ProgressFile) {
             try {
                 $pctShown = [int][math]::Round($pct)
                 $gb = [math]::Round($liveBytes / 1GB, 2)
                 $detailText = "iPhone backup $pctShown% - $gb GB, $liveFiles files - keep the phone unlocked, screen awake, and Trust This Computer."
+                if ($idleMinutes -ge [math]::Min(2, $stallLimit / 2)) {
+                    $waitLeft = [math]::Max(1, [math]::Ceiling($stallLimit - $idleMinutes))
+                    if ($finishing) {
+                        $detailText = ("iPhone backup 100% - {0} GB, {1} files. The iPhone has sent nothing for {2:N0} min while finishing the backup. If it is locked or asleep, unlock it and keep the screen on. Polaron checks the backup on disk in {3} min." -f $gb, $liveFiles, $idleMinutes, $waitLeft)
+                    } else {
+                        $detailText = ("iPhone backup {0}% - {1} GB, {2} files. The iPhone has sent nothing for {3:N0} min. Unlock it and keep the screen on; Polaron checks and resumes the backup in {4} min if it stays silent." -f $pctShown, $gb, $liveFiles, $idleMinutes, $waitLeft)
+                    }
+                }
                 $itemText = $liveNewest
                 if (-not $itemText) { $itemText = "ios_backup" }
                 $progObj = @{
@@ -2223,6 +2325,8 @@ function Invoke-IosPymobileBackup {
                     run_name      = $RunName
                     output_path   = $(if ($stagingPath) { $stagingPath } else { $BackupRoot })
                     media_path    = $BackupRoot
+                    idle_seconds  = [int]($idleMinutes * 60)
+                    stall_limit_minutes = $stallLimit
                 }
                 $progObj | ConvertTo-Json -Compress | Set-Content -LiteralPath $ProgressFile -Encoding UTF8
             } catch {}
@@ -2230,7 +2334,20 @@ function Invoke-IosPymobileBackup {
         Start-Sleep -Seconds 2
     }
     if ($proc -and -not $proc.HasExited) {
-        try { $proc.WaitForExit() } catch {}
+        # Bounded: never wait forever for a process that was just stopped.
+        try { $null = $proc.WaitForExit(60000) } catch {}
+        if (-not $proc.HasExited) { try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {} }
+    }
+    if ($stallFailure) {
+        return @{
+            ok      = $false
+            method  = "pymobiledevice3"
+            error   = "ios_backup_stalled_no_data_from_iphone"
+            exit    = 1
+            stalled = $true
+            detail  = ("No data from the iPhone for {0:N0} min; backup on disk not complete ({1}, missing {2} of {3} files)." -f `
+                $stallUsedMinutes, $stallFailure.reason, $stallFailure.missing, $stallFailure.files_in_manifest)
+        }
     }
     $outTail = ""
     if (Test-Path -LiteralPath $outFile) {
@@ -2254,6 +2371,7 @@ function Invoke-IosPymobileBackup {
             }
         } catch { }
     }
+    if (-not $backupDir -and $stalledCompleteDir) { $backupDir = $stalledCompleteDir }
     if (-not $backupDir) {
         $nested = Get-ChildItem -LiteralPath $BackupRoot -Directory -ErrorAction SilentlyContinue |
             Where-Object { Test-IosBackupComplete -Path $_.FullName } |
@@ -2468,6 +2586,12 @@ function Invoke-IosAfcAcquire {
     $env:PYTHONPATH = $prevPy
     $cancel = ""
     if ($ProgressFile) { $cancel = $ProgressFile + ".cancel" }
+    # V1.31.4: the AFC add-on has the same no-timeout reads. When it stays silent, keep what it pulled.
+    $afcStallMinutes = 15
+    $afcValue = 0
+    if ([int]::TryParse([string]$env:IOS_AFC_STALL_MINUTES, [ref]$afcValue) -and $afcValue -ge 1) { $afcStallMinutes = $afcValue }
+    $afcLastActivity = Get-Date
+    $afcLastKey = ""
     while ($proc -and -not $proc.HasExited) {
         if ($cancel -and (Test-Path -LiteralPath $cancel)) {
             Write-AcquireLog $LogPath "Cancel file seen - stopping iPhone AFC pull."
@@ -2475,6 +2599,15 @@ function Invoke-IosAfcAcquire {
             break
         }
         $stats = Get-DirFileStats -Dir $stage
+        $afcOutLength = [int64]-1
+        try { $afcOutLength = [int64](Get-Item -LiteralPath $outFile -ErrorAction Stop).Length } catch { }
+        $afcKey = "{0}|{1}|{2}" -f $stats.files, $stats.bytes, $afcOutLength
+        if ($afcKey -ne $afcLastKey) { $afcLastKey = $afcKey; $afcLastActivity = Get-Date }
+        if (((Get-Date) - $afcLastActivity).TotalMinutes -ge $afcStallMinutes) {
+            Write-AcquireLog $LogPath ("iOS AFC/house_arrest sent nothing for {0} min - stopping it and keeping the {1} files it pulled (the backup is already saved)." -f $afcStallMinutes, $stats.files)
+            & taskkill.exe /PID $proc.Id /T /F 2>$null | Out-Null
+            break
+        }
         if ($ProgressFile) {
             try {
                 $gb = [math]::Round(([int64]$stats.bytes) / 1GB, 2)
@@ -2503,7 +2636,8 @@ function Invoke-IosAfcAcquire {
         Start-Sleep -Seconds 4
     }
     if ($proc -and -not $proc.HasExited) {
-        try { $proc.WaitForExit() } catch {}
+        try { $null = $proc.WaitForExit(60000) } catch {}
+        if (-not $proc.HasExited) { try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {} }
     }
     $stats = Get-DirFileStats -Dir $stage
     $ok = ([int]$stats.files -gt 0)

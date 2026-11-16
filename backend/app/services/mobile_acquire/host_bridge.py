@@ -54,10 +54,21 @@ def helper_base_url() -> str:
     return _ACTIVE_HELPER_URL or _candidate_helper_urls()[0]
 
 
-def helper_auth_headers() -> dict[str, str]:
-    """Shared secret for the helper when HOST_DRIVE_HELPER_TOKEN is configured on both sides."""
+def helper_auth_headers(url: str | None = None) -> dict[str, str]:
+    """Shared secret for the helper when HOST_DRIVE_HELPER_TOKEN is configured on both sides.
+
+    With *url*, also the Host header a helper bound to 127.0.0.1 needs when it is reached through
+    host.docker.internal (V1.31.3, see hostdrive_agent.docker_host_header).
+    """
     token = (os.environ.get("HOST_DRIVE_HELPER_TOKEN") or "").strip()
-    return {"X-Host-Helper-Token": token} if token else {}
+    headers = {"X-Host-Helper-Token": token} if token else {}
+    if url:
+        from app.services.hostdrive_agent import docker_host_header
+
+        host = docker_host_header(url)
+        if host:
+            headers["Host"] = host
+    return headers
 
 
 def is_host_job_id(run_id: str | None) -> bool:
@@ -169,7 +180,7 @@ def helper_reachable(timeout_sec: float = 2.0) -> bool:
     last_exc: Exception | None = None
     for base in _candidate_helper_urls():
         try:
-            req = urllib.request.Request(f"{base}/health", method="GET")
+            req = urllib.request.Request(f"{base}/health", method="GET", headers=helper_auth_headers(base))
             with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
                 data = json.loads(resp.read().decode("utf-8", errors="replace"))
                 if bool(data.get("ok")):
@@ -187,7 +198,7 @@ def helper_reachable(timeout_sec: float = 2.0) -> bool:
 def _get_json(path: str, *, timeout_sec: float = 30.0) -> dict[str, Any] | None:
     url = f"{helper_base_url()}{path}"
     try:
-        req = urllib.request.Request(url, method="GET", headers=helper_auth_headers())
+        req = urllib.request.Request(url, method="GET", headers=helper_auth_headers(url))
         with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
             return json.loads(resp.read().decode("utf-8", errors="replace"))
     except Exception as exc:
@@ -203,7 +214,7 @@ def _post_json(path: str, body: dict[str, Any], *, timeout_sec: float = 1800.0) 
             url,
             data=raw,
             method="POST",
-            headers={"Content-Type": "application/json", **helper_auth_headers()},
+            headers={"Content-Type": "application/json", **helper_auth_headers(url)},
         )
         with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
             return json.loads(resp.read().decode("utf-8", errors="replace"))

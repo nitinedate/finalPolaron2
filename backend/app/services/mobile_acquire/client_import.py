@@ -389,7 +389,7 @@ class HelperWriter:
 
         self.base_url = base_url.rstrip("/")
         self.headers = {
-            **host_bridge.helper_auth_headers(),
+            **host_bridge.helper_auth_headers(self.base_url),
             "X-Import-Case-Root": case_root,
             "X-Import-Case-Id": case_folder,
             "User-Agent": "PolaronForensicServer/1.0 (client-mobile-import)",

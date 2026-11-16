@@ -109,8 +109,9 @@ if (Get-Command Invoke-IosToolAcquire -ErrorAction SilentlyContinue) {
             $ok = $false
             break
         }
+        # V1.31.4: a retry continues the earlier attempt's staging folder (same stamp) instead of a new full backup.
         $ios = Invoke-IosToolAcquire -OutDir $original -LogPath $logPath -Udid ([string]$p.device_id) `
-            -ProgressFile $progress -RunName $runName -Stamp $stamp
+            -ProgressFile $progress -RunName $runName -Stamp $stamp -Resume:($tryN -gt 1)
         if ($ios.ok) {
             $backupPath = [string]$ios.backup_path
             $backupComplete = $false
@@ -141,6 +142,10 @@ if (Get-Command Invoke-IosToolAcquire -ErrorAction SilentlyContinue) {
         }
         if ($err -match 'not_enough_disk|device_locked|pair_|cancelled') { break }
         if ($tryN -lt $maxBackupTries) {
+            $retryDetail = "USB backup dropped before Manifest.db. Keep the iPhone unlocked - resuming attempt $($tryN + 1) of $maxBackupTries into the same staging folder."
+            if ($err -eq "ios_backup_stalled_no_data_from_iphone") {
+                $retryDetail = "The iPhone stopped sending data before the backup was complete. Unlock it and keep the screen on - resuming attempt $($tryN + 1) of $maxBackupTries into the same staging folder."
+            }
             Write-Prog @{
                 stage        = "acquire"
                 item         = "ios_backup"
@@ -148,7 +153,7 @@ if (Get-Command Invoke-IosToolAcquire -ErrorAction SilentlyContinue) {
                 files_seen   = $copied
                 run_name     = $runName
                 progress_pct = 6
-                detail       = "USB backup dropped before Manifest.db. Keep the iPhone unlocked - resuming attempt $($tryN + 1) of $maxBackupTries into the same staging folder."
+                detail       = $retryDetail
                 category     = "Collecting"
             }
             if (Get-Command Write-AcquireLog -ErrorAction SilentlyContinue) {
