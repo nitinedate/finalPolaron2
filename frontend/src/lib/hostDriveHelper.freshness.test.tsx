@@ -11,7 +11,7 @@ describe("this computer's phone list freshness (V1.31.6)", () => {
 
   it("says when the list is old and how to restart the helper", () => {
     const [w] = deviceListFreshnessWarnings({ scanned_utc: new Date(now - 33 * 60_000).toISOString() }, now);
-    expect(w).toMatch(/last read at .* \(33 min ago\) and is not updating/);
+    expect(w).toMatch(/last read at .* \(33 min ago\) and is not updating, so its phones are not shown/);
     expect(w).toMatch(/an unplugged one may still be listed/);
     expect(w).toContain("scripts\\ensure-host-drive-helper.ps1 -ForceRestart");
     expect(w).toContain("not while a collection is running");

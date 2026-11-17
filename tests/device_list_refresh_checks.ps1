@@ -57,7 +57,7 @@ function Get-ItemProperty { param([string]$LiteralPath, $ErrorAction)
         if ($script:enumProps.ContainsKey($id)) { return [pscustomobject]$script:enumProps[$id] }; return $null }
     if ($LiteralPath -like 'wpd::*') { $id = $LiteralPath.Substring(5); $e = $script:wpd | Where-Object { $_.Id -eq $id } | Select-Object -First 1; return [pscustomobject]@{ FriendlyName = $e.Name } }
     return $null }
-function Get-CimInstance { param($ClassName, $Filter, $ErrorAction) return $script:procs }
+function Get-CimInstance { param($ClassName, $Filter, $OperationTimeoutSec, $ErrorAction) return $script:procs }
 function Read-Acq { return (Get-Content -LiteralPath $acqFile -Raw | ConvertFrom-Json) }
 function Set-Plugged([string[]]$What) {
     $script:running = @{}; $script:wpd = @()
@@ -209,8 +209,26 @@ try {
         Assert-True ($body -match '\$usbStates = Get-AndroidUsbStates' -and $body -match '\$usbStates\.MtpKeys\.Contains' -and $body -match '@\(@\(\$usbStates\.Ready\) \+ @\(\$usbStates\.Rows\)\)') "$builder uses the Android USB classifier"
     }
 
+    # ---- V1.31.9 ----------------------------------------------------------------------------------
+    # 15. A failing stay-awake call no longer stops the list from being written (it threw first before).
+    $adbOnly = 'USB\VID_18D1&PID_4EE7\8ABX0001'
+    $script:enumProps[$adbOnly] = @{ DeviceDesc = '@oem1.inf,%adb%;ADB Device'; CompatibleIDs = @('USB\Class_ff&SubClass_42&Prot_01') }
+    $script:running = @{ WinUSB = @($adbOnly) }; $script:wpd = @(); $script:procs = @()
+    Remove-Item -LiteralPath $acqFile -Force -ErrorAction SilentlyContinue
+    function Set-UsbStayAwake { param([bool]$On) throw 'Add-Type is blocked on this computer' }
+    $null = Update-DeviceCacheOnce
+    Assert-True (Test-Path -LiteralPath $acqFile) 'The list is written even when stay-awake fails'
+    $rows = @((Read-Acq).devices)
+    Assert-True ($rows.Count -eq 1 -and $rows[0].adapter -eq 'android_adb' -and $rows[0].label -eq 'Android phone') '"ADB Device" is not shown as the phone name'
+    function Set-UsbStayAwake { param([bool]$On) }
+    # 16. Nothing plugged in: the list is empty.
+    $script:running = @{}; $script:wpd = @()
+    $null = Update-DeviceCacheOnce
+    Assert-True (@((Read-Acq).devices).Count -eq 0) 'Nothing plugged in: no phones'
+
     $text = [IO.File]::ReadAllText($helper)
-    Assert-True ($text -match '\$script:HelperVersion = "5\.63"') 'Helper version 5.63'
+    Assert-True ($text -match '\$script:HelperVersion = "5\.64"') 'Helper version 5.64'
+    Assert-True ($text -match 'if \(\$null -eq \$context\) \{ Test-MobileDeviceRefresh; continue \}' -and $text -match 'function Test-MobileDeviceRefresh') 'The request loop restarts a stopped background refresh'
     Write-Output "PASS: $script:checks device list refresh checks"
 } finally {
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue

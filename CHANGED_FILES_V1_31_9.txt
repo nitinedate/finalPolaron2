@@ -1,0 +1,26 @@
+Polaron V1.31.9 - cumulative list for POLARON_V1_31_9_UPDATED_FILES.zip (V1.31.0 to V1.31.9)
+
+V1.31.9 (this update; deploy on the server; clients update themselves or via Update this computer)
+  scripts/host-drive-helper.ps1                    5.64: /acquisition/devices and /mobile-devices read the USB
+                                                   devices present now (AetherisUsbLive, SetupAPI) and classify
+                                                   them; background refresh writes before keep-awake, bounded
+                                                   process query, status file, restarted when stopped/stale;
+                                                   "ADB Device" is not a phone name
+  scripts/ensure-host-drive-helper.ps1             expects helper 5.64
+  scripts/diagnose-phone-detection.ps1             shows the live list, the background list and its status
+  frontend/src/lib/hostDriveHelper.ts              a list older than 2 min is not shown (local_helper.stale);
+                                                   adb rows from the mobile list map to android_adb (one card)
+  frontend/src/components/forensic/ClientSetupPanel.tsx   a frozen list asks to Update this computer
+  frontend/src/pages/forensic/MobileAcquisitionPage.tsx   skips this computer's mobile list when untrusted
+  frontend/src/lib/hostDriveHelper.v1319.test.tsx  7 tests (new)
+  frontend/src/lib/hostDriveHelper.freshness.test.tsx, hostDriveHelper.androidUsb.test.tsx   updated
+  backend/tests/test_live_usb_scan_v1_31_9.py      11 tests (new; compiles the helper C# with Mono)
+  backend/tests/test_mobile_usb_bootstrap_scripts.py, test_android_usb_detection_v1_31_7.py,
+  backend/tests/test_client_kit_v1_31_8.py         version 5.64
+  tests/device_list_refresh_checks.ps1             33 checks (4 new)
+  RELEASE_V1_31_9_LIVE_PHONE_SCAN.md, CHANGED_FILES_V1_31_9.txt
+  recovery-snapshots/pre-v1.31.9-live-scan-20261117/  the V1.31.8 versions of the changed files
+
+Earlier: CHANGED_FILES_V1_31_8.txt, _V1_31_7, _V1_31_6, _V1_31_5, _V1_31_4, _V1_31_3, _V1_31_2 (V1.31.0 to V1.31.2).
+
+Not in the ZIP: .env (no change needed)

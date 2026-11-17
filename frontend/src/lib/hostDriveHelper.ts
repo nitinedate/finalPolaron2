@@ -364,11 +364,13 @@ export function hostMobileToAcquisitionDevice(
 ): HostAcquisitionDevice {
   const os = device.os_hint === "ios" ? "ios" : device.os_hint === "android" ? "android" : "other";
   const needsAction = os !== "ios" && device.connection === "usb" && Boolean(device.state);
+  const adb = os !== "ios" && device.connection === "adb";
   return {
-    adapter: os === "ios" ? "ios_lockdown" : needsAction ? PHONE_NEEDS_ACTION_ADAPTER : "android_mtp",
+    // V1.31.9: a USB-debugging phone is android_adb in both helper lists, so it is shown once.
+    adapter: os === "ios" ? "ios_lockdown" : needsAction ? PHONE_NEEDS_ACTION_ADAPTER : adb ? "android_adb" : "android_mtp",
     device_id: device.id,
     label: device.name,
-    status: needsAction ? device.state : device.connection || "usb",
+    status: needsAction ? device.state : adb ? "adb" : device.connection || "usb",
     os_family: os,
     connection: device.connection,
     instance_id: device.instance_id,
@@ -495,6 +497,12 @@ export function helperVersionWarning(health: HostDriveHelperHealth | null | unde
 /** How old this computer's phone list may be before the page says it is not updating (helper 5.61 refreshes every 10-15 s). */
 export const DEVICE_LIST_STALE_MS = 120_000;
 
+/** V1.31.9: true when the list says when it was read and that is longer ago than DEVICE_LIST_STALE_MS. */
+export function isDeviceListStale(data: { scanned_utc?: string }, now: number = Date.now()): boolean {
+  const scanned = data.scanned_utc ? Date.parse(data.scanned_utc) : NaN;
+  return Number.isFinite(scanned) && now - scanned > DEVICE_LIST_STALE_MS;
+}
+
 /**
  * V1.31.6: the workstation helper serves its phone list from a cache refreshed in the background.
  * Say so when that list is old (the watcher stopped) or read in a reduced way, instead of showing an
@@ -506,19 +514,24 @@ export function deviceListFreshnessWarnings(
 ): string[] {
   const out: string[] = [];
   const scanned = data.scanned_utc ? Date.parse(data.scanned_utc) : NaN;
-  if (Number.isFinite(scanned) && now - scanned > DEVICE_LIST_STALE_MS) {
+  if (isDeviceListStale(data, now)) {
     const minutes = Math.max(2, Math.round((now - scanned) / 60_000));
     const at = new Date(scanned).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
     out.push(
-      `This computer's phone list was last read at ${at} (${minutes} min ago) and is not updating: a phone plugged in since then is not shown, and an unplugged one may still be listed. ` +
-        "Restart the workstation helper on this computer (scripts\\ensure-host-drive-helper.ps1 -ForceRestart), but not while a collection is running.",
+      `This computer's phone list was last read at ${at} (${minutes} min ago) and is not updating, so its phones are not shown: a phone plugged in since then would be missing, and an unplugged one may still be listed. ` +
+        "Update this computer (the helper there reads the phones live from 5.64), or restart the workstation helper on this computer (scripts\\ensure-host-drive-helper.ps1 -ForceRestart), but not while a collection is running.",
     );
   }
   if (data.note) out.push(data.note);
   return out;
 }
 
-export type LocalHelperState = { version: string; outdated: boolean };
+export type LocalHelperState = {
+  version: string;
+  outdated: boolean;
+  /** V1.31.9: its list is older than DEVICE_LIST_STALE_MS, so its phones are not shown. */
+  stale?: boolean;
+};
 
 async function fromLocalHelperAcquisitionDevices(timeoutMs: number): Promise<{
   ok: boolean;
@@ -545,15 +558,17 @@ async function fromLocalHelperAcquisitionDevices(timeoutMs: number): Promise<{
       note?: string;
     };
     const outdated = isHelperOutdated(health);
+    const stale = !outdated && isDeviceListStale(data);
     return {
       ok: Boolean(res.ok && data.ok !== false),
       // V1.31.8: an outdated helper's list is not shown (it kept showing an unplugged iPhone).
-      devices: outdated ? [] : tagAttachHost(data.devices ?? [], "this_pc"),
+      // V1.31.9: nor a list that stopped updating (it showed "ADB Device" with nothing plugged in).
+      devices: outdated || stale ? [] : tagAttachHost(data.devices ?? [], "this_pc"),
       warnings: outdated
         ? [helperVersionWarning(health) as string]
         : [...(data.warnings ?? []), ...deviceListFreshnessWarnings(data)],
       error: data.error,
-      helper: { version: String(health.helper_version || ""), outdated },
+      helper: { version: String(health.helper_version || ""), outdated, stale },
     };
   } catch (e: unknown) {
     return { ok: false, devices: [], warnings: [], error: e instanceof Error ? e.message : "Host device scan failed" };

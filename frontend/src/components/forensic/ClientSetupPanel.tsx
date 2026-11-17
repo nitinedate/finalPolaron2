@@ -9,7 +9,7 @@ export type ClientSetupState = "outdated" | "missing" | "update_available";
 
 /**
  * V1.31.8: what this computer needs before phones plugged into it can be listed and collected.
- * - outdated: the helper here is too old to trust (its phone list is not shown);
+ * - outdated: the helper here is too old to trust, or its list stopped updating (its phones are not shown);
  * - missing: no helper answers here (not set up, or stopped), and this is not the server itself;
  * - update_available: the helper works, but the server has a newer one.
  */
@@ -20,7 +20,7 @@ export function clientSetupState(opts: {
   officeHost: boolean;
 }): ClientSetupState | null {
   const { localHelper, helperOnline, serverHelperVersion, officeHost } = opts;
-  if (localHelper?.outdated) return "outdated";
+  if (localHelper?.outdated || localHelper?.stale) return "outdated";
   if (helperOnline === false && !officeHost) return "missing";
   if (
     localHelper?.version &&
@@ -78,8 +78,9 @@ export function ClientSetupPanel({
             <p>
               This computer runs Polaron helper {localVersion || "(an old version)"}
               {serverVersion ? `; the server has ${serverVersion}` : ""}. That helper cannot be trusted to say which
-              phone is plugged in (it can keep showing an unplugged iPhone and miss an Android phone), so phones on
-              this computer are not listed until it is updated.
+              phone is plugged in (it can keep showing a phone that was unplugged and miss one plugged in since), so
+              phones on this computer are not listed until it is updated. From 5.64 the helper asks Windows what is
+              plugged in at every scan.
             </p>
           )}
           {state === "missing" && (

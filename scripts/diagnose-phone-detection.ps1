@@ -102,6 +102,15 @@ if ($health.ok) {
     Add-Line ("/acquisition/devices: " + $devs.text)
     $mob = Invoke-Helper "/mobile-devices"
     Add-Line ("/mobile-devices: " + $mob.text)
+    # V1.31.9: helper 5.64 answers the two lists above live from Windows; the background file is kept too.
+    $cached = Invoke-Helper "/acquisition/devices?cached=1"
+    Add-Line ("/acquisition/devices?cached=1 (background file): " + $cached.text)
+    $refreshStatus = Join-Path $tempDir "aetheris_device_refresh_status.json"
+    if (Test-Path -LiteralPath $refreshStatus) {
+        Add-Line ("Background refresh status: " + (Get-Content -LiteralPath $refreshStatus -Raw -ErrorAction SilentlyContinue))
+    } else {
+        Add-Line "Background refresh status: not written (helper older than 5.64, or the refresh never ran)."
+    }
 }
 try {
     $procs = @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue | Where-Object { ([string]$_.CommandLine) -match 'host-drive-helper\.ps1' })

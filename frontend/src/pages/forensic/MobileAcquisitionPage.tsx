@@ -1139,7 +1139,11 @@ export function MobileAcquisitionPage() {
           });
         }
       }
+      // V1.31.9: when this computer's list is outdated or stopped updating, none of its phones are shown
+      // (they may be unplugged long ago); its other list is skipped too.
+      const localUntrusted = Boolean(hostDirect.local_helper?.outdated || hostDirect.local_helper?.stale);
       for (const mobile of wpdDirect?.mobile_devices ?? []) {
+        if (localUntrusted && mobile.attach_host !== "office_server") continue;
         const converted = hostMobileToAcquisitionDevice(mobile);
         const key = `${converted.adapter}:${converted.device_id}`;
         if (!mergedDevices.has(key)) {

@@ -109,14 +109,14 @@ describe("this computer's device scan carries the version warning", () => {
     const r = await getHostAcquisitionDevices(2_000);
     expect(r.warnings.some((w) => w.includes("version 5.60"))).toBe(true);
     expect(r.devices.filter((d) => d.attach_host === "this_pc")).toEqual([]);
-    expect(r.local_helper).toEqual({ version: "5.60", outdated: true });
+    expect(r.local_helper).toEqual({ version: "5.60", outdated: true, stale: false });
   });
 
   it("lists a current helper's phones without the warning", async () => {
     stubHelper("5.62");
     const r = await getHostAcquisitionDevices(2_000);
     expect(r.warnings.filter((w) => w.includes("Polaron helper on this computer"))).toEqual([]);
-    expect(r.local_helper).toEqual({ version: "5.62", outdated: false });
+    expect(r.local_helper).toEqual({ version: "5.62", outdated: false, stale: false });
     const android = r.devices.find((d) => d.os_family === "android");
     expect(android?.guidance).toBe("Choose File transfer, then Rescan.");
     expect(android && deviceNeedsPhoneAction(android)).toBe(true);
