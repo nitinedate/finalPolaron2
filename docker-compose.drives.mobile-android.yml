@@ -23,12 +23,6 @@ services:
         read_only: true
         bind:
           create_host_path: false
-      - type: bind
-        source: 'F:/'
-        target: '/host/f'
-        read_only: true
-        bind:
-          create_host_path: false
   worker-build:
     volumes:
       - type: bind
@@ -49,12 +43,6 @@ services:
         read_only: true
         bind:
           create_host_path: false
-      - type: bind
-        source: 'F:/'
-        target: '/host/f'
-        read_only: true
-        bind:
-          create_host_path: false
   worker-parse:
     volumes:
       - type: bind
@@ -72,12 +60,6 @@ services:
       - type: bind
         source: 'E:/'
         target: '/host/e'
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: 'F:/'
-        target: '/host/f'
         read_only: true
         bind:
           create_host_path: false
