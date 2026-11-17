@@ -53,6 +53,8 @@ import {
   friendlyMobileAcquireError,
   startHostDriveAgentFromBrowser,
   hostMobileToAcquisitionDevice,
+  deviceNeedsPhoneAction,
+  phoneActionLabel,
   listHostMobileDevices,
   mobileAttachHostLabel,
   mobileKindLabel,
@@ -1179,17 +1181,27 @@ export function MobileAcquisitionPage() {
         void loadAdapters();
       }
 
+      const readyNow = devicesNow.filter((d) => !deviceNeedsPhoneAction(d));
+      const waitingNow = devicesNow.filter((d) => deviceNeedsPhoneAction(d));
       const nextKey = devicesNow.map((d) => `${d.adapter}:${d.device_id}`).sort().join("|");
       const otherKey = otherNow.map((d) => `${d.adapter}:${d.device_id}`).sort().join("|");
-      const appeared = devicesNow.length > 0 && nextKey !== lastDeviceKeyRef.current;
+      const appeared = readyNow.length > 0 && nextKey !== lastDeviceKeyRef.current;
+      const waitingAppeared = !readyNow.length && waitingNow.length > 0 && nextKey !== lastDeviceKeyRef.current;
       const otherAppeared = otherNow.length > 0 && otherKey !== lastOtherDeviceKeyRef.current;
       lastDeviceKeyRef.current = nextKey;
       lastOtherDeviceKeyRef.current = otherKey;
       if (appeared) {
-        const kinds = [...new Set(devicesNow.map((d) => mobileKindLabel(d.os_family)))].join(", ");
-        const first = devicesNow[0];
+        const kinds = [...new Set(readyNow.map((d) => mobileKindLabel(d.os_family)))].join(", ");
+        const first = readyNow[0];
         const where = mobileAttachHostLabel(first.attach_host);
-        toast.success(`${kinds} detected on ${where}${devicesNow.length > 1 ? ` (${devicesNow.length} devices)` : ""}.`);
+        toast.success(`${kinds} detected on ${where}${readyNow.length > 1 ? ` (${readyNow.length} devices)` : ""}.`);
+      } else if (waitingAppeared || (!silent && !readyNow.length && waitingNow.length)) {
+        const first = waitingNow[0];
+        toast.error(
+          `${first.label || "Android phone"} is plugged in but cannot be collected yet: ${
+            first.guidance || "unlock it and choose USB: File transfer, then Rescan."
+          }`,
+        );
       } else if ((otherAppeared || !silent) && otherNow.length && !devicesNow.length) {
         const first = otherNow[0];
         const kind = mobileKindLabel(first.os_family);
@@ -1222,6 +1234,10 @@ export function MobileAcquisitionPage() {
 
 
   async function identify(device: DetectedDevice) {
+    if (deviceNeedsPhoneAction(device)) {
+      toast.error(device.guidance || "Unlock the phone and choose USB: File transfer on it, then Rescan.");
+      return;
+    }
     setSelected(device);
     setPreviewing(true);
     setPreview(null);
@@ -2794,6 +2810,29 @@ export function MobileAcquisitionPage() {
               const active = selected?.device_id === d.device_id && selected?.adapter === d.adapter;
               const kind = mobileKindLabel(d.os_family);
               const owner = ownerAgentForFamily(d.os_family);
+              if (deviceNeedsPhoneAction(d)) {
+                // V1.31.7: on the cable, but the phone must be switched to a USB mode Windows can read first.
+                return (
+                  <div
+                    key={`${d.adapter}:${d.device_id}`}
+                    data-testid="phone-needs-action"
+                    className="flex items-start gap-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-left"
+                  >
+                    <Smartphone className="mt-0.5 h-5 w-5 shrink-0 text-amber-700" />
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate font-medium text-ink-800">{d.label || "Android phone"}</p>
+                      <p className="text-xs text-ink-500">
+                        {kind} · {mobileAttachHostLabel(d.attach_host)} · {phoneActionLabel(d)}
+                      </p>
+                      <p className="mt-1 text-xs text-amber-800">
+                        {d.guidance ||
+                          "Unlock the phone, open the USB notification and choose File transfer, then Rescan."}
+                      </p>
+                    </div>
+                    <Badge tone="amber">Action needed</Badge>
+                  </div>
+                );
+              }
               return (
                 <button
                   key={`${d.adapter}:${d.device_id}`}

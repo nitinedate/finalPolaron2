@@ -112,6 +112,8 @@ export type HostMobileDevice = {
   live_acquire?: boolean;
   capability_label?: string;
   guidance?: string;
+  /** Helper 5.62+: "charging_only" or "driver_missing" for a phone that is plugged in but not usable yet. */
+  state?: string;
   ios_backup_roots?: string[];
   attach_host?: MobileAttachHost | string;
 };
@@ -312,22 +314,51 @@ export type HostAcquisitionDevice = {
   connection?: string;
   instance_id?: string;
   attach_host?: MobileAttachHost | string;
+  /** What to do on the phone before it can be collected (helper 5.62+). */
+  guidance?: string;
+  state?: string;
 };
+
+/** Helper 5.62+ lists an Android phone that is plugged in but not usable yet under this adapter. */
+export const PHONE_NEEDS_ACTION_ADAPTER = "android_usb";
+
+const NEEDS_ACTION_STATES = new Set(["charging_only", "driver_missing", "needs_action"]);
+
+/** True for a phone that is on the cable but cannot be collected until something is done on it. */
+export function deviceNeedsPhoneAction(device: {
+  adapter?: string;
+  status?: string;
+  state?: string;
+  connection?: string;
+}): boolean {
+  if (device.adapter === PHONE_NEEDS_ACTION_ADAPTER) return true;
+  if (device.connection === "usb" && NEEDS_ACTION_STATES.has(String(device.state || device.status || ""))) return true;
+  return false;
+}
+
+/** Short status shown on the card of a phone that needs something done on it. */
+export function phoneActionLabel(device: { status?: string; state?: string }): string {
+  const state = String(device.state || device.status || "");
+  if (state === "driver_missing") return "No Windows driver for its USB mode";
+  return "Connected for charging only";
+}
 
 export function hostMobileToAcquisitionDevice(
   device: HostMobileDevice,
   attachHost?: MobileAttachHost | string,
 ): HostAcquisitionDevice {
   const os = device.os_hint === "ios" ? "ios" : device.os_hint === "android" ? "android" : "other";
+  const needsAction = os !== "ios" && device.connection === "usb" && Boolean(device.state);
   return {
-    adapter: os === "ios" ? "ios_lockdown" : "android_mtp",
+    adapter: os === "ios" ? "ios_lockdown" : needsAction ? PHONE_NEEDS_ACTION_ADAPTER : "android_mtp",
     device_id: device.id,
     label: device.name,
-    status: device.connection || "usb",
+    status: needsAction ? device.state : device.connection || "usb",
     os_family: os,
     connection: device.connection,
     instance_id: device.instance_id,
     attach_host: attachHost || device.attach_host,
+    ...(needsAction ? { guidance: device.guidance, state: device.state } : {}),
   };
 }
 
@@ -409,6 +440,37 @@ async function fromOfficeApiAcquisitionDevices(timeoutMs: number): Promise<{
   }
 }
 
+/** Oldest workstation helper that recognises every Android USB mode (File transfer by its interface,
+ * charging only, no driver). An older helper on this computer can miss an Android phone entirely. */
+export const REQUIRED_HELPER_VERSION = "5.62";
+
+/** Compare dotted helper versions ("5.61" < "5.62" < "5.100"). Missing parts count as 0. */
+export function compareHelperVersions(a: string | null | undefined, b: string | null | undefined): number {
+  const pa = String(a || "").split(".").map((x) => Number.parseInt(x, 10) || 0);
+  const pb = String(b || "").split(".").map((x) => Number.parseInt(x, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (d !== 0) return d < 0 ? -1 : 1;
+  }
+  return 0;
+}
+
+/** V1.31.7: say so when the helper on this computer is older than this release (it was not restarted). */
+export function helperVersionWarning(health: HostDriveHelperHealth | null | undefined): string | null {
+  if (!health?.ok) return null;
+  const version = String(health.helper_version || "").trim();
+  if (version && compareHelperVersions(version, REQUIRED_HELPER_VERSION) >= 0) return null;
+  // No version: only a full /health answer (not the short cached "online" marker) means an old helper.
+  if (!version && health.root === undefined && health.port === undefined) return null;
+  return (
+    `The Polaron helper running on this computer is ${version ? `version ${version}` : "an older version"}; ` +
+    `this release needs ${REQUIRED_HELPER_VERSION} or later to see Android phones reliably. ` +
+    "Copy this release's scripts folder to this computer, close any phone collection that is running, then run " +
+    "powershell -ExecutionPolicy Bypass -File scripts\\ensure-host-drive-helper.ps1 -ForceRestart and click Rescan. " +
+    "If the phone is still missing, run scripts\\diagnose-phone-detection.ps1 there and send the report it writes."
+  );
+}
+
 /** How old this computer's phone list may be before the page says it is not updating (helper 5.61 refreshes every 10-15 s). */
 export const DEVICE_LIST_STALE_MS = 120_000;
 
@@ -461,7 +523,11 @@ async function fromLocalHelperAcquisitionDevices(timeoutMs: number): Promise<{
     return {
       ok: Boolean(res.ok && data.ok !== false),
       devices: tagAttachHost(data.devices ?? [], "this_pc"),
-      warnings: [...(data.warnings ?? []), ...deviceListFreshnessWarnings(data)],
+      warnings: [
+        ...(data.warnings ?? []),
+        ...deviceListFreshnessWarnings(data),
+        ...[helperVersionWarning(health)].filter((w): w is string => Boolean(w)),
+      ],
       error: data.error,
     };
   } catch (e: unknown) {

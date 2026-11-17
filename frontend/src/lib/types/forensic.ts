@@ -1373,6 +1373,9 @@ export interface DetectedDevice {
   connection?: string;
   instance_id?: string;
   attach_host?: string;
+  /** Workstation helper 5.62+: what to do on a phone that is plugged in but not usable yet. */
+  guidance?: string;
+  state?: string;
 }
 
 export interface DetectedDeviceList {

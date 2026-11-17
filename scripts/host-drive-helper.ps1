@@ -269,7 +269,7 @@ $script:HelperComputerName = [string]$env:COMPUTERNAME
 # the same case root server-side collections use. HOST_IMPORT_CASE_ROOT overrides it.
 $script:ImportCasesRootOverride = [string]$env:HOST_IMPORT_CASE_ROOT
 $script:ImportCasesRoot = $(if ($script:ImportCasesRootOverride) { $script:ImportCasesRootOverride } else { Join-Path $root "evidence\cases" })
-$script:HelperVersion = "5.61"  # 5.61 phone list follows the cables during a copy (registry read) and ignores leftover copy processes; 5.60 do not kill pnputil or re-enumerate USB during a phone copy; 5.59 C# taskkill fallbacks keep `$_ (stop USB collection works)
+$script:HelperVersion = "5.62"  # 5.62 Android phones found by their File transfer interface; charging-only / no-driver phones listed with what to do; 5.61 phone list follows the cables during a copy (registry read) and ignores leftover copy processes; 5.60 do not kill pnputil or re-enumerate USB during a phone copy; 5.59 C# taskkill fallbacks keep `$_ (stop USB collection works)
 $script:DeviceCacheAt = [datetime]::MinValue
 $script:DeviceCache = @()
 $script:DeviceScanBusy = $false
@@ -1292,6 +1292,11 @@ function Get-RegistryUsbLines {
         if ($desc -match ';(.+)$') { $desc = $Matches[1] }
         $lines.Add("Instance ID:                $id")
         $lines.Add("Device Description:         $desc")
+        if ($props -and $props.PSObject.Properties['Mfg']) {
+            $mfg = [string]$props.Mfg
+            if ($mfg -match ';(.+)$') { $mfg = $Matches[1] }
+            $lines.Add("Manufacturer Name:          $mfg")
+        }
         $lines.Add("Status:                     Started")
         if ($props -and $props.PSObject.Properties['CompatibleIDs']) {
             foreach ($c in @($props.CompatibleIDs)) { if ($c) { $lines.Add("Compatible IDs:             $c") } }
@@ -1378,8 +1383,120 @@ function Get-ConnectedAdbPhones {
     return [object[]]$phones.ToArray()
 }
 
+function Get-AndroidUsbStates {
+    # V1.31.7: what Windows shows of Android phones on USB, from pnputil-style lines (pnputil or registry).
+    #   MtpKeys - VID|PID of phones with a running File transfer (MTP) interface, whatever Windows calls them
+    #             (many phones are listed only by a model code such as SM-A546E or CPH2451).
+    #   Ready   - phones with a running File transfer interface that Windows' portable-device list does not
+    #             show (the collection finds them by their USB vendor and product ID).
+    #   Rows    - phones that are plugged in but not usable yet (charging only, or no Windows driver for their
+    #             interface), with what to do on the phone. Before, such a phone was simply not listed.
+    param([string[]]$Lines)
+    $phoneVendors = @('18D1', '2717', '2A70', '22D9', '2D95', '22B8', '339B', '2A45', '2E04', '29A9', '2B4C')
+    $maybeVendors = @('04E8', '0FCE', '1004', '0B05', '0E8D', '05C6', '12D1', '19D2', '0BB4')
+    $notPhoneWords = '(?i)modem|network|broadband|mobile connect|card reader|keyboard|mouse|headset|webcam|printer|bluetooth|mass storage|ssd|flash drive'
+    $phoneWords = '(?i)android|phone|galaxy|pixel|redmi|xiaomi|poco|oneplus|oppo|vivo|realme|iqoo|moto|nokia|honor|huawei|nothing|infinix|tecno|itel|xperia|mobile'
+    $genericDesc = '(?i)^(USB Composite Device|USB Device|WinUsb Device|ADB Interface|Android ADB Interface|Android Composite ADB Interface|MTP USB Device|USB Input Device|Generic USB Hub|USB Mass Storage Device)$'
+    # Names used only when nothing better is shown: the File transfer interface carries the phone's own name.
+    $fallbackDesc = '(?i)Composite Device$|ADB Interface$|Modem$'
+    $groups = @{}
+    $block = $null
+    $flush = {
+        if ($block -and $block.Id -match '(?i)^USB\\VID_([0-9A-F]{4})&PID_([0-9A-F]{4})(&MI_[0-9A-F]{2})?\\(.+)$') {
+            $vid = $Matches[1].ToUpperInvariant()
+            $prodId = $Matches[2].ToUpperInvariant()
+            $iface = [bool]$Matches[3]
+            $tail = [string]$Matches[4]
+            if ($vid -ne '05AC') {
+                $key = "android|$vid|$prodId"
+                if (-not $groups.ContainsKey($key)) {
+                    $groups[$key] = @{ Vid = $vid; ProdId = $prodId; Serial = ''; Instance = ''; Desc = ''; Phone = $false; AdbOk = $false; AdbBad = $false; MtpOk = $false; MtpBad = $false; MsMtp = $false; MtpDesc = ''; FallbackDesc = '' }
+                }
+                $g = $groups[$key]
+                $ids = [string]$block.Ids
+                $started = ((-not $block.Status) -or $block.Status -eq 'Started')
+                $isAdb = ($ids -match '(?i)SubClass_42&Prot_01|MS_COMP_ADB')
+                $isMtp = (($ids -match '(?i)MS_COMP_MTP') -or ($ids -match '(?i)Class_06&SubClass_01&Prot_01'))
+                if ($isAdb) { if ($started) { $g.AdbOk = $true } else { $g.AdbBad = $true } }
+                if ($isMtp) { if ($started) { $g.MtpOk = $true } else { $g.MtpBad = $true } }
+                if ($ids -match '(?i)MS_COMP_MTP') { $g.MsMtp = $true }
+                if ((-not $iface) -and $tail -notmatch '&') { $g.Serial = $tail; $g.Instance = $block.Id }
+                if (-not $g.Instance) { $g.Instance = $block.Id }
+                $words = ([string]$block.Desc + ' ' + [string]$block.Mfr)
+                if ($isAdb -or ($phoneVendors -contains $vid) -or ((($maybeVendors -contains $vid) -or $isMtp) -and $words -match $phoneWords -and $words -notmatch $notPhoneWords)) { $g.Phone = $true }
+                if ($block.Desc -and $block.Desc -notmatch $genericDesc) {
+                    if ($isMtp -and -not $g.MtpDesc) { $g.MtpDesc = [string]$block.Desc }
+                    if ($block.Desc -match $fallbackDesc) { if (-not $g.FallbackDesc) { $g.FallbackDesc = [string]$block.Desc } }
+                    elseif (-not $g.Desc) { $g.Desc = [string]$block.Desc }
+                }
+            }
+        }
+    }
+    foreach ($line in @($Lines)) {
+        $text = [string]$line
+        if ($text -match '(?i)^\s*Instance ID:\s+(\S+)') {
+            $newId = [string]$Matches[1]   # read before the flush, which runs its own matches
+            . $flush
+            $block = @{ Id = $newId; Desc = ''; Mfr = ''; Status = ''; Ids = '' }
+            continue
+        }
+        if (-not $block) { continue }
+        if ($text -match '(?i)^\s*Device Description:\s+(.+?)\s*$') { $block.Desc = [string]$Matches[1]; continue }
+        if ($text -match '(?i)^\s*Manufacturer Name:\s+(.+?)\s*$') { $block.Mfr = [string]$Matches[1]; continue }
+        if ($text -match '(?i)^\s*Status:\s+(\S+)') { $block.Status = [string]$Matches[1]; continue }
+        $block.Ids = [string]$block.Ids + ' ' + $text.Trim()
+    }
+    . $flush
+    $mtpKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $rows = @()
+    $ready = @()
+    foreach ($key in @($groups.Keys)) {
+        $g = $groups[$key]
+        # A camera uses the same picture-transfer class; Android's File transfer also says MS_COMP_MTP.
+        if ($g.MtpOk -and ($g.Phone -or $g.MsMtp)) {
+            [void]$mtpKeys.Add($g.Vid + '|' + $g.ProdId)
+            $ready += @{
+                id               = $g.Instance
+                name             = $(if ($g.MtpDesc) { $g.MtpDesc } elseif ($g.Desc) { $g.Desc } elseif ($g.FallbackDesc) { $g.FallbackDesc } else { 'Android phone (File transfer)' })
+                device_class     = 'WPD'
+                connection       = 'mtp'
+                os_hint          = 'android'
+                instance_id      = $g.Instance
+                has_drive_letter = $false
+                live_acquire     = $true
+                capability_label = 'SUPPORTED_DIRECT_LOGICAL'
+                guidance         = 'Connected phone detected (File transfer). Use Start extraction.'
+                ios_backup_roots = @()
+            }
+        }
+        if ((-not $g.Phone) -or $g.AdbOk -or $g.MtpOk) { continue }
+        $state = 'charging_only'
+        $guidance = 'Connected for charging only. Unlock the phone, open the USB notification on it and choose File transfer (for a deeper collection also turn on USB debugging and tap Allow), then Rescan.'
+        if ($g.AdbBad -or $g.MtpBad) {
+            $state = 'driver_missing'
+            $guidance = 'Windows has no working driver for this phone''s USB interface (Device Manager shows it with a warning). On the phone choose USB: File transfer, which needs no extra driver, or install the phone maker''s USB driver, then Rescan.'
+        }
+        $rows += @{
+            id               = $(if ($g.Serial) { $g.Serial } else { $g.Instance })
+            name             = $(if ($g.Desc) { $g.Desc } elseif ($g.FallbackDesc) { $g.FallbackDesc } else { 'Android phone' })
+            device_class     = 'USB'
+            connection       = 'usb'
+            os_hint          = 'android'
+            instance_id      = $g.Instance
+            has_drive_letter = $false
+            live_acquire     = $false
+            state            = $state
+            capability_label = 'NEEDS_ACTION'
+            guidance         = $guidance
+            ios_backup_roots = @()
+        }
+    }
+    return @{ MtpKeys = $mtpKeys; Ready = $ready; Rows = $rows }
+}
+
 function Get-PresentWpdPhones {
     $started = Get-StartedUsbInstanceIds
+    $usbStates = Get-AndroidUsbStates -Lines $script:LastConnectedUsbLines
     $list = @()
     $seen = @{}
     foreach ($regRoot in @(
@@ -1394,8 +1511,10 @@ function Get-PresentWpdPhones {
             if (-not $name) { $name = $id }
             if (-not $id) { return }
             if ($name -match '(?i)^(Local Disk|Windows|Network|CD Drive|DVD|Removable Disk|New Volume|CCCOMA_|RUFUS_)') { return }
+            $mtpPhone = $false
+            if ($id -match '(?i)VID_([0-9A-F]{4}).*?PID_([0-9A-F]{4})') { $mtpPhone = $usbStates.MtpKeys.Contains($Matches[1] + '|' + $Matches[2]) }
             $looksPhone = ($name -match '(?i)iPhone|iPad|iPod|Apple|Android|Samsung|Galaxy|Xiaomi|Redmi|Huawei|Honor|OnePlus|Pixel|Oppo|Vivo|Tecno|Infinix|Motorola|Nokia|Realme|Nothing|Phone') -or
-                ($id -match '(?i)VID_(05AC|18D1|04E8|2717|2A45|0E8D|2A70|19D2|22D9|29A9|05C6|12D1|22B8|0BB4|0FCE|1004|0B05|2B4C|2D95)')
+                ($id -match '(?i)VID_(05AC|18D1|04E8|2717|2A45|0E8D|2A70|19D2|22D9|29A9|05C6|12D1|22B8|0BB4|0FCE|1004|0B05|2B4C|2D95|339B|2E04)') -or $mtpPhone
             if (-not $looksPhone) { return }
             if (-not (Test-WpdIdCurrentlyAttached -WpdId $id -StartedIds $started)) { return }
             $os = "android"
@@ -1441,6 +1560,15 @@ function Get-PresentWpdPhones {
         $seen[$key] = $true
         $list += $adbPhone
     }
+    foreach ($row in @(@($usbStates.Ready) + @($usbStates.Rows))) {
+        $rowKey = ""
+        if ([string]$row.instance_id -match 'VID_([0-9A-Fa-f]{4}).*?PID_([0-9A-Fa-f]{4})') {
+            $rowKey = "android|" + $Matches[1].ToUpperInvariant() + "|" + $Matches[2].ToUpperInvariant()
+        }
+        if (-not $rowKey -or $seen.ContainsKey($rowKey)) { continue }
+        $seen[$rowKey] = $true
+        $list += $row
+    }
     return $list
 }
 
@@ -1456,6 +1584,7 @@ function Write-MobileDeviceCaches {
         $status = "wpd"
         if ($os -eq "ios") { $adapter = "ios_lockdown" }
         elseif ($conn -eq "adb") { $adapter = "android_adb"; $status = "adb" }
+        elseif ($conn -eq "usb") { $adapter = "android_usb"; $status = [string]$d.state }
         $acq += @{
             adapter     = $adapter
             device_id   = [string]$d.id
@@ -1464,6 +1593,8 @@ function Write-MobileDeviceCaches {
             os_family   = $(if ($os) { $os } else { "android" })
             instance_id = [string]$d.instance_id
             connection  = $conn
+            guidance    = [string]$d.guidance
+            state       = [string]$d.state
         }
     }
     $acqBody = @{ ok = $true; devices = $acq; warnings = @(); count = $acq.Count; scanned_utc = (Get-Date).ToUniversalTime().ToString("o"); source = "startup" }
@@ -1527,6 +1658,11 @@ function Start-MobileDeviceRefresh {
                 if ($desc -match ';(.+)$') { $desc = $Matches[1] }
                 $lines.Add("Instance ID:                $id")
                 $lines.Add("Device Description:         $desc")
+                if ($props -and $props.PSObject.Properties['Mfg']) {
+                    $mfg = [string]$props.Mfg
+                    if ($mfg -match ';(.+)$') { $mfg = $Matches[1] }
+                    $lines.Add("Manufacturer Name:          $mfg")
+                }
                 $lines.Add("Status:                     Started")
                 if ($props -and $props.PSObject.Properties['CompatibleIDs']) {
                     foreach ($c in @($props.CompatibleIDs)) { if ($c) { $lines.Add("Compatible IDs:             $c") } }
@@ -1668,9 +1804,121 @@ function Start-MobileDeviceRefresh {
             }
             return $false
         }
+        function Get-AndroidUsbStates {
+            # V1.31.7: what Windows shows of Android phones on USB, from pnputil-style lines (pnputil or registry).
+            #   MtpKeys - VID|PID of phones with a running File transfer (MTP) interface, whatever Windows calls them
+            #             (many phones are listed only by a model code such as SM-A546E or CPH2451).
+            #   Ready   - phones with a running File transfer interface that Windows' portable-device list does not
+            #             show (the collection finds them by their USB vendor and product ID).
+            #   Rows    - phones that are plugged in but not usable yet (charging only, or no Windows driver for their
+            #             interface), with what to do on the phone. Before, such a phone was simply not listed.
+            param([string[]]$Lines)
+            $phoneVendors = @('18D1', '2717', '2A70', '22D9', '2D95', '22B8', '339B', '2A45', '2E04', '29A9', '2B4C')
+            $maybeVendors = @('04E8', '0FCE', '1004', '0B05', '0E8D', '05C6', '12D1', '19D2', '0BB4')
+            $notPhoneWords = '(?i)modem|network|broadband|mobile connect|card reader|keyboard|mouse|headset|webcam|printer|bluetooth|mass storage|ssd|flash drive'
+            $phoneWords = '(?i)android|phone|galaxy|pixel|redmi|xiaomi|poco|oneplus|oppo|vivo|realme|iqoo|moto|nokia|honor|huawei|nothing|infinix|tecno|itel|xperia|mobile'
+            $genericDesc = '(?i)^(USB Composite Device|USB Device|WinUsb Device|ADB Interface|Android ADB Interface|Android Composite ADB Interface|MTP USB Device|USB Input Device|Generic USB Hub|USB Mass Storage Device)$'
+            # Names used only when nothing better is shown: the File transfer interface carries the phone's own name.
+            $fallbackDesc = '(?i)Composite Device$|ADB Interface$|Modem$'
+            $groups = @{}
+            $block = $null
+            $flush = {
+                if ($block -and $block.Id -match '(?i)^USB\\VID_([0-9A-F]{4})&PID_([0-9A-F]{4})(&MI_[0-9A-F]{2})?\\(.+)$') {
+                    $vid = $Matches[1].ToUpperInvariant()
+                    $prodId = $Matches[2].ToUpperInvariant()
+                    $iface = [bool]$Matches[3]
+                    $tail = [string]$Matches[4]
+                    if ($vid -ne '05AC') {
+                        $key = "android|$vid|$prodId"
+                        if (-not $groups.ContainsKey($key)) {
+                            $groups[$key] = @{ Vid = $vid; ProdId = $prodId; Serial = ''; Instance = ''; Desc = ''; Phone = $false; AdbOk = $false; AdbBad = $false; MtpOk = $false; MtpBad = $false; MsMtp = $false; MtpDesc = ''; FallbackDesc = '' }
+                        }
+                        $g = $groups[$key]
+                        $ids = [string]$block.Ids
+                        $started = ((-not $block.Status) -or $block.Status -eq 'Started')
+                        $isAdb = ($ids -match '(?i)SubClass_42&Prot_01|MS_COMP_ADB')
+                        $isMtp = (($ids -match '(?i)MS_COMP_MTP') -or ($ids -match '(?i)Class_06&SubClass_01&Prot_01'))
+                        if ($isAdb) { if ($started) { $g.AdbOk = $true } else { $g.AdbBad = $true } }
+                        if ($isMtp) { if ($started) { $g.MtpOk = $true } else { $g.MtpBad = $true } }
+                        if ($ids -match '(?i)MS_COMP_MTP') { $g.MsMtp = $true }
+                        if ((-not $iface) -and $tail -notmatch '&') { $g.Serial = $tail; $g.Instance = $block.Id }
+                        if (-not $g.Instance) { $g.Instance = $block.Id }
+                        $words = ([string]$block.Desc + ' ' + [string]$block.Mfr)
+                        if ($isAdb -or ($phoneVendors -contains $vid) -or ((($maybeVendors -contains $vid) -or $isMtp) -and $words -match $phoneWords -and $words -notmatch $notPhoneWords)) { $g.Phone = $true }
+                        if ($block.Desc -and $block.Desc -notmatch $genericDesc) {
+                            if ($isMtp -and -not $g.MtpDesc) { $g.MtpDesc = [string]$block.Desc }
+                            if ($block.Desc -match $fallbackDesc) { if (-not $g.FallbackDesc) { $g.FallbackDesc = [string]$block.Desc } }
+                            elseif (-not $g.Desc) { $g.Desc = [string]$block.Desc }
+                        }
+                    }
+                }
+            }
+            foreach ($line in @($Lines)) {
+                $text = [string]$line
+                if ($text -match '(?i)^\s*Instance ID:\s+(\S+)') {
+                    $newId = [string]$Matches[1]   # read before the flush, which runs its own matches
+                    . $flush
+                    $block = @{ Id = $newId; Desc = ''; Mfr = ''; Status = ''; Ids = '' }
+                    continue
+                }
+                if (-not $block) { continue }
+                if ($text -match '(?i)^\s*Device Description:\s+(.+?)\s*$') { $block.Desc = [string]$Matches[1]; continue }
+                if ($text -match '(?i)^\s*Manufacturer Name:\s+(.+?)\s*$') { $block.Mfr = [string]$Matches[1]; continue }
+                if ($text -match '(?i)^\s*Status:\s+(\S+)') { $block.Status = [string]$Matches[1]; continue }
+                $block.Ids = [string]$block.Ids + ' ' + $text.Trim()
+            }
+            . $flush
+            $mtpKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            $rows = @()
+            $ready = @()
+            foreach ($key in @($groups.Keys)) {
+                $g = $groups[$key]
+                # A camera uses the same picture-transfer class; Android's File transfer also says MS_COMP_MTP.
+                if ($g.MtpOk -and ($g.Phone -or $g.MsMtp)) {
+                    [void]$mtpKeys.Add($g.Vid + '|' + $g.ProdId)
+                    $ready += @{
+                        id               = $g.Instance
+                        name             = $(if ($g.MtpDesc) { $g.MtpDesc } elseif ($g.Desc) { $g.Desc } elseif ($g.FallbackDesc) { $g.FallbackDesc } else { 'Android phone (File transfer)' })
+                        device_class     = 'WPD'
+                        connection       = 'mtp'
+                        os_hint          = 'android'
+                        instance_id      = $g.Instance
+                        has_drive_letter = $false
+                        live_acquire     = $true
+                        capability_label = 'SUPPORTED_DIRECT_LOGICAL'
+                        guidance         = 'Connected phone detected (File transfer). Use Start extraction.'
+                        ios_backup_roots = @()
+                    }
+                }
+                if ((-not $g.Phone) -or $g.AdbOk -or $g.MtpOk) { continue }
+                $state = 'charging_only'
+                $guidance = 'Connected for charging only. Unlock the phone, open the USB notification on it and choose File transfer (for a deeper collection also turn on USB debugging and tap Allow), then Rescan.'
+                if ($g.AdbBad -or $g.MtpBad) {
+                    $state = 'driver_missing'
+                    $guidance = 'Windows has no working driver for this phone''s USB interface (Device Manager shows it with a warning). On the phone choose USB: File transfer, which needs no extra driver, or install the phone maker''s USB driver, then Rescan.'
+                }
+                $rows += @{
+                    id               = $(if ($g.Serial) { $g.Serial } else { $g.Instance })
+                    name             = $(if ($g.Desc) { $g.Desc } elseif ($g.FallbackDesc) { $g.FallbackDesc } else { 'Android phone' })
+                    device_class     = 'USB'
+                    connection       = 'usb'
+                    os_hint          = 'android'
+                    instance_id      = $g.Instance
+                    has_drive_letter = $false
+                    live_acquire     = $false
+                    state            = $state
+                    capability_label = 'NEEDS_ACTION'
+                    guidance         = $guidance
+                    ios_backup_roots = @()
+                }
+            }
+            return @{ MtpKeys = $mtpKeys; Ready = $ready; Rows = $rows }
+        }
+
         function Read-WpdPhones {
             param([switch]$RegistryOnly)
             $started = Get-StartedUsbInstanceIds -RegistryOnly:$RegistryOnly
+            $usbStates = Get-AndroidUsbStates -Lines $script:LastConnectedUsbLines
             $list = @()
             $seen = @{}
             foreach ($regRoot in @(
@@ -1685,8 +1933,10 @@ function Start-MobileDeviceRefresh {
                     if (-not $name) { $name = $id }
                     if (-not $id) { return }
                     if ($name -match '(?i)^(Local Disk|Windows|Network|CD Drive|DVD|Removable Disk|New Volume|CCCOMA_|RUFUS_)') { return }
+                    $mtpPhone = $false
+                    if ($id -match '(?i)VID_([0-9A-F]{4}).*?PID_([0-9A-F]{4})') { $mtpPhone = $usbStates.MtpKeys.Contains($Matches[1] + '|' + $Matches[2]) }
                     $looksPhone = ($name -match '(?i)iPhone|iPad|iPod|Apple|Android|Samsung|Galaxy|Xiaomi|Redmi|Huawei|Honor|OnePlus|Pixel|Oppo|Vivo|Tecno|Infinix|Motorola|Nokia|Realme|Nothing|Phone') -or
-                        ($id -match '(?i)VID_(05AC|18D1|04E8|2717|2A45|0E8D|2A70|19D2|22D9|29A9|05C6|12D1|22B8|0BB4|0FCE|1004|0B05|2B4C|2D95)')
+                        ($id -match '(?i)VID_(05AC|18D1|04E8|2717|2A45|0E8D|2A70|19D2|22D9|29A9|05C6|12D1|22B8|0BB4|0FCE|1004|0B05|2B4C|2D95|339B|2E04)') -or $mtpPhone
                     if (-not $looksPhone) { return }
                     if (-not (Test-WpdIdCurrentlyAttached -WpdId $id -StartedIds $started)) { return }
                     $os = "android"
@@ -1729,6 +1979,15 @@ function Start-MobileDeviceRefresh {
                 }
                 $seen[$key] = $true
                 $list += $adbPhone
+            }
+            foreach ($row in @(@($usbStates.Ready) + @($usbStates.Rows))) {
+                $rowKey = ""
+                if ([string]$row.instance_id -match 'VID_([0-9A-Fa-f]{4}).*?PID_([0-9A-Fa-f]{4})') {
+                    $rowKey = "android|" + $Matches[1].ToUpperInvariant() + "|" + $Matches[2].ToUpperInvariant()
+                }
+                if (-not $rowKey -or $seen.ContainsKey($rowKey)) { continue }
+                $seen[$rowKey] = $true
+                $list += $row
             }
             return $list
         }
@@ -1781,6 +2040,7 @@ function Start-MobileDeviceRefresh {
                 $status = "wpd"
                 if ($os -eq "ios") { $adapter = "ios_lockdown" }
                 elseif ($conn -eq "adb") { $adapter = "android_adb"; $status = "adb" }
+                elseif ($conn -eq "usb") { $adapter = "android_usb"; $status = [string]$d.state }
                 $acq += @{
                     adapter     = $adapter
                     device_id   = [string]$d.id
@@ -1789,6 +2049,8 @@ function Start-MobileDeviceRefresh {
                     os_family   = $(if ($os) { $os } else { "android" })
                     instance_id = [string]$d.instance_id
                     connection  = $conn
+                    guidance    = [string]$d.guidance
+                    state       = [string]$d.state
                 }
             }
             $acqBody = @{
@@ -2563,6 +2825,7 @@ function Handle-Request {
                 $adapterName = "android_mtp"
                 $statusName = $(if ($conn -eq "mtp") { "mtp" } else { "wpd" })
                 if ($conn -eq "adb") { $adapterName = "android_adb"; $statusName = "adb" }
+                if ($conn -eq "usb") { $adapterName = "android_usb"; $statusName = [string]$wpd.state }
                 $devices += @{
                     adapter     = $adapterName
                     device_id   = $wid
@@ -2571,6 +2834,7 @@ function Handle-Request {
                     os_family   = "android"
                     instance_id = $winst
                     connection  = $conn
+                    guidance    = [string]$wpd.guidance
                 }
             }
             Write-JsonResponse -Response $response -StatusCode 200 -Body @{ ok = $true; devices = @($devices); warnings = @($warnings); count = @($devices).Count }
@@ -2584,6 +2848,7 @@ function Handle-Request {
                     $adapterName = "android_mtp"
                     if ($os -eq "ios") { $adapterName = "ios_lockdown" }
                     elseif ($conn -eq "adb") { $adapterName = "android_adb" }
+                    elseif ($conn -eq "usb") { $adapterName = "android_usb" }
                     $fallback += @{
                         adapter     = $adapterName
                         device_id   = [string]$wpd.id

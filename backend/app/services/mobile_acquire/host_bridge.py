@@ -291,14 +291,18 @@ def fetch_host_devices() -> tuple[list[dict[str, Any]], list[str]]:
         mapped: list[dict[str, Any]] = []
         for item in raw:
             os_hint = str(item.get("os_hint") or "android")
+            # Helper 5.62+: a phone on the cable that is not usable yet (charging only / no driver).
+            needs_action = os_hint != "ios" and item.get("connection") == "usb" and bool(item.get("state"))
             mapped.append({
-                "adapter": "ios_lockdown" if os_hint == "ios" else "android_mtp",
+                "adapter": "ios_lockdown" if os_hint == "ios" else (
+                    "android_usb" if needs_action else "android_mtp"),
                 "device_id": item.get("id") or item.get("instance_id") or "",
                 "label": item.get("name") or "Phone",
-                "status": "wpd",
+                "status": str(item.get("state")) if needs_action else "wpd",
                 "os_family": os_hint,
                 "instance_id": item.get("instance_id") or "",
                 "connection": item.get("connection") or "mtp",
+                **({"state": item.get("state"), "guidance": item.get("guidance") or ""} if needs_action else {}),
             })
         if mapped:
             return mapped, []

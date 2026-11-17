@@ -20,7 +20,7 @@ function Get-HelperScriptVersion {
     return $null
 }
 $agent = Join-Path $root "scripts\hostdrive-agent.ps1"
-$ExpectedHelperVersion = "5.61"
+$ExpectedHelperVersion = "5.62"
 
 # The logon/5-minute watchdog calls this script constantly. When the helper is already
 # the right process, return before the examiner-kit check (that check installs drivers
