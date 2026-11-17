@@ -79,7 +79,7 @@ def test_malware_live_devices_marks_needs_action_phone_not_ready(monkeypatch):
 
 
 def test_helper_recognises_android_by_its_usb_interfaces():
-    assert 'HelperVersion = "5.62"' in HELPER
+    assert 'HelperVersion = "5.63"' in HELPER  # 5.62 Android USB states; 5.63 V1.31.8
     assert HELPER.count("function Get-AndroidUsbStates") == 2  # startup scan and background refresh
     assert HELPER.count("$usbStates = Get-AndroidUsbStates -Lines $script:LastConnectedUsbLines") == 2
     assert HELPER.count("$usbStates.MtpKeys.Contains(") == 2

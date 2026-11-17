@@ -22,6 +22,8 @@ import {
 } from "lucide-react";
 import { Badge, Button, Card, Field, Input, Modal, PageHeader, Select, Spinner } from "../../components/ui";
 import { ClientAgentSetup, ClientEvidenceBrowser, type ClientSelectedFolder } from "../../components/forensic/ClientEvidenceBrowser";
+import { ClientSetupPanel, clientSetupState } from "../../components/forensic/ClientSetupPanel";
+import { getClientKitInfo } from "../../lib/clientKit";
 import { clientAgentStatus, type ClientAgentStatus } from "../../lib/clientEvidenceAgent";
 import {
   ClientAgentRequiredError,
@@ -59,6 +61,8 @@ import {
   mobileAttachHostLabel,
   mobileKindLabel,
   isUsbCollectionBusyError,
+  isBrowserOnOfficeHost,
+  type LocalHelperState,
 } from "../../lib/hostDriveHelper";
 import { UsbCollectionBusyBanner } from "../../components/forensic/StopUsbCollectionButton";
 import { useToast } from "../../lib/toast";
@@ -535,6 +539,10 @@ export function MobileAcquisitionPage() {
   const [otherDevices, setOtherDevices] = useState<DetectedDevice[]>([]);
   const [detectWarnings, setDetectWarnings] = useState<string[]>([]);
   const [scanning, setScanning] = useState(false);
+  // V1.31.8: the Polaron helper on this computer (null = not running) and the version the server has.
+  const [localHelper, setLocalHelper] = useState<LocalHelperState | null>(null);
+  const [helperOnline, setHelperOnline] = useState<boolean | null>(null);
+  const [serverHelperVersion, setServerHelperVersion] = useState("");
 
   const [selected, setSelected] = useState<DetectedDevice | null>(null);
   const [preview, setPreview] = useState<AcquisitionPreview | null>(null);
@@ -1108,12 +1116,16 @@ export function MobileAcquisitionPage() {
       const hostAdaptersPromise = health?.ok
         ? getHostAcquisitionAdapters()
         : Promise.resolve({ ok: false, adapters: [] as AcquisitionAdapter[] });
-      const [data, hostDirect, hostAdaptersDirect, wpdDirect] = await Promise.all([
+      const [data, hostDirect, hostAdaptersDirect, wpdDirect, kitInfo] = await Promise.all([
         acquisitionApi.detectDevices().catch(() => ({ devices: [], warnings: [] as string[], adapters: [] })),
         hostPromise,
         hostAdaptersPromise,
         listHostMobileDevices(silent ? 4_000 : 8_000),
+        getClientKitInfo(),
       ]);
+      setHelperOnline(Boolean(health?.ok));
+      setLocalHelper(hostDirect.local_helper);
+      setServerHelperVersion(kitInfo?.helper_version || "");
 
       const mergedDevices = new Map<string, DetectedDevice>();
       for (const device of data.devices ?? []) {
@@ -1147,6 +1159,10 @@ export function MobileAcquisitionPage() {
       });
 
       let warnings = [...(data.warnings ?? []), ...(hostDirect.warnings ?? [])];
+      // The update panel explains an outdated helper; do not repeat it under Detection limitations.
+      if (hostDirect.local_helper?.outdated) {
+        warnings = warnings.filter((w) => !/^The Polaron helper on this computer is /.test(w));
+      }
       if (hostDirect.ok || (wpdDirect?.mobile_devices?.length ?? 0) > 0 || devicesNow.length) {
         warnings = warnings.filter(
           (w) =>
@@ -2740,6 +2756,24 @@ export function MobileAcquisitionPage() {
             </span>
           ))}
         </div>
+
+        {(() => {
+          const setupState = clientSetupState({
+            localHelper,
+            helperOnline,
+            serverHelperVersion,
+            officeHost: isBrowserOnOfficeHost(),
+          });
+          return setupState ? (
+            <div className="mb-3">
+              <ClientSetupPanel
+                state={setupState}
+                localVersion={localHelper?.version}
+                serverVersion={serverHelperVersion}
+              />
+            </div>
+          ) : null;
+        })()}
 
         {detectWarnings.length > 0 && (
           <div className="mb-3">

@@ -57,12 +57,11 @@ describe("helper version on this computer (V1.31.7)", () => {
     expect(REQUIRED_HELPER_VERSION).toBe("5.62");
   });
 
-  it("warns about an older helper and says how to restart it", () => {
+  it("says an older helper's list is not shown and how to update this computer", () => {
     const w = helperVersionWarning({ ok: true, helper_version: "5.61", port: 9876 });
     expect(w).toContain("version 5.61");
-    expect(w).toContain("5.62 or later");
-    expect(w).toContain("scripts\\ensure-host-drive-helper.ps1 -ForceRestart");
-    expect(w).toContain("scripts\\diagnose-phone-detection.ps1");
+    expect(w).toContain("its phone list is not shown");
+    expect(w).toContain("Update this computer");
   });
 
   it("is quiet for a current helper, an offline one, or the short cached online marker", () => {
@@ -105,18 +104,21 @@ describe("this computer's device scan carries the version warning", () => {
     );
   }
 
-  it("adds the warning when the helper here is older", async () => {
-    stubHelper("5.61");
+  it("hides an older helper's phones (V1.31.8) and says why", async () => {
+    stubHelper("5.60");
     const r = await getHostAcquisitionDevices(2_000);
-    expect(r.warnings.some((w) => w.includes("version 5.61"))).toBe(true);
+    expect(r.warnings.some((w) => w.includes("version 5.60"))).toBe(true);
+    expect(r.devices.filter((d) => d.attach_host === "this_pc")).toEqual([]);
+    expect(r.local_helper).toEqual({ version: "5.60", outdated: true });
+  });
+
+  it("lists a current helper's phones without the warning", async () => {
+    stubHelper("5.62");
+    const r = await getHostAcquisitionDevices(2_000);
+    expect(r.warnings.filter((w) => w.includes("Polaron helper on this computer"))).toEqual([]);
+    expect(r.local_helper).toEqual({ version: "5.62", outdated: false });
     const android = r.devices.find((d) => d.os_family === "android");
     expect(android?.guidance).toBe("Choose File transfer, then Rescan.");
     expect(android && deviceNeedsPhoneAction(android)).toBe(true);
-  });
-
-  it("does not warn for the current helper", async () => {
-    stubHelper("5.62");
-    const r = await getHostAcquisitionDevices(2_000);
-    expect(r.warnings.filter((w) => w.includes("Polaron helper running on this computer"))).toEqual([]);
   });
 });

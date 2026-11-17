@@ -35,6 +35,8 @@ export type HostDriveHelperHealth = {
   /** Helper 5.58+: can store an image copied from a client PC. */
   client_import?: boolean;
   root?: string;
+  /** Helper 5.63+: whether the Client Evidence Agent answers on this computer (port 9877). */
+  client_agent_running?: boolean;
 };
 
 export type RefreshDriveMountsResult = {
@@ -176,7 +178,19 @@ export function invalidateHelperHealthCache(): void {
   probeInFlight = null;
 }
 
+/** The last full /health answer (not the short cached "online" marker), with when it was read. */
+let lastFullHealth: { health: HostDriveHelperHealth; at: number } | null = null;
+
+/** V1.31.8: the helper's own /health, if one was read within maxAgeMs. */
+export function lastFullHelperHealth(maxAgeMs = 15_000): HostDriveHelperHealth | null {
+  if (!lastFullHealth || Date.now() - lastFullHealth.at > maxAgeMs) return null;
+  return lastFullHealth.health;
+}
+
 function markOnline(health: HostDriveHelperHealth): HostDriveHelperHealth {
+  if (health.helper_version !== undefined || health.port !== undefined || health.root !== undefined) {
+    lastFullHealth = { health, at: Date.now() };
+  }
   reachability = "online";
   offlineStreak = 0;
   offlineUntilMs = 0;
@@ -185,6 +199,7 @@ function markOnline(health: HostDriveHelperHealth): HostDriveHelperHealth {
 }
 
 function markOffline(): null {
+  lastFullHealth = null;
   reachability = "offline";
   onlineUntilMs = 0;
   offlineStreak += 1;
@@ -440,8 +455,9 @@ async function fromOfficeApiAcquisitionDevices(timeoutMs: number): Promise<{
   }
 }
 
-/** Oldest workstation helper that recognises every Android USB mode (File transfer by its interface,
- * charging only, no driver). An older helper on this computer can miss an Android phone entirely. */
+/** Oldest workstation helper whose phone list is trusted: it follows the cables (5.61) and recognises every
+ * Android USB mode (5.62). An older helper can keep showing an unplugged phone and miss an Android phone,
+ * so the page does not show its list (V1.31.8). */
 export const REQUIRED_HELPER_VERSION = "5.62";
 
 /** Compare dotted helper versions ("5.61" < "5.62" < "5.100"). Missing parts count as 0. */
@@ -455,19 +471,24 @@ export function compareHelperVersions(a: string | null | undefined, b: string | 
   return 0;
 }
 
-/** V1.31.7: say so when the helper on this computer is older than this release (it was not restarted). */
-export function helperVersionWarning(health: HostDriveHelperHealth | null | undefined): string | null {
-  if (!health?.ok) return null;
+/** True when this computer's helper is too old for its phone list to be trusted (full /health answers only). */
+export function isHelperOutdated(health: HostDriveHelperHealth | null | undefined): boolean {
+  if (!health?.ok) return false;
   const version = String(health.helper_version || "").trim();
-  if (version && compareHelperVersions(version, REQUIRED_HELPER_VERSION) >= 0) return null;
+  if (version) return compareHelperVersions(version, REQUIRED_HELPER_VERSION) < 0;
   // No version: only a full /health answer (not the short cached "online" marker) means an old helper.
-  if (!version && health.root === undefined && health.port === undefined) return null;
+  return health.root !== undefined || health.port !== undefined;
+}
+
+/** V1.31.7/V1.31.8: why this computer's phones are not listed while its helper is outdated, and the fix. */
+export function helperVersionWarning(health: HostDriveHelperHealth | null | undefined): string | null {
+  if (!isHelperOutdated(health)) return null;
+  const version = String(health?.helper_version || "").trim();
   return (
-    `The Polaron helper running on this computer is ${version ? `version ${version}` : "an older version"}; ` +
-    `this release needs ${REQUIRED_HELPER_VERSION} or later to see Android phones reliably. ` +
-    "Copy this release's scripts folder to this computer, close any phone collection that is running, then run " +
-    "powershell -ExecutionPolicy Bypass -File scripts\\ensure-host-drive-helper.ps1 -ForceRestart and click Rescan. " +
-    "If the phone is still missing, run scripts\\diagnose-phone-detection.ps1 there and send the report it writes."
+    `The Polaron helper on this computer is ${version ? `version ${version}` : "an older version"}, too old to ` +
+    "report which phones are plugged in here (it can keep showing a phone that was unplugged and miss an Android " +
+    "phone), so its phone list is not shown. Click Update this computer, open the downloaded file, then Rescan. " +
+    "From then on this computer updates itself from the server."
   );
 }
 
@@ -497,11 +518,14 @@ export function deviceListFreshnessWarnings(
   return out;
 }
 
+export type LocalHelperState = { version: string; outdated: boolean };
+
 async function fromLocalHelperAcquisitionDevices(timeoutMs: number): Promise<{
   ok: boolean;
   devices: HostAcquisitionDevice[];
   warnings: string[];
   error?: string;
+  helper?: LocalHelperState;
 }> {
   const health = await hostDriveHelperHealth(2_000, { force: true });
   if (!health?.ok) return { ok: false, devices: [], warnings: [], error: "Host drive helper is offline" };
@@ -520,15 +544,16 @@ async function fromLocalHelperAcquisitionDevices(timeoutMs: number): Promise<{
       source?: string;
       note?: string;
     };
+    const outdated = isHelperOutdated(health);
     return {
       ok: Boolean(res.ok && data.ok !== false),
-      devices: tagAttachHost(data.devices ?? [], "this_pc"),
-      warnings: [
-        ...(data.warnings ?? []),
-        ...deviceListFreshnessWarnings(data),
-        ...[helperVersionWarning(health)].filter((w): w is string => Boolean(w)),
-      ],
+      // V1.31.8: an outdated helper's list is not shown (it kept showing an unplugged iPhone).
+      devices: outdated ? [] : tagAttachHost(data.devices ?? [], "this_pc"),
+      warnings: outdated
+        ? [helperVersionWarning(health) as string]
+        : [...(data.warnings ?? []), ...deviceListFreshnessWarnings(data)],
       error: data.error,
+      helper: { version: String(health.helper_version || ""), outdated },
     };
   } catch (e: unknown) {
     return { ok: false, devices: [], warnings: [], error: e instanceof Error ? e.message : "Host device scan failed" };
@@ -541,6 +566,8 @@ export async function getHostAcquisitionDevices(timeoutMs = 20_000): Promise<{
   devices: HostAcquisitionDevice[];
   warnings: string[];
   error?: string;
+  /** This computer's helper: its version, and whether it is too old to list phones (null = not running). */
+  local_helper: LocalHelperState | null;
 }> {
   const [office, local] = await Promise.all([
     fromOfficeApiAcquisitionDevices(timeoutMs),
@@ -554,6 +581,7 @@ export async function getHostAcquisitionDevices(timeoutMs = 20_000): Promise<{
     devices,
     warnings,
     error: ok ? undefined : local.error || office?.error,
+    local_helper: local.helper ?? null,
   };
 }
 
@@ -914,7 +942,9 @@ export async function listHostMobileDevices(timeoutMs = 4000): Promise<HostMobil
   const office = await fromOfficeApiMobileDevices(timeoutMs);
   const online = await hostDriveHelperHealth(1500);
   let local: HostMobileDevicesResult | null = null;
-  if (online?.ok) {
+  // V1.31.8: an outdated helper's phone list is not shown (see helperVersionWarning).
+  const full = online?.ok ? lastFullHelperHealth(60_000) ?? (await getLocalHelperIdentity(2_000)) : null;
+  if (online?.ok && !isHelperOutdated(full)) {
     try {
       const res = await fetch(`${HELPER_BASE}/mobile-devices`, {
         method: "GET",

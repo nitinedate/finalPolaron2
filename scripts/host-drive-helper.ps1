@@ -269,7 +269,7 @@ $script:HelperComputerName = [string]$env:COMPUTERNAME
 # the same case root server-side collections use. HOST_IMPORT_CASE_ROOT overrides it.
 $script:ImportCasesRootOverride = [string]$env:HOST_IMPORT_CASE_ROOT
 $script:ImportCasesRoot = $(if ($script:ImportCasesRootOverride) { $script:ImportCasesRootOverride } else { Join-Path $root "evidence\cases" })
-$script:HelperVersion = "5.62"  # 5.62 Android phones found by their File transfer interface; charging-only / no-driver phones listed with what to do; 5.61 phone list follows the cables during a copy (registry read) and ignores leftover copy processes; 5.60 do not kill pnputil or re-enumerate USB during a phone copy; 5.59 C# taskkill fallbacks keep `$_ (stop USB collection works)
+$script:HelperVersion = "5.63"  # 5.63 /health says whether the Client Evidence Agent runs; kept up to date from the server (polaron-client-update.ps1); 5.62 Android phones found by their File transfer interface; charging-only / no-driver phones listed with what to do; 5.61 phone list follows the cables during a copy (registry read) and ignores leftover copy processes; 5.60 do not kill pnputil or re-enumerate USB during a phone copy; 5.59 C# taskkill fallbacks keep `$_ (stop USB collection works)
 $script:DeviceCacheAt = [datetime]::MinValue
 $script:DeviceCache = @()
 $script:DeviceScanBusy = $false
@@ -3538,8 +3538,33 @@ public class AetherisHelperDispatcher {
   void WriteBytes(HttpListenerContext ctx, string json) {
     WriteJson(ctx, 200, json);
   }
+  // V1.31.8: the page asks here whether the Client Evidence Agent (port 9877) is running, instead of
+  // calling 127.0.0.1:9877 itself: each refused browser call shows up as a red console error.
+  public int ClientAgentPort = 9877;
+  readonly object _agentLock = new object();
+  DateTime _agentCheckedUtc = DateTime.MinValue;
+  bool _agentUp;
+  bool ClientAgentListening() {
+    lock (_agentLock) {
+      if ((DateTime.UtcNow - _agentCheckedUtc).TotalSeconds < 3) return _agentUp;
+    }
+    bool up = false;
+    try {
+      using (System.Net.Sockets.TcpClient c = new System.Net.Sockets.TcpClient()) {
+        IAsyncResult ar = c.BeginConnect("127.0.0.1", ClientAgentPort, null, null);
+        if (ar.AsyncWaitHandle.WaitOne(250) && c.Connected) { c.EndConnect(ar); up = true; }
+      }
+    } catch { up = false; }
+    lock (_agentLock) { _agentUp = up; _agentCheckedUtc = DateTime.UtcNow; }
+    return up;
+  }
   void WriteHealth(HttpListenerContext ctx) {
-    WriteBytes(ctx, HealthJson ?? "{\"ok\":true}");
+    string json = HealthJson ?? "{\"ok\":true}";
+    try {
+      int end = json.LastIndexOf('}');
+      if (end > 0) json = json.Substring(0, end) + ",\"client_agent_running\":" + (ClientAgentListening() ? "true" : "false") + "}";
+    } catch {}
+    WriteBytes(ctx, json);
   }
   void WriteCached(HttpListenerContext ctx, string path, string fallback) {
     string json = fallback;

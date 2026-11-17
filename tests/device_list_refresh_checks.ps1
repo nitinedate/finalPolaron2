@@ -210,7 +210,7 @@ try {
     }
 
     $text = [IO.File]::ReadAllText($helper)
-    Assert-True ($text -match '\$script:HelperVersion = "5\.62"') 'Helper version 5.62'
+    Assert-True ($text -match '\$script:HelperVersion = "5\.63"') 'Helper version 5.63'
     Write-Output "PASS: $script:checks device list refresh checks"
 } finally {
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue

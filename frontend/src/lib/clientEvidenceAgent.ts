@@ -11,6 +11,7 @@
 
 import { resolveApiUrl } from "./api";
 import { inferApiService } from "./apiRouting";
+import { getCachedHelperOnline, getLocalHelperIdentity, lastFullHelperHealth } from "./hostDriveHelper";
 
 export const CLIENT_AGENT_PORT = 9877;
 
@@ -207,7 +208,26 @@ export async function loopbackPermissionState(): Promise<PermissionState | null>
   return null;
 }
 
+/**
+ * V1.31.8: helper 5.63+ reports whether the agent answers on this computer. When it says no, the page does
+ * not call 127.0.0.1:9877 itself: every refused call shows as a red ERR_CONNECTION_REFUSED console error.
+ */
+async function helperSaysAgentIsDown(): Promise<boolean> {
+  try {
+    let health = lastFullHelperHealth(15_000);
+    if (!health && getCachedHelperOnline() === true) health = await getLocalHelperIdentity(1_500);
+    return health?.client_agent_running === false;
+  } catch {
+    return false; // best effort: without an answer, ask the agent as before
+  }
+}
+
 async function probeClientAgent(timeoutMs: number): Promise<ClientAgentStatus> {
+  if (await helperSaysAgentIsDown()) {
+    offlineStreak += 1;
+    if (HEALTH_BACKOFF) offlineUntilMs = Date.now() + Math.min(8_000 * 1.5 ** Math.max(offlineStreak - 1, 0), 30_000);
+    return { state: "offline", health: null };
+  }
   try {
     const health = await agentJson<ClientAgentHealth>("/health", {}, timeoutMs);
     offlineStreak = 0;

@@ -82,7 +82,7 @@ if ($health.ok) {
         $helperRoot = [string]$h.root
     } catch {}
     if (-not $runningVersion -or (Compare-Version $runningVersion $RequiredHelperVersion) -lt 0) {
-        Add-Finding ("The helper running on this computer is " + $(if ($runningVersion) { "version " + $runningVersion } else { "an old version" }) + ". This release needs " + $RequiredHelperVersion + " or later to see Android phones reliably. Close any phone collection, then run: powershell -ExecutionPolicy Bypass -File scripts\ensure-host-drive-helper.ps1 -ForceRestart")
+        Add-Finding ("The helper running on this computer is " + $(if ($runningVersion) { "version " + $runningVersion } else { "an old version" }) + ". This release needs " + $RequiredHelperVersion + " or later to see Android phones reliably. On the Mobile acquisition page click Update this computer and open the downloaded file, or close any phone collection and run: powershell -ExecutionPolicy Bypass -File scripts\ensure-host-drive-helper.ps1 -ForceRestart")
     }
     if ($helperRoot) {
         $a = ""; $b = ""
