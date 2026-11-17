@@ -489,32 +489,6 @@ def _seed_work(db, stage_run_id, bundles):
         "UPDATE pipeline_work_items SET status='pending' WHERE stage_run_id=:sid AND status='running'",
         {"sid": stage_run_id},
     )
-    # A binary file named like text used to fail the bundle. Retry that class
-    # once the parser no longer treats a decode error as a lost work unit.
-    execute(
-        db,
-        """UPDATE pipeline_work_items SET status='pending', error=NULL
-           WHERE stage_run_id=:sid AND status='failed'
-             AND error ILIKE '%codec can''t decode%'""",
-        {"sid": stage_run_id},
-    )
-    # A plaintext msgstore that was closed before any parser ran must be read.
-    # Encrypted crypt backups stay as they are.
-    execute(
-        db,
-        """UPDATE pipeline_work_items AS w
-           SET status='pending', error=NULL, completed_at=NULL, started_at=NULL, worker_id=NULL
-           FROM pipeline_stage_runs AS s
-           WHERE w.stage_run_id=:sid AND s.id=w.stage_run_id AND w.status='done'
-             AND lower(w.payload->0->>'path') LIKE '%/msgstore.db'
-             AND lower(w.payload->0->>'path') NOT LIKE '%.crypt%'
-             AND EXISTS (
-               SELECT 1 FROM mobile_inventory_items AS i
-               WHERE i.job_id=s.job_id AND i.path=w.payload->0->>'path'
-                 AND i.status='unsupported' AND coalesce(i.parser, '')=''
-             )""",
-        {"sid": stage_run_id},
-    )
     # Rows seeded before priority existed stay at the default. One pass fixes them.
     # Claims then read the integer column and the pending index.
     execute(

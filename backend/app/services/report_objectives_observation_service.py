@@ -36,9 +36,8 @@ from app.services.structured_observation_service import (
 
 
 def printed_procedure(title: str, objective: dict[str, Any]) -> str:
-    """Use the procedure learned by ReportTrain when the sample reports match."""
+    """Use the procedure learned from the trained report model when one matches."""
     from app.services.document_report_model import trained_procedure_text
-    from app.services.report_train_agent import trained_procedure
 
     statement = str(
         objective.get("statement")
@@ -46,7 +45,7 @@ def printed_procedure(title: str, objective: dict[str, Any]) -> str:
         or objective.get("objective_text")
         or ""
     )
-    trained = trained_procedure(title, statement) or trained_procedure_text(title, statement)
+    trained = trained_procedure_text(title, statement)
     if trained:
         return trained
     return format_procedure_for_report(
@@ -110,7 +109,6 @@ def _agent_safe_brief(brief: dict[str, Any]) -> dict[str, Any]:
             "knowledge_base_version": plan.get("knowledge_base_version"),
             "reference_exemplar_guidance": plan.get("reference_exemplar_guidance") or {},
             "document_report_model": plan.get("document_report_model") or {},
-            "report_train": plan.get("report_train") or {},
         },
         # When an objective-specific live detector exists, its record-level finding is
         # authoritative. Hiding generic KB report results prevents the writer from
@@ -189,7 +187,6 @@ WRITING REQUIREMENTS:
 - Use the supplied knowledge-base result and only the facts shown above.
 - The reference_exemplar_guidance was learned from the supplied examiner reports. Use it only for evidence questions, decision boundaries and writing structure; never copy an example case value or conclusion.
 - document_report_model was trained from the physical reports in document_report_model. Run its extraction_queries against the current case's extracted content, then write the observation with its writing_moves. Never copy a fact from those physical reports.
-- report_train.prompt lists the questions to answer. Answer them in short everyday words. Use only the saved records and what the user wrote in the case form. Do not name the phone or the computer. Say what was found, then say what that does not prove.
 - Follow the evidence progression: candidate records -> classify/exclude noise -> deduplicate/correlate -> objective-specific finding -> limitation -> simple meaning.
 - Keep access/presence/connection separate from transfer/use/execution/unauthorized intent unless direct evidence supports the stronger claim.
 - When case_fact is present it is the objective-specific result from the full current-case records used by Sections A/B/D. Treat it as authoritative over generic catalog totals or RAG prose.
@@ -355,20 +352,13 @@ def fill_objective_observations(
         )
         brief = ((built.get("structured_json") or {}).get("evidence_brief") or {})
         deterministic = str(built.get("observation_md") or "").strip()
-        from app.services.report_train_agent import plain_observation
-
-        plain = plain_observation(title, brief, intake)
         observation = _finalize_observation(
-            plain or deterministic,
+            deterministic,
             title=title,
-            device_label="",
+            device_label=device_label,
             fallback=deterministic,
             brief=brief,
         )
-        structured_preview = built.get("structured_json") or {}
-        train_plan = (brief.get("knowledge_plan") or {}).get("report_train") or {}
-        if train_plan.get("prompt"):
-            structured_preview["report_train_prompt"] = train_plan.get("prompt")
 
         built["observation_md"] = observation
         structured_json = built.get("structured_json") or {}

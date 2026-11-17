@@ -105,28 +105,32 @@ def get_lockdown(serial: str):
 
 
 async def _list_async() -> list[dict[str, Any]]:
+    from pymobiledevice3.lockdown import create_using_usbmux
     from pymobiledevice3.usbmux import list_devices
 
-    # Presence only. Opening lockdown here used to run on every device scan and
-    # on every UDID resolve. A second lockdown session while MobileBackup2 or AFC
-    # is running is what drops the iPhone ("connection terminated" / USB session
-    # dropped before Manifest.db). Name and iOS version come from the backup's
-    # own lockdown, not from this list.
     devices = await _maybe_await(list_devices())
     out: list[dict[str, Any]] = []
     for dev in devices:
         serial = normalize_ios_udid(str(getattr(dev, "serial", "") or "").strip()) or str(
             getattr(dev, "serial", "") or ""
         ).strip()
-        if not serial:
-            continue
-        out.append({
+        item: dict[str, Any] = {
             "udid": serial,
             "connection": str(getattr(dev, "connection_type", "") or "USB"),
             "name": "",
             "product": "",
             "version": "",
-        })
+        }
+        if not serial:
+            continue
+        try:
+            lockdown = await _maybe_await(create_using_usbmux(serial=serial))
+            item["name"] = str(getattr(lockdown, "display_name", "") or "")
+            item["product"] = str(getattr(lockdown, "product_type", "") or "")
+            item["version"] = str(getattr(lockdown, "product_version", "") or "")
+        except Exception as exc:
+            item["error"] = str(exc)
+        out.append(item)
     return out
 
 

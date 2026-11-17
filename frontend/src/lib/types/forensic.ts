@@ -1373,9 +1373,6 @@ export interface DetectedDevice {
   connection?: string;
   instance_id?: string;
   attach_host?: string;
-  /** Workstation helper 5.62+: what to do on a phone that is plugged in but not usable yet. */
-  guidance?: string;
-  state?: string;
 }
 
 export interface DetectedDeviceList {
@@ -1481,6 +1478,16 @@ export interface AcquisitionResult {
   };
   acquisition_record?: AcquisitionRecordFields & { output_size?: number; missing_fields?: string[] };
   verification?: AcquisitionVerification;
+  /** Private server receipt: never a local image path or downloadable URL. */
+  server_transfer?: {
+    server_stored: boolean;
+    verified: boolean;
+    evidence_ref: string;
+    sha256: string;
+    size_bytes: number;
+    transfer_id?: string;
+    client_package_removed?: boolean;
+  };
   coverage_statement?: MethodCoverage;
   limitations?: string[];
   warnings?: string[];
@@ -1488,87 +1495,6 @@ export interface AcquisitionResult {
   error?: string;
   audit?: { path: string; event_count: number; by_severity: Record<string, number> };
   chain_of_custody?: CustodyLink[];
-  /** V1.27.0: collected on a client PC and copied to the forensic server. */
-  client_import?: ClientImportSummary;
-}
-
-export interface ClientImportSummary {
-  import_id?: string;
-  client_host?: string;
-  client_case_dir?: string;
-  server_case_dir?: string;
-  files?: number;
-  bytes?: number;
-  already_on_server?: number;
-  scope?: "full" | "packages" | string;
-  transport?: "direct" | "relay" | string;
-  provenance?: string;
-}
-
-/** Copy of a client-created mobile image to the forensic server (V1.27.0). */
-export type ClientImportStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
-
-export interface ClientImportState {
-  import_id: string;
-  status: ClientImportStatus;
-  stage: string;
-  detail: string;
-  scope: "full" | "packages" | string;
-  case_id: string;
-  case_folder: string;
-  server_case_folder: string;
-  run_name: string;
-  client_host: string;
-  client_case_dir: string;
-  transport: "direct" | "relay" | string;
-  total_files: number;
-  total_bytes: number;
-  files_done: number;
-  bytes_done: number;
-  files_present: number;
-  progress_pct: number;
-  server_case_dir: string;
-  started_utc: string;
-  ended_utc: string | null;
-  warnings: string[];
-  error: string | null;
-  result: AcquisitionResult | null;
-  run?: AcquisitionRunDetail | null;
-}
-
-export interface ClientImportCapabilities {
-  enabled: boolean;
-  office_helper: {
-    reachable: boolean;
-    client_import: boolean;
-    computer_name: string;
-    helper_version: string;
-    import_case_root?: string;
-    root?: string;
-  };
-  default_client_case_root: string;
-  server_case_root: string;
-  scopes: string[];
-}
-
-export interface ClientImportStartPayload {
-  share_id: string;
-  token: string;
-  port: number;
-  addresses: string[];
-  hostname: string;
-  client_root: string;
-  file_count: number;
-  total_bytes: number;
-  manifest_sha256: string;
-  relay: boolean;
-  /** V1.31.2: the folder was chosen in the browser and this tab serves it. */
-  browser?: boolean;
-  skipped?: number;
-  agent_version?: string;
-  case_id?: string;
-  run_name?: string;
-  scope?: "full" | "packages";
 }
 
 export interface AcquisitionRecordFields {
@@ -1620,6 +1546,7 @@ export interface AcquisitionStartPayload {
   /** 64-digit WhatsApp end-to-end backup key (Android), when known or just created on-device. */
   whatsapp_64_digit_key?: string;
   /** Optional IMAP cloud mailboxes (Gmail/Outlook app passwords). */
+  server_transfer?: { token: string; transfer_id: string; platform: string; tenant: string; base_url: string };
   cloud_mailboxes?: Array<{
     provider: string;
     address: string;

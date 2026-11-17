@@ -138,11 +138,7 @@ def _load_jids(conn: sqlite3.Connection) -> dict[int, dict[str, Any]]:
     return out
 
 
-def _load_chats(
-    conn: sqlite3.Connection,
-    jids: dict[int, dict[str, Any]],
-    names: dict[str, str] | None = None,
-) -> dict[int, dict[str, Any]]:
+def _load_chats(conn: sqlite3.Connection, jids: dict[int, dict[str, Any]]) -> dict[int, dict[str, Any]]:
     out: dict[int, dict[str, Any]] = {}
     if "chat" not in {n.lower() for n in table_names(conn)}:
         return out
@@ -157,9 +153,6 @@ def _load_chats(
             continue
         jid = jids.get(int(r.get("jid_row_id") or -1))
         info = _jid_display(jid)
-        raw_jid = str(info.get("jid") or "")
-        saved = (names or {}).get(raw_jid) or (names or {}).get(raw_jid.lower())
-        subject = str(r.get("subject") or "").strip()
         out[cid] = {
             "chat_row_id": cid,
             "subject": r.get("subject"),
@@ -167,7 +160,7 @@ def _load_chats(
             "archived": r.get("archived"),
             "hidden": r.get("hidden"),
             **info,
-            "display": saved or subject or info["jid"],
+            "display": r.get("subject") or info["jid"],
         }
     return out
 
@@ -274,18 +267,7 @@ def iter_modern_whatsapp(
     recovery_source: str,
 ) -> Iterator[NormalizedArtifact]:
     jids = _load_jids(conn)
-    phone_names: dict[str, str] = {}
-    if getattr(context, "db", None) is not None and context.job_id:
-        try:
-            from app.services.mobile_forensic.whatsapp_names import phone_names_from_job
-
-            phone_names = phone_names_from_job(context.db, context.job_id)
-        except Exception:
-            phone_names = {}
-    from app.services.mobile_forensic.whatsapp_names import jid_display_names
-
-    saved_names = jid_display_names(conn, phone_names)
-    chats = _load_chats(conn, jids, saved_names)
+    chats = _load_chats(conn, jids)
     media = _load_media(conn)
     revoked = _load_revoked(conn)
     quoted = _load_quoted_text(conn)
@@ -373,10 +355,6 @@ def iter_modern_whatsapp(
             "conversation_type": chat.get("jid_type") if chat else None,
             "chat_row_id": cid,
             "sender": sender["jid"] if not r.get("from_me") else "me",
-            "sender_display_name": (
-                saved_names.get(str(sender["jid"] or ""))
-                or saved_names.get(str(sender["jid"] or "").lower())
-            ) if not r.get("from_me") else None,
             "sender_phone": sender["phone"] if not r.get("from_me") else None,
             "from_me": _scalar(r.get("from_me")),
             "direction": "outgoing" if r.get("from_me") else "incoming",

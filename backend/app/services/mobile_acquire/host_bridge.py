@@ -54,23 +54,6 @@ def helper_base_url() -> str:
     return _ACTIVE_HELPER_URL or _candidate_helper_urls()[0]
 
 
-def helper_auth_headers(url: str | None = None) -> dict[str, str]:
-    """Shared secret for the helper when HOST_DRIVE_HELPER_TOKEN is configured on both sides.
-
-    With *url*, also the Host header a helper bound to 127.0.0.1 needs when it is reached through
-    host.docker.internal (V1.31.3, see hostdrive_agent.docker_host_header).
-    """
-    token = (os.environ.get("HOST_DRIVE_HELPER_TOKEN") or "").strip()
-    headers = {"X-Host-Helper-Token": token} if token else {}
-    if url:
-        from app.services.hostdrive_agent import docker_host_header
-
-        host = docker_host_header(url)
-        if host:
-            headers["Host"] = host
-    return headers
-
-
 def is_host_job_id(run_id: str | None) -> bool:
     return bool(_HOST_JOB_ID_RE.match(str(run_id or "").strip()))
 
@@ -180,7 +163,7 @@ def helper_reachable(timeout_sec: float = 2.0) -> bool:
     last_exc: Exception | None = None
     for base in _candidate_helper_urls():
         try:
-            req = urllib.request.Request(f"{base}/health", method="GET", headers=helper_auth_headers(base))
+            req = urllib.request.Request(f"{base}/health", method="GET")
             with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
                 data = json.loads(resp.read().decode("utf-8", errors="replace"))
                 if bool(data.get("ok")):
@@ -198,7 +181,7 @@ def helper_reachable(timeout_sec: float = 2.0) -> bool:
 def _get_json(path: str, *, timeout_sec: float = 30.0) -> dict[str, Any] | None:
     url = f"{helper_base_url()}{path}"
     try:
-        req = urllib.request.Request(url, method="GET", headers=helper_auth_headers(url))
+        req = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
             return json.loads(resp.read().decode("utf-8", errors="replace"))
     except Exception as exc:
@@ -214,7 +197,7 @@ def _post_json(path: str, body: dict[str, Any], *, timeout_sec: float = 1800.0) 
             url,
             data=raw,
             method="POST",
-            headers={"Content-Type": "application/json", **helper_auth_headers(url)},
+            headers={"Content-Type": "application/json"},
         )
         with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
             return json.loads(resp.read().decode("utf-8", errors="replace"))
@@ -291,18 +274,14 @@ def fetch_host_devices() -> tuple[list[dict[str, Any]], list[str]]:
         mapped: list[dict[str, Any]] = []
         for item in raw:
             os_hint = str(item.get("os_hint") or "android")
-            # Helper 5.62+: a phone on the cable that is not usable yet (charging only / no driver).
-            needs_action = os_hint != "ios" and item.get("connection") == "usb" and bool(item.get("state"))
             mapped.append({
-                "adapter": "ios_lockdown" if os_hint == "ios" else (
-                    "android_usb" if needs_action else "android_mtp"),
+                "adapter": "ios_lockdown" if os_hint == "ios" else "android_mtp",
                 "device_id": item.get("id") or item.get("instance_id") or "",
                 "label": item.get("name") or "Phone",
-                "status": str(item.get("state")) if needs_action else "wpd",
+                "status": "wpd",
                 "os_family": os_hint,
                 "instance_id": item.get("instance_id") or "",
                 "connection": item.get("connection") or "mtp",
-                **({"state": item.get("state"), "guidance": item.get("guidance") or ""} if needs_action else {}),
             })
         if mapped:
             return mapped, []

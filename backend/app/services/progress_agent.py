@@ -209,11 +209,6 @@ def classify_stage(job, stage, *, now=None):
     # A parse worker yielding because unfinished evidence claims remain is a
     # dependency wait, not a failed attempt. Do not consume recovery_dispatches
     # for a healthy queue that may still be draining in sidecar workers.
-    if str(stage.get("stage") or "") == "graph" and any(
-        phrase in str(stage.get("error") or "").lower()
-        for phrase in ("neo4j unavailable", "graph synchronization unavailable")
-    ):
-        return "skip_optional", "Neo4j is not part of the evidence record; graph synchronization is complete and the next stage continues"
     if state == 'waiting' and str(stage.get('stage') or '') == 'parse' and (
         'parsing made no progress' in str(stage.get('error') or '').lower()
         or 'remaining evidence claims' in str(stage.get('error') or '').lower()
@@ -552,11 +547,7 @@ def monitor_job(db, job_id, *, schema_name):
             and not job.get("extracted_disk_uri")):
         return _monitor_acquisition(db, job, schema_name=schema_name)
     report = _monitor_report(db, job, schema_name=schema_name)
-    # A queued report used to return here even when a stage still owned the
-    # case. The report task had already exited, and the open stage was no
-    # longer supervised. Keep watching that stage; start the report only once
-    # every stage is sealed.
-    if report is not None and report.get("status") != "pipeline":
+    if report is not None:
         return report
     rows = stage_rows(db, job_id)
     if rows and [r['stage'] for r in rows] != [s[0] for s in STAGES]:
@@ -621,29 +612,6 @@ def monitor_job(db, job_id, *, schema_name):
             WHERE id=:id AND task_id=:tid AND status='running'""", {'id':active['id'],'tid':active.get('task_id')})
         db.commit()
         return {'status':'recovering','reason':reason,'stage':active['stage'],'job_id':job_id}
-    if decision == 'skip_optional':
-        with pipeline_execution_lock(db, schema_name, job_id) as acquired:
-            if not acquired:
-                return {'status': 'valid_wait', 'reason': 'Owning stage is still releasing its execution lock', 'job_id': job_id}
-            fresh = first_open_stage(stage_rows(db, job_id))
-            if not fresh or fresh.get('stage') != 'graph':
-                return {'status': 'held', 'reason': 'Graph stage changed during inspection', 'job_id': job_id}
-            execute(
-                db,
-                """UPDATE pipeline_stage_runs SET status='skipped', completed_at=NOW(), error=NULL,
-                   total_items=1, completed_items=1, skipped_items=1,
-                   details=CAST(:details AS jsonb), updated_at=NOW()
-                   WHERE id=:id AND status IN ('waiting','pending','running')""",
-                {"id": fresh["id"], "details": json.dumps({
-                    "status": "skipped",
-                    "reason": "Neo4j unavailable; evidence remains in the case database",
-                    "total": 1, "completed": 1, "skipped": 1,
-                })},
-            )
-            persist_snapshot(db, job_id)
-            db.commit()
-        return {**dispatch_current_stage(db, job_id, schema_name=schema_name),
-                'job_id': job_id, 'coordinator': 'progressAgent', 'reason': reason}
     db.commit()
     if decision not in {'recover','retry_dependency'}:
         return {'status':decision,'reason':reason,'stage':active['stage'],'job_id':job_id}
@@ -1005,27 +973,6 @@ def supervise_progress(db, *, schema_name):
         return {'status':'ok','coordinator':'progressAgent','schema':schema_name,'actions':actions}
 
 
-def _report_pipeline_wait(db, job_id):
-    """Why a report must wait, or None once every evidence stage is sealed."""
-    from app.services.forensic_serial_pipeline import STAGES, first_open_stage, stage_rows
-
-    rows = stage_rows(db, job_id)
-    if not rows:
-        return None
-    if [row["stage"] for row in rows] != [stage[0] for stage in STAGES]:
-        return "Writing in: evidence stages are still being arranged. The report starts when processing finishes."
-    active = first_open_stage(rows)
-    if not active:
-        return None
-    done = int(active.get("completed_items") or 0)
-    total = int(active.get("total_items") or 0)
-    counts = f" ({done}/{total})" if total else ""
-    return (
-        f"Writing in: evidence stage {active.get('stage')}{counts} is still running. "
-        "The report starts when processing finishes."
-    )
-
-
 def _monitor_report(db,job,*,schema_name):
     exists=fetchone(db,"SELECT to_regclass('report_runs') AS t")
     if not exists or not exists['t']:
@@ -1033,25 +980,6 @@ def _monitor_report(db,job,*,schema_name):
     run=fetchone(db,"SELECT * FROM report_runs WHERE job_id=:jid AND status IN ('running','queued','waiting') ORDER BY created_at DESC LIMIT 1",{'jid':job['id']})
     if not run:
         return None
-    if str(run.get("status") or "") != "running":
-        waiting_reason = _report_pipeline_wait(db, job["id"])
-        if waiting_reason:
-            if str(run.get("status") or "") != "waiting" or str(run.get("error") or "") != waiting_reason:
-                execute(
-                    db,
-                    """UPDATE report_runs SET status='waiting', error=:err
-                       WHERE id=:id AND status IN ('queued','waiting')""",
-                    {"id": run["id"], "err": waiting_reason},
-                )
-                db.commit()
-            _event(db, str(job["id"]), "report", "valid_wait", waiting_reason)
-            db.commit()
-            return {
-                "status": "pipeline",
-                "stage": "report",
-                "reason": waiting_reason,
-                "job_id": str(job["id"]),
-            }
     stage={**run,'stage':'report','updated_at':run.get('heartbeat_at') or run.get('started_at') or run['created_at'],'attempt':run.get('recovery_dispatches',0)}
     decision,reason=classify_stage(job,stage)
     if decision=='recover' and run['status']=='queued':

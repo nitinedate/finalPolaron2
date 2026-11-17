@@ -282,44 +282,6 @@ class _ResumableObjectStream:
         self.close()
 
 
-def object_identity(storage_uri: str) -> dict | None:
-    """Size + version marker of a stored object (ETag/last-modified, or file mtime).
-
-    Used by the local part cache so a cached copy is only served while the stored
-    object is the one it was built from.
-    """
-    if not storage_uri:
-        return None
-    if storage_uri.startswith("file://"):
-        path = Path(storage_uri[7:])
-        try:
-            st = path.stat()
-        except OSError:
-            return None
-        return {"size": int(st.st_size), "version": f"mtime:{st.st_mtime_ns}"}
-    if storage_uri.startswith("s3://"):
-        parts = storage_uri[5:].split("/", 1)
-        bucket, key = parts[0], parts[1] if len(parts) > 1 else ""
-        client = _minio_client()
-        if not client:
-            path = _local_root() / key.replace("/", os.sep)
-            try:
-                st = path.stat()
-            except OSError:
-                return None
-            return {"size": int(st.st_size), "version": f"mtime:{st.st_mtime_ns}"}
-        try:
-            stat = client.stat_object(bucket, key)
-        except Exception:
-            return None
-        modified = getattr(stat, "last_modified", None)
-        return {
-            "size": int(getattr(stat, "size", 0) or 0),
-            "version": f"etag:{getattr(stat, 'etag', '') or ''}|{modified.isoformat() if modified else ''}",
-        }
-    return None
-
-
 def open_object_stream(storage_uri: str) -> _ObjectStream | _ResumableObjectStream | None:
     """Open a streaming read for an object without buffering the whole blob in RAM.
 

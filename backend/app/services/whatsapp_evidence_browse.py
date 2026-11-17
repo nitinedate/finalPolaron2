@@ -14,7 +14,6 @@ from app.db.sql_helpers import fetchall, fetchone
 
 _APPLE_EPOCH = 978307200
 _INDEX_CACHE: dict[str, tuple[float, str, str]] = {}
-_NAME_CACHE: dict[str, tuple[float, dict[str, str]]] = {}
 _INDEX_TTL = 1800
 _MEDIA_TOKEN = {
     "jpg", "jpeg", "png", "gif", "webp", "heic", "mp4", "mov", "opus", "m4a", "aac", "pdf",
@@ -505,63 +504,7 @@ def whatsapp_recovery_notice(job_id, family, db=None):
                          "backup_results": statuses}, "tags": ["notice", "no_chat_data"]}
 
 
-def _saved_names(db, job_id) -> dict[str, str]:
-    """JID -> saved contact or group name. Cached; a missing address book returns {}."""
-    cached = _NAME_CACHE.get(str(job_id))
-    if cached and time.monotonic() - cached[0] < _INDEX_TTL:
-        return cached[1]
-    names: dict[str, str] = {}
-    try:
-        import sqlite3
-        import tempfile
-        from app.services.mobile_forensic.sqlite_counts import _read_artifact_bytes
-        from app.services.mobile_forensic.whatsapp_names import jid_display_names, phone_names_from_job
-
-        phone_names = phone_names_from_job(db, job_id)
-        source = fetchone(db, """
-            SELECT forensic->>'source_path' AS path
-            FROM mobile_normalized_artifacts
-            WHERE job_id=:jid AND artifact_type='app_message'
-              AND coalesce(forensic->>'source_path','') ILIKE '%msgstore.db'
-              AND coalesce(forensic->>'source_path','') NOT ILIKE '%.crypt%'
-            LIMIT 1
-        """, {"jid": job_id})
-        raw = None
-        if source and source.get("path"):
-            raw = _read_artifact_bytes(db, job_id, str(source["path"]))
-        if raw and raw[:16].startswith(b"SQLite format"):
-            fd, path = tempfile.mkstemp(suffix=".db")
-            try:
-                os.write(fd, raw)
-            finally:
-                os.close(fd)
-            try:
-                conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-                try:
-                    names = jid_display_names(conn, phone_names)
-                finally:
-                    conn.close()
-            finally:
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
-    except Exception:
-        names = {}
-    _NAME_CACHE[str(job_id)] = (time.monotonic(), names)
-    return names
-
-
-def _prefer_saved_name(current: str, jid: str, names: dict[str, str] | None) -> str:
-    saved = ""
-    if names:
-        saved = str(names.get(jid) or names.get(str(jid).lower()) or "")
-    if saved and (not current or current == jid or _identifier(current)):
-        return saved
-    return current
-
-
-def _row(record, job_id, names: dict[str, str] | None = None):
+def _row(record, job_id):
     from app.services.artifact_group_browse import _person_key_from_row
 
     data = _json(record.get("data"))
@@ -571,11 +514,7 @@ def _row(record, job_id, names: dict[str, str] | None = None):
     deleted = state in DELETED or revoked
     candidate = state in {"freelist_candidate", "fragment"}
     conversation = str(data.get("conversation_id") or forensic.get("source_path") or record["artifact_id"])
-    title = _prefer_saved_name(
-        str(data.get("conversation_name") or data.get("conversation_title") or conversation),
-        conversation,
-        names,
-    )
+    title = str(data.get("conversation_name") or data.get("conversation_title") or conversation)
     body = str(data.get("body") or "")
     media_name = str(data.get("media_name") or "").strip()
     if _identifier(body) and " " not in body.strip():
@@ -589,17 +528,13 @@ def _row(record, job_id, names: dict[str, str] | None = None):
     message_title = body.strip().splitlines()[0][:140]
     stamp = record.get("timestamp_utc")
     stamp = stamp.isoformat() if hasattr(stamp, "isoformat") else stamp
-    sender = str(data.get("sender") or "")
-    saved_sender = _prefer_saved_name(str(data.get("sender_display_name") or sender), sender, names)
     meta = {**data, "evidence_kind": "whatsapp_message", "social_app": "whatsapp",
             "normalized_artifact_id": record["artifact_id"],
             "conversation_id": conversation, "conversation": title,
-            "conversation_name": title,
             "chat_jid": conversation if "@" in conversation else None,
             "is_group": conversation.endswith("@g.us"), "is_deleted": None if candidate else deleted,
             "is_deleted_candidate": candidate,
             "body": body, "message_title": message_title,
-            "sender_display_name": saved_sender if saved_sender and saved_sender != sender else data.get("sender_display_name"),
             "timestamp": stamp or data.get("timestamp_local"),
             "source_path": forensic.get("source_path"), "source_sha256": forensic.get("source_sha256"),
             "forensic_state": state, "forensic": forensic,
@@ -608,7 +543,7 @@ def _row(record, job_id, names: dict[str, str] | None = None):
             # historical/exported state separately so it cannot leak into Deleted.
             "recovery_state": state if deleted else "",
             "preview_body": f"WhatsApp: {title}\nTime: {stamp or data.get('timestamp_local') or 'unspecified'}\n"
-                            f"Sender: {saved_sender or data.get('sender') or 'unspecified'}\nState: {state}\n\n{body}\n\n"
+                            f"Sender: {data.get('sender') or 'unspecified'}\nState: {state}\n\n{body}\n\n"
                             f"Source: {forensic.get('source_path') or ''}\nSHA256: {forensic.get('source_sha256') or ''}"}
     row = {"id": "ev-mobile-" + record["artifact_id"], "job_id": job_id, "artifact_type": "whatsapp_message",
            "title": title, "source_path": forensic.get("source_path"), "artifact_datetime": stamp,
@@ -669,7 +604,6 @@ def list_whatsapp_evidence(db, job_id, *, family="whatsapp_messages", page=1, pa
     grouped = group_by in {"person", "conversation"}
     summaries = []
     labels = _session_labels(db, job_id) if grouped or group_id else {}
-    names = _saved_names(db, job_id)
     matched_summaries = []
     thread_name = None
     thread_group = False
@@ -697,7 +631,7 @@ def list_whatsapp_evidence(db, job_id, *, family="whatsapp_messages", page=1, pa
         want = str(group_id).removesuffix("::deleted")
         conversations = []
         for record in summaries:
-            labeled = _row(record, job_id, names)
+            labeled = _row(record, job_id)
             _apply_session_label(labeled, labels, heading=True)
             meta = labeled["metadata"]
             identity = meta["person_id"] if group_by == "person" else meta["conversation_id"]
@@ -711,7 +645,7 @@ def list_whatsapp_evidence(db, job_id, *, family="whatsapp_messages", page=1, pa
     if grouped and not group_id:
         buckets = {}
         for record in summaries:
-            row = _row(record, job_id, names)
+            row = _row(record, job_id)
             _apply_session_label(row, labels, heading=True)
             meta = row["metadata"]
             identity = meta["person_id"] if group_by == "person" else meta["conversation_id"]
@@ -739,9 +673,7 @@ def list_whatsapp_evidence(db, job_id, *, family="whatsapp_messages", page=1, pa
                                       f"Current: {bucket['current_count']}\nHistorical: {bucket['historical_count']}\n"
                                       f"Deleted/recovery candidates: {bucket['deleted_count']}\nMedia references: {bucket['media_count']}"
                                       f"{deleted_line}")
-        from app.services.artifact_group_browse import chat_label_sort_key
-
-        rows = sorted(buckets.values(), key=lambda row: chat_label_sort_key(str(row.get("title") or "")))
+        rows = sorted(buckets.values(), key=lambda row: str(row["title"]).casefold())
         total = len(rows)
         rows = rows[params["offset"]:params["offset"] + page_size]
         summary = None
@@ -752,7 +684,7 @@ def list_whatsapp_evidence(db, job_id, *, family="whatsapp_messages", page=1, pa
                 timestamp_utc DESC NULLS LAST,forensic->>'source_path',
                 CASE WHEN data->>'source_line_start' ~ '^[0-9]+$' THEN (data->>'source_line_start')::bigint END,
                 artifact_id LIMIT :limit OFFSET :offset""", params)
-        rows = [_row(record, job_id, names) for record in records]
+        rows = [_row(record, job_id) for record in records]
         for row in rows:
             _apply_session_label(row, labels, heading=False)
             shown = str((row.get("metadata") or {}).get("message_title") or "").strip()

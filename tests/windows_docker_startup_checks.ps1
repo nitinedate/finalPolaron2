@@ -29,39 +29,7 @@ try {
     foreach ($badIP in @('192.168.1.10','10.0.0.1','172.16.0.1','127.0.0.1','169.254.1.1','100.64.0.1','224.1.1.1','999.1.1.1','1.2.3.4;id')) {
         Assert-Throws { Get-DeploymentSettings -Root $tempRoot -Profile prod -PublicIP $badIP } "Reject private or malformed IP: $badIP"
     }
-    # V1.29: prod takes an optional domain and reads its HTTPS address from .env.
-    $prodDomain = Get-DeploymentSettings -Root $tempRoot -Profile prod -Domain Example.ORG.
-    Assert-True ($prodDomain.Domain -eq 'example.org') 'Production accepts an optional domain (normalized)'
-    Assert-Throws { Get-DeploymentSettings -Root $tempRoot -Profile prod -Domain 'a;return 200;' } 'Production rejects nginx domain injection'
-    Assert-Throws { Get-DeploymentSettings -Root $tempRoot -Profile prod -Domain '8.8.8.8' } 'Production rejects an IP as the domain'
-    $envFile = Join-Path $tempRoot '.env'
-    [IO.File]::WriteAllText($envFile, "APP_BASE_URL=http://localhost:3001`r`n# PUBLIC_HTTPS_IP=1.1.1.1`r`nPUBLIC_HTTPS_IP=9.9.9.9 # old`r`nPUBLIC_HTTPS_IP=`"8.8.4.4`"`r`nPUBLIC_HTTPS_DOMAIN='Polaron.Example.com'`r`nPUBLIC_HTTPS_EMAIL=ops@example.com`r`n")
-    $fromEnv = Get-DeploymentSettings -Root $tempRoot -Profile prod
-    Assert-True ($fromEnv.PublicIP -eq '8.8.4.4' -and $fromEnv.IPSource -eq '.env' -and $fromEnv.IPFromDotEnv) '.env PUBLIC_HTTPS_IP drives prod (last value, quotes removed)'
-    Assert-True ($fromEnv.Domain -eq 'polaron.example.com' -and $fromEnv.DomainFromDotEnv) '.env PUBLIC_HTTPS_DOMAIN drives prod'
-    Assert-True ($fromEnv.AcmeEmail -eq 'ops@example.com') '.env PUBLIC_HTTPS_EMAIL supplies the ACME email'
-    $cliWins = Get-DeploymentSettings -Root $tempRoot -Profile prod -PublicIP 8.8.8.8 -AcmeEmail cli@example.com
-    Assert-True ($cliWins.PublicIP -eq '8.8.8.8' -and $cliWins.AcmeEmail -eq 'cli@example.com') 'Command-line values override .env'
-    [IO.File]::WriteAllText($envFile, "PUBLIC_HTTPS_IP=9.9.9.9`nPUBLIC_HTTPS_DOMAIN=`n")
-    $ipOnly = Get-DeploymentSettings -Root $tempRoot -Profile prod -AcmeEmail saved@example.com
-    Assert-True ($ipOnly.Domain -eq '' -and $ipOnly.PublicIP -eq '9.9.9.9') 'Empty PUBLIC_HTTPS_DOMAIN means IP-only HTTPS'
-    Save-DeploymentSettings -Settings $ipOnly -Profile prod
-    $saved = Get-Content -LiteralPath (Join-Path $tempRoot 'script_docker/start_docker.settings.json') -Raw | ConvertFrom-Json
-    Assert-True ($saved.prod.publicIp -eq '8.8.4.4' -and $saved.prod.acmeEmail -eq 'saved@example.com') 'Values read from .env are not copied into the settings file'
-    Assert-True ([IO.File]::ReadAllText($envFile) -eq "PUBLIC_HTTPS_IP=9.9.9.9`nPUBLIC_HTTPS_DOMAIN=`n") 'The launcher never rewrites .env'
-    [IO.File]::WriteAllText($envFile, "PUBLIC_HTTPS_IP=192.168.1.20`n")
-    Assert-Throws { Get-DeploymentSettings -Root $tempRoot -Profile prod } 'A LAN address in .env is rejected'
-    [IO.File]::WriteAllText($envFile, "PUBLIC_HTTPS_IP=8.8.4.4`nPUBLIC_HTTPS_DOMAIN=bad_domain`n")
-    Assert-Throws { Get-DeploymentSettings -Root $tempRoot -Profile prod } 'An invalid .env domain is rejected'
-    [IO.File]::WriteAllText($envFile, "PUBLIC_HTTPS_IP=8.8.4.4`n")
-    $nitinIgnoresEnv = Get-DeploymentSettings -Root $tempRoot -Profile nitin
-    Assert-True ($nitinIgnoresEnv.PublicIP -eq '122.179.140.167' -and $nitinIgnoresEnv.Domain -eq 'future-softtech.co.in') 'Nitin keeps its own settings'
-    Assert-True ((Get-PublicAppBaseUrl -Root $tempRoot -HttpsUrl 'https://8.8.4.4') -eq 'https://8.8.4.4') 'Missing APP_BASE_URL becomes the HTTPS address'
-    [IO.File]::WriteAllText($envFile, "APP_BASE_URL=http://localhost:3001`n")
-    Assert-True ((Get-PublicAppBaseUrl -Root $tempRoot -HttpsUrl 'https://8.8.4.4') -eq 'https://8.8.4.4') 'Loopback APP_BASE_URL becomes the HTTPS address'
-    [IO.File]::WriteAllText($envFile, "APP_BASE_URL=https://polaron.example.com/`n")
-    Assert-True ((Get-PublicAppBaseUrl -Root $tempRoot -HttpsUrl 'https://8.8.4.4') -eq 'https://polaron.example.com') 'A custom APP_BASE_URL is kept'
-    Remove-Item -LiteralPath $envFile -Force
+    Assert-Throws { Get-DeploymentSettings -Root $tempRoot -Profile prod -Domain example.org } 'Production rejects domain overrides'
     Assert-Throws { Get-DeploymentSettings -Root $tempRoot -Profile nitin -Domain 'a;return 200;' } 'Reject nginx domain injection'
     $normal = @(Get-AppBuildArgs -BuildId first)
     $next = @(Get-AppBuildArgs -BuildId second)
@@ -72,12 +40,10 @@ try {
     Assert-Throws { Get-AppBuildArgs -BuildId '' } 'Empty application build ID is rejected'
     $nginxProd = Get-PublicNginxConfig -PublicIP 8.8.8.8
     Assert-True ($nginxProd -match 'aetheris-ip-8.8.8.8/fullchain.pem' -and $nginxProd -notmatch 'aetheris-domain') 'IP configuration has no domain certificate'
-    Assert-True ($nginxProd -match 'return 308 https://\$aetheris_https_host\$request_uri' -and $nginxProd -match 'default 8\.8\.8\.8;') 'Production HTTP redirects to configured IP'
-    Assert-True ($nginxProd -match 'map \$http_x_aetheris_service \$svc_id' -and $nginxProd -match 'map \$svc_id \$svc_label') 'HTTPS gateway defines the readable-502 maps of the local gateway'
+    Assert-True ($nginxProd -match 'return 308 https://8.8.8.8\$request_uri') 'Production HTTP redirects to configured IP'
     Assert-True ($nginxProd -match 'location \^~ /\.well-known/acme-challenge/' -and $nginxProd -match 'listen 80 default_server' -and $nginxProd -match 'listen 443 ssl default_server') 'HTTP-01 remains available on public ports'
     $nginxNitin = Get-PublicNginxConfig -PublicIP 8.8.8.8 -Domain example.org
     Assert-True ($nginxNitin -match 'aetheris-domain-example.org' -and $nginxNitin -match 'aetheris-ip-8.8.8.8') 'Domain and IP get separate TLS certificates'
-    Assert-True ($nginxNitin -match 'default example\.org;' -and $nginxNitin -match '(?m)^\s+8\.8\.8\.8 8\.8\.8\.8;' -and $nginxNitin -match '(?m)^\s+example\.org example\.org;') 'HTTP keeps the requested IP or domain'
     $ipIssue = @(Get-CertbotIssueArgs -Identity 8.8.8.8 -CertName aetheris-ip-8.8.8.8 -Email admin@example.com -IsIP)
     Assert-True ($ipIssue -contains '--ip-address' -and $ipIssue -contains 'shortlived' -and $ipIssue -notcontains '-d' -and $ipIssue -notcontains '--staging') 'IP issuance uses production shortlived ACME profile'
     $domainIssue = @(Get-CertbotIssueArgs -Identity example.org -CertName aetheris-domain-example.org -Email admin@example.com)

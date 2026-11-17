@@ -1375,7 +1375,7 @@ def generate_report(db, job_id: str, *, schema_name: str, report_run_id: str | N
     duration_ms = int((finished - started).total_seconds() * 1000)
     execute(
         db,
-        "UPDATE report_runs SET status='completed', error=NULL, completed_at=NOW(), duration_ms=:ms WHERE id=:id",
+        "UPDATE report_runs SET status='completed', completed_at=NOW(), duration_ms=:ms WHERE id=:id",
         {"ms": duration_ms, "id": report_run_id},
     )
     execute(db, "UPDATE jobs SET status='report_ready', updated_at=NOW() WHERE id=:id", {"id": job_id})

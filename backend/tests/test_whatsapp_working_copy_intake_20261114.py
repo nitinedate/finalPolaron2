@@ -1,37 +1,12 @@
 import sqlite3
 from pathlib import Path
 from app.services.mobile_forensic.whatsapp_working_copy_intake import (
-    case_id_from_evidence, host_case_roots, working_copy_candidates, validate_whatsapp_sqlite,
+    case_id_from_evidence, working_copy_candidates, validate_whatsapp_sqlite,
 )
 
 
 def test_case_id_from_registered_evidence_path():
     assert case_id_from_evidence({}, ["CASE-20261114-ANDROIDPHO_E-400003_FFS.zip/readable_artifacts/whatsapp/Databases/msgstore.db.crypt15"]) == "CASE-20261114-ANDROIDPHO"
-    assert case_id_from_evidence({
-        "last_host_path": r"D:\project1\polaran2\evidence\cases\CASE-20261114-ANDROIDPHO\05_Exports\run.zip"
-    }, []) == "CASE-20261114-ANDROIDPHO"
-
-
-def test_windows_case_path_is_read_from_the_host_mount():
-    roots = host_case_roots({
-        "last_host_path": r"D:\project1\polaran2\evidence\cases\CASE-20261114-ANDROIDPHO\05_Exports\run.zip"
-    })
-    texts = [str(path).replace("\\", "/") for path in roots]
-    assert "/host/d/project1/polaran2/evidence/cases" in texts
-
-
-def test_segment_paths_locate_the_mounted_case():
-    roots = host_case_roots({
-        "base_name": "CASE-20261114-ANDROIDPHO_E-400003_Android_phone_FFS_20261114_094907",
-        "segment_paths": [
-            "/host/d/project1/polaran2/evidence/cases/CASE-20261114-ANDROIDPHO/05_Exports/run.ufdx"
-        ],
-    })
-    texts = [str(path).replace("\\", "/") for path in roots]
-    assert "/host/d/project1/polaran2/evidence/cases" in texts
-    assert case_id_from_evidence({
-        "base_name": "CASE-20261114-ANDROIDPHO_E-400003_Android_phone_FFS_20261114_094907"
-    }, []) == "CASE-20261114-ANDROIDPHO"
 
 
 def test_working_copy_locator_and_sqlite_validation(tmp_path: Path):

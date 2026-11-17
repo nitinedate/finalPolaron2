@@ -622,6 +622,7 @@ def collect_mobile_device_facts(db, job_id: str, intake: dict[str, Any] | None =
         build_prop.get("ro.product.model")
         or ufd_meta.get("model")
         or name_hints.get("model")
+        or ds.get("base_name")
         or "—"
     )
     os_version = (
@@ -641,7 +642,7 @@ def collect_mobile_device_facts(db, job_id: str, intake: dict[str, Any] | None =
     timezone_id = dump_id.get("timezone") or build_prop.get("persist.sys.timezone") or "UTC"
     if not timezone_id or str(timezone_id).strip() in {"", "—", "None"}:
         timezone_id = "UTC"
-    device_name = build_prop.get("ro.product.name") or model or "—"
+    device_name = build_prop.get("ro.product.name") or model or ds.get("base_name") or "—"
 
     vol18 = _json_field(intake.get("vol18_form_json"), {}) or {}
     exhibit = vol18.get("exhibit") if isinstance(vol18.get("exhibit"), dict) else {}

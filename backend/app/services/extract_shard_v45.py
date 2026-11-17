@@ -441,15 +441,6 @@ def shard_worker_v45(
         cpu_backoff_delay = None
     thermal_check_every = 64
 
-    # V1.28.0: the seekable part cache shares this drive; evidence always wins.
-    # Free cached copies (never evidence) until this shard's spool + upload fit.
-    try:
-        from app.services.part_cache import release_space
-
-        release_space(2 * sum(max(0, int(n.get("size_bytes") or 0)) for n in nodes))
-    except Exception:
-        log.debug("part-cache release before shard spool skipped", exc_info=True)
-
     fd, tmp_name = tempfile.mkstemp(suffix=".tar.zst", dir=spool_dir)
     os.close(fd)
     tmp_path = Path(tmp_name)

@@ -19,64 +19,15 @@ _MAX_BYTES = 768 * 1024 * 1024
 _CASE_RE = re.compile(r"(CASE-[A-Za-z0-9-]+)", re.IGNORECASE)
 
 
-def _evidence_strings(value: Any) -> list[str]:
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, dict):
-        found: list[str] = []
-        for item in value.values():
-            found.extend(_evidence_strings(item))
-        return found
-    if isinstance(value, (list, tuple)):
-        found = []
-        for item in value:
-            found.extend(_evidence_strings(item))
-        return found
-    return []
-
-
 def case_id_from_evidence(disk_source: dict[str, Any], artifact_paths: list[str]) -> str | None:
     """Use a case identifier explicitly associated with this job, never a global scan."""
-    for value in [*_evidence_strings(disk_source), *artifact_paths]:
-        match = _CASE_RE.search(value)
+    candidates = [disk_source.get(k) for k in ("case_id", "case_path", "evidence_folder", "source_path", "host_path")]
+    candidates.extend(artifact_paths)
+    for value in candidates:
+        match = _CASE_RE.search(str(value or ""))
         if match:
             return match.group(1)
     return None
-
-
-def host_case_roots(disk_source: dict[str, Any] | None) -> list[Path]:
-    """Folders that contain CASE-* directories.
-
-    The Android worker mounts the project evidence tree at /host/<drive>/...,
-    while /evidence is a different store. A Windows case path on D: has to be
-    read from that host mount or the plaintext msgstore.db is never parsed.
-    """
-    found: list[Path] = []
-    seen: set[str] = set()
-
-    def add(path: Path) -> None:
-        key = str(path).replace("\\", "/").rstrip("/").lower()
-        if not key or key in seen:
-            return
-        seen.add(key)
-        found.append(path)
-
-    add(Path(os.environ.get("POLARON_EVIDENCE_CASES_ROOT", "/evidence/cases")))
-    marker = "/evidence/cases"
-    for raw_value in _evidence_strings(disk_source):
-        raw = raw_value.replace("\\", "/")
-        idx = raw.lower().find(marker)
-        if idx < 0:
-            continue
-        root_text = raw[: idx + len(marker)]
-        if not (root_text.startswith("/") or (len(root_text) >= 3 and root_text[1] == ":")):
-            continue
-        add(Path(root_text))
-        if len(root_text) >= 3 and root_text[1] == ":":
-            letter = root_text[0].lower()
-            rest = root_text[3:].lstrip("/")
-            add(Path("/host") / letter / rest)
-    return found
 
 
 def working_copy_candidates(case_dir: Path) -> list[Path]:
@@ -129,12 +80,10 @@ def register_working_copy_whatsapp(db, job_id: str, disk_source: dict[str, Any],
     if not case_id:
         result["state"] = "case_not_identified"
         return result
-    # Backend may run inside Docker. /evidence is not the examiner case tree;
-    # the same CASE folder is also on the host drive mount.
+    # Backend may run inside Docker; mount the host case tree explicitly.
+    roots = [Path(os.environ.get("POLARON_EVIDENCE_CASES_ROOT", "/evidence/cases"))]
     candidates: list[Path] = []
-    for root in host_case_roots(disk_source):
-        if not root.is_dir() or root.is_symlink():
-            continue
+    for root in roots:
         candidates.extend(working_copy_candidates(root / case_id))
     if not candidates:
         result["state"] = "not_found_or_case_volume_not_mounted"

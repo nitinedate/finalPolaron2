@@ -290,6 +290,25 @@ if ($adb -and $adb.app_private -or $hasPlainMsgstore) {
         [void]$limitations.Add("SMS/MMS/contacts/calendar were collected via content providers.")
     }
 }
+# Transfer the complete verified ZIP to the case's isolated server before
+# publishing success. A failed upload remains RETRYABLE; do not claim complete.
+$serverTransfer = @{}
+if ($ok) {
+    Write-Prog @{
+        stage = "transfer"; item = "server_upload"; bytes_done = $bytes
+        files_seen = $copied; run_name = $runName
+        detail = "Securely transferring acquired evidence to the forensic server"
+        category = "Transferring"
+    }
+    $handoff = Invoke-MobileEvidenceTransfer -Payload $p -Exports $exports -Logs $logs
+    if ($handoff.ok) {
+        $serverTransfer = $handoff.receipt
+    } else {
+        $ok = $false
+        $err = [string]$handoff.error
+        $errList.Add($err) | Out-Null
+    }
+}
 $summary = @{
     ok                 = $ok
     run_name           = $runName
@@ -309,6 +328,7 @@ $summary = @{
     errors             = @($errList)
     content_inventory  = $inventory
     export_packages    = $exportPkg
+    server_transfer     = $serverTransfer
     verification       = @{ ok = $ok; verified = $(if ($ok) { $copied } else { 0 }) }
     acquisition_record = @{ output_size = $bytes; file_count = $copied; missing_fields = @() }
     evidence_package   = @{
@@ -347,11 +367,14 @@ $res = @{
     acquisition_record = $summary.acquisition_record
     content_inventory  = $inventory
     export_packages    = $exportPkg
+    server_transfer     = $serverTransfer
     verification       = $summary.verification
 }
 $resJson = if (Get-Command Convert-AcquireResultToJson -ErrorAction SilentlyContinue) {
     Convert-AcquireResultToJson -Obj $res
 } else { $res | ConvertTo-Json -Compress -Depth 12 }
 $resJson | Set-Content -LiteralPath $ResultFile -Encoding UTF8
+# Remove short-lived upload ticket and collection secrets from local temp.
+Remove-Item -LiteralPath $PayloadFile -Force -ErrorAction SilentlyContinue
 if (-not $ok) { exit 1 }
 exit 0

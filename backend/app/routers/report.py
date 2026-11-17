@@ -903,14 +903,7 @@ def get_report_status(
     )
     count = int(sec_count["c"]) if sec_count else 0
     raw = str(run.get("status") or "unknown")
-    message = str(run.get("error") or "") or None
-    if raw == "running":
-        status = "generating"
-    elif raw in {"queued", "waiting"} and message and message.lower().startswith("writing in"):
-        # The page shows this string as the status. A queued run that already
-        # exited must not look like sections are being written.
-        status = message
-    elif raw in {"queued", "waiting"}:
+    if raw in {"running", "queued", "waiting"}:
         status = "generating"
     elif raw == "completed":
         status = "Report generated"
@@ -924,7 +917,6 @@ def get_report_status(
         "sections_total": sections_total,
         "duration_ms": run.get("duration_ms"),
         "error": run.get("error"),
-        "message": message,
     }
 
 

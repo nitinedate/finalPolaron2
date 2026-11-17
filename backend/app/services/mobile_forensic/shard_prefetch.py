@@ -35,16 +35,11 @@ def _members(claims):
                 yield row
 
 
-def choose_prefetch_groups(claims, *, wanted=None, max_member=MAX_MEMBER, max_batch=MAX_BATCH, retain_bytes=None):
+def choose_prefetch_groups(claims, *, wanted=None, max_member=MAX_MEMBER, max_batch=MAX_BATCH):
     """Select only small members with known part URIs and bounded total bytes.
 
     Grouping depends only on immutable source metadata, not on the worker's DB
     state. A part with one selected member is left to the normal read path.
-    ``retain_bytes`` is the prefix a parser will keep. The batch budget uses
-    that prefix, while the returned size stays the real source size so hash
-    and length checks still cover the whole member. Without this, a 5 MB
-    cache file that only needs a 4 KB header consumes a full slot and every
-    later file scans the archive from the start.
     """
     # First group *all* eligible metadata by source shard.  The old code
     # deducted memory before ranking shards, so 256 random small files could
@@ -52,7 +47,6 @@ def choose_prefetch_groups(claims, *, wanted=None, max_member=MAX_MEMBER, max_ba
     # prefetched at all.  This phase stores metadata only, not file contents.
     grouped = defaultdict(list)
     seen = set()
-    retain = retain_bytes or {}
     for row in _members(claims):
         path = str(row.get("path") or "").replace("\\", "/")
         if not path or (wanted is not None and path not in wanted) or path in seen:
@@ -71,15 +65,9 @@ def choose_prefetch_groups(claims, *, wanted=None, max_member=MAX_MEMBER, max_ba
             size = int(row.get("size") or 0)
         except (TypeError, ValueError):
             continue
-        retained = size
-        if path in retain:
-            try:
-                retained = min(size, max(1, int(retain[path])))
-            except (TypeError, ValueError):
-                retained = size
-        if not part or size <= 0 or retained <= 0 or retained > max_member:
+        if not part or size <= 0 or size > max_member:
             continue
-        grouped[str(part)].append((path, size, row.get("sha256") or meta.get("source_sha256"), retained))
+        grouped[str(part)].append((path, size, row.get("sha256") or meta.get("source_sha256")))
 
     # Prioritize reuse (members per scan), and only then allocate the bounded
     # cache budget.  A whole shard is still streamed only once in this batch.
@@ -90,10 +78,10 @@ def choose_prefetch_groups(claims, *, wanted=None, max_member=MAX_MEMBER, max_ba
     remaining = max(0, int(max_batch))
     for part, entries in candidates[:MAX_SHARDS_PER_CLAIM]:
         keep = []
-        for path, size, digest, retained in entries:
-            if retained <= remaining:
+        for path, size, digest in entries:
+            if size <= remaining:
                 keep.append((path, size, digest))
-                remaining -= retained
+                remaining -= size
         if len(keep) >= MIN_MEMBERS_PER_SHARD:
             selected[part] = keep
     return selected
@@ -138,7 +126,7 @@ def prefetch_claim_bytes(claims, registry, context, *, on_detail=None):
         if any(path.lower().endswith(s) and path[:-len(s)] in wanted
                for s in ("-wal", "-shm", "-journal")):
             wanted.add(path)
-    groups = choose_prefetch_groups(claims, wanted=wanted, retain_bytes=read_caps)
+    groups = choose_prefetch_groups(claims, wanted=wanted)
     cache = context.extra["prefetched_bytes"]
     total = 0
     for part, entries in groups.items():

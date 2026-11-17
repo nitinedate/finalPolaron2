@@ -13,12 +13,6 @@ _LETTERHEAD_PAD_X_RATIO = 0.04
 _LETTERHEAD_PAD_Y_RATIO = 0.05
 _LETTERHEAD_PAD_X_MIN = 18
 _LETTERHEAD_PAD_Y_MIN = 8
-# A little smaller than the source artwork, and far enough from the page edge
-# that the left wing is not clipped when the band is fitted to A4.
-_HEADER_LOGO_SCALE = 0.86
-_HEADER_LEFT_INSET = 0.075
-_HEADER_RIGHT_INSET = 0.04
-_HEADER_ASPECT = 210 / 44
 
 
 def _asset(name: str) -> bytes:
@@ -118,89 +112,6 @@ def flatten_letterhead_band(image: "Image.Image") -> "Image.Image":
     return _pad_letterhead_canvas(Image.alpha_composite(white, cropped).convert("RGB"))
 
 
-def _ink_bbox(image: "Image.Image") -> tuple[int, int, int, int] | None:
-    rgb = image.convert("RGB")
-    width, height = rgb.size
-    pixels = rgb.load()
-    left, top, right, bottom = width, height, -1, -1
-    for y in range(height):
-        for x in range(width):
-            red, green, blue = pixels[x, y]
-            if min(red, green, blue) < 245:
-                left = min(left, x)
-                top = min(top, y)
-                right = max(right, x)
-                bottom = max(bottom, y)
-    if right < left or bottom < top:
-        return None
-    return left, top, right + 1, bottom + 1
-
-
-def _header_split_x(image: "Image.Image") -> int | None:
-    """X where the logo block ends and the right-hand accent begins."""
-    rgb = image.convert("RGB")
-    width, height = rgb.size
-    pixels = rgb.load()
-
-    def ink(x: int) -> bool:
-        return any(min(pixels[x, y]) < 245 for y in range(height))
-
-    gap_start = None
-    best = None
-    for x in range(int(width * 0.28), int(width * 0.82)):
-        if not ink(x):
-            if gap_start is None:
-                gap_start = x
-        elif gap_start is not None:
-            if best is None or x - gap_start > best[1] - best[0]:
-                best = (gap_start, x)
-            gap_start = None
-    if best is None or best[1] - best[0] < 24:
-        return None
-    return best[0]
-
-
-def prepare_header_png(raw: bytes) -> bytes:
-    """Shrink the logo slightly and keep its left wing inside the page."""
-    if not raw:
-        return raw
-    from PIL import Image
-
-    flat = flatten_letterhead_band(Image.open(io.BytesIO(raw)))
-    width, height = flat.size
-    canvas_h = max(height, int(round(width / _HEADER_ASPECT)))
-    canvas = Image.new("RGB", (width, canvas_h), (255, 255, 255))
-    split = _header_split_x(flat)
-    if split is None:
-        box = _ink_bbox(flat)
-        parts = [(flat.crop(box), True)] if box else []
-    else:
-        logo_box = _ink_bbox(flat.crop((0, 0, split, height)))
-        accent_box = _ink_bbox(flat.crop((split, 0, width, height)))
-        parts = []
-        if logo_box:
-            parts.append((flat.crop(logo_box), True))
-        if accent_box:
-            parts.append((flat.crop((split + accent_box[0], accent_box[1], split + accent_box[2], accent_box[3])), False))
-    for crop, is_logo in parts:
-        if is_logo:
-            target_w = max(1, int(round(crop.width * _HEADER_LOGO_SCALE)))
-            target_h = max(1, int(round(crop.height * _HEADER_LOGO_SCALE)))
-            placed = crop.resize((target_w, target_h), Image.Resampling.LANCZOS)
-            x = int(round(width * _HEADER_LEFT_INSET))
-            y = max(0, (canvas_h - target_h) // 2)
-        else:
-            placed = crop
-            x = width - placed.width - int(round(width * _HEADER_RIGHT_INSET))
-            y = max(0, (canvas_h - placed.height) // 2)
-        x = max(0, min(x, width - placed.width))
-        y = max(0, min(y, canvas_h - placed.height))
-        canvas.paste(placed, (x, y))
-    buf = io.BytesIO()
-    canvas.save(buf, format="PNG", optimize=True)
-    return buf.getvalue()
-
-
 def white_letterhead_png(raw: bytes) -> bytes:
     """Return a letterhead band PNG with gray chrome removed and paper set to white."""
     if not raw:
@@ -236,7 +147,7 @@ def apply_forensic_letterhead(pdf_bytes: bytes) -> bytes:
     except ImportError:
         return pdf_bytes
 
-    header = prepare_header_png(_asset("letterhead-header.png"))
+    header = white_letterhead_png(_asset("letterhead-header.png"))
     footer = white_letterhead_png(_asset("letterhead-footer.png"))
     watermark = _asset("watermark.png")
     seal = _asset("confidential-stamp.png")

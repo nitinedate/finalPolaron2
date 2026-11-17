@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import json
 import threading
-import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -263,97 +262,6 @@ def _known_evidence_case_roots() -> list[Path]:
     _add(Path(r"E:\rag_new2\evidence\cases"))
     _add(Path("/host/e/rag_new2/evidence/cases"))
     _add(Path("/evidence/cases"))
-    for helper_root in _helper_case_roots():
-        _add(helper_root)
-    return out
-
-
-_HELPER_ROOTS_CACHE: tuple[float, list[Path]] = (0.0, [])
-
-
-def _helper_case_roots() -> list[Path]:
-    """Case root(s) the server HostDrive helper writes to, as this container sees them.
-
-    Server-side collections and V1.27.0 client-image copies land in
-    ``<helper root>\\evidence\\cases`` (or HOST_IMPORT_CASE_ROOT). Asking the helper
-    keeps recovery working whatever drive/folder the project was installed in.
-    Cached for a minute, including failures, so an offline helper costs nothing.
-    """
-    global _HELPER_ROOTS_CACHE
-    stamp, cached = _HELPER_ROOTS_CACHE
-    if time.monotonic() - stamp < 60.0:
-        return cached
-    roots: list[Path] = []
-    try:
-        from app.services.mobile_acquire import host_bridge
-
-        health = host_bridge.helper_health() or {}
-        raw_roots = [str(health.get("import_case_root") or "")]
-        if health.get("root"):
-            raw_roots.append(str(health["root"]).rstrip("\\/") + "\\evidence\\cases")
-        for raw in raw_roots:
-            mapped = _windows_drive_to_host_mount(raw) if raw else None
-            if mapped is not None and mapped not in roots:
-                roots.append(mapped)
-    except Exception:
-        roots = []
-    _HELPER_ROOTS_CACHE = (time.monotonic(), roots)
-    return roots
-
-
-def _client_import_record(logs_dir: Path) -> dict[str, Any] | None:
-    """Newest V1.27.0 copy record next to a collection summary (07_Logs/<run>/client_import_*.json)."""
-    try:
-        hits = sorted(logs_dir.glob("client_import_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    except OSError:
-        return None
-    for hit in hits:
-        try:
-            data = _read_json(hit)
-        except Exception:
-            continue
-        if isinstance(data, dict) and str(data.get("schema") or "").startswith("polaron.client_mobile_import/"):
-            return data
-    return None
-
-
-def _apply_client_import(summary: dict[str, Any], logs_dir: Path) -> dict[str, Any]:
-    """A run collected on a client PC and copied here keeps the client's summary byte-for-byte.
-
-    Its paths name the client (``C:\\evidence\\CASE\\…``); the copy record says where the
-    verified server copy is, so recovery and analysis use the server paths.
-    """
-    record = _client_import_record(logs_dir)
-    if not record:
-        return summary
-    client = record.get("client") if isinstance(record.get("client"), dict) else {}
-    server = record.get("server") if isinstance(record.get("server"), dict) else {}
-    client_dir = str(client.get("case_dir") or "")
-    server_dir = str(server.get("case_dir") or "")
-    if not server_dir:
-        return summary
-    from app.services.mobile_acquire.client_import import rebase_paths
-
-    out = rebase_paths(summary, client_dir, server_dir) if client_dir else dict(summary)
-    paths = dict(out.get("paths") or {})
-    server_paths = server.get("paths") if isinstance(server.get("paths"), dict) else {}
-    paths.update({str(k): str(v) for k, v in server_paths.items()})
-    out["paths"] = paths
-    note = (
-        f"Collected on {client.get('hostname') or 'a client computer'} ({client_dir}) and copied to the forensic "
-        f"server with SHA-256 verification (copy {record.get('import_id') or ''})."
-    )
-    warnings = [str(w) for w in (out.get("warnings") or [])]
-    if note not in warnings:
-        warnings.append(note)
-    out["warnings"] = warnings
-    out["client_import"] = {
-        "import_id": record.get("import_id"),
-        "client_host": client.get("hostname"),
-        "client_case_dir": client_dir,
-        "server_case_dir": server_dir,
-        "scope": record.get("scope"),
-    }
     return out
 
 
@@ -462,8 +370,6 @@ def _recover_summary_from_disk(case_root: str, case_id: str) -> dict[str, Any] |
 
     try:
         summary = _read_json(summary_path)
-        if isinstance(summary, dict):
-            summary = _apply_client_import(summary, summary_path.parent)
     except Exception:
         return None
     if not isinstance(summary, dict):
@@ -1275,8 +1181,6 @@ class AcquisitionRegistry:
                     continue
                 try:
                     data = _read_json(summary_file)
-                    if isinstance(data, dict):
-                        data = _apply_client_import(data, summary_file.parent)
                     result = full if full and (
                         str(full.get("run_name") or "") == run_dir
                         or not any(

@@ -479,62 +479,6 @@ def test_dispatch_cannot_cross_product_boundaries(monkeypatch):
     )
 
 
-def test_open_stage_keeps_a_queued_report_waiting(monkeypatch):
-    from app.services import progress_agent as progress
-
-    monkeypatch.setattr(pipeline, "stage_rows", lambda *args: rows_at("chunk", "running"))
-    reason = progress._report_pipeline_wait(object(), "job")
-    assert reason is not None
-    assert reason.startswith("Writing in: evidence stage chunk")
-    assert "The report starts when processing finishes." in reason
-
-
-def test_sealed_pipeline_does_not_hold_the_report(monkeypatch):
-    from app.services import progress_agent as progress
-
-    monkeypatch.setattr(
-        pipeline,
-        "stage_rows",
-        lambda *args: [{**row, "status": "done"} for row in rows_at("validation", "done")],
-    )
-    assert progress._report_pipeline_wait(object(), "job") is None
-
-
-def test_report_wait_still_supervises_the_open_stage(monkeypatch):
-    from app.services import progress_agent as progress
-
-    monkeypatch.setenv("AETHERIS_SERVICE", "forensic")
-    monkeypatch.setattr(
-        "app.services.mobile_platform_agents.current_service_owns_job",
-        lambda *args: True,
-    )
-    monkeypatch.setattr(pipeline, "stage_rows", lambda *args: rows_at("chunk", "pending"))
-    monkeypatch.setattr(
-        progress,
-        "fetchone",
-        lambda *args: {"status": "indexing", "stop_requested": False, "id": "job"},
-    )
-    monkeypatch.setattr(progress, "execute", lambda *args: None)
-    monkeypatch.setattr(
-        progress,
-        "_monitor_report",
-        lambda *args, **kwargs: {"status": "pipeline", "reason": "chunk"},
-    )
-    monkeypatch.setattr(
-        pipeline,
-        "dispatch_current_stage",
-        lambda *args, **kwargs: {"status": "queued", "stage": "chunk"},
-    )
-    monkeypatch.setattr(progress, "_event", lambda *args, **kwargs: None)
-    result = progress.monitor_job(
-        SimpleNamespace(commit=lambda: None, rollback=lambda: None),
-        "job",
-        schema_name="firm_test",
-    )
-    assert result["status"] == "queued"
-    assert result["stage"] == "chunk"
-
-
 def test_watchdog_releases_lock_before_publishing(monkeypatch):
     from app.services import progress_agent as progress
     held = False

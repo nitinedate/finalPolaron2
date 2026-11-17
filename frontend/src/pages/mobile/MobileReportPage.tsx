@@ -74,7 +74,6 @@ export function MobileReportPage() {
   const [status, setStatus] = useState("none");
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
-  const [detail, setDetail] = useState("");
 
   const load = useCallback(async () => {
     if (!jobId) return;
@@ -84,7 +83,6 @@ export function MobileReportPage() {
         forensicApi.listReportSections(jobId).catch(() => []),
       ]);
       setStatus(displayStatus(st.status));
-      setDetail(st.message || st.error || "");
       setSections(sec);
       if (typeof st.sections_completed === "number" && typeof st.sections_total === "number") {
         setProgress({ done: st.sections_completed, total: st.sections_total });
@@ -176,8 +174,8 @@ export function MobileReportPage() {
           <Card className="p-8 text-center text-sm text-ink-400">
             <FileText className="mx-auto mb-2 h-7 w-7" />
             {status === "generating"
-              ? detail || "Generating mobile report sections…"
-              : detail || "No mobile report sections yet."}
+              ? "Generating mobile report sections…"
+              : "No mobile report sections yet."}
           </Card>
         ) : (
           <MobileReportSheets

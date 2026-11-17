@@ -94,18 +94,6 @@ def test_protobuf_wire_fields_and_truncated_rejection():
         list(iter_protobuf_fields(b'\x12\x05he','raw.pb'))
 
 
-def test_binary_xml_does_not_fail_the_work_unit():
-    blob=b'\x00\x05\x16\x07' + b'\xb0' * 64
-    path='sdcard/__MACOSX/mb/res/xml/._layer.xml'
-    item=InventoryItem(path=path, size=len(blob), extension='.xml', sha256=hashlib.sha256(blob).hexdigest())
-    context=ParseContext(job_id='fixture', platform='Android', read_bytes=lambda *a, **kw: blob)
-    parser=CommunicationEvidenceParser()
-    assert parser.supports(item, context) is False
-    other=InventoryItem(path='sdcard/notes/layer.xml', size=len(blob), extension='.xml', sha256=item.sha256)
-    assert parser.supports(other, context) is True
-    assert list(parser.parse(other, context)) == []
-
-
 def test_xml_external_entities_rejected():
     with pytest.raises(ValueError,match='DOCTYPE'):
         list(iter_structured_records(b'<!DOCTYPE x [<!ENTITY leak SYSTEM "file:///etc/passwd">]><x>&leak;</x>','source.xml'))

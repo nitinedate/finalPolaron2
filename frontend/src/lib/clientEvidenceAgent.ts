@@ -11,16 +11,13 @@
 
 import { resolveApiUrl } from "./api";
 import { inferApiService } from "./apiRouting";
-import { getCachedHelperOnline, getLocalHelperIdentity, lastFullHelperHealth } from "./hostDriveHelper";
 
 export const CLIENT_AGENT_PORT = 9877;
 
 const CONFIGURED_BASE = (import.meta.env.VITE_CLIENT_EVIDENCE_AGENT_URL as string | undefined)?.replace(/\/$/, "");
-// One loopback address. Also trying localhost after 127.0.0.1 is down only
-// adds a second connection-refused exception for the same missing agent.
 const AGENT_BASES = CONFIGURED_BASE
   ? [CONFIGURED_BASE]
-  : [`http://127.0.0.1:${CLIENT_AGENT_PORT}`];
+  : [`http://127.0.0.1:${CLIENT_AGENT_PORT}`, `http://localhost:${CLIENT_AGENT_PORT}`];
 
 /** Same evidence-file pattern as the server drive browser. */
 export const EVIDENCE_FILE_RE =
@@ -28,8 +25,7 @@ export const EVIDENCE_FILE_RE =
 
 export const HIDDEN_CLIENT_DIR_RE = /^(?:\$recycle\.bin|system volume information|recovery|config\.msi)$/i;
 
-/** blocked = the agent may be running, but the browser refuses this site access to apps on this computer. */
-export type ClientAgentState = "online" | "unpaired" | "offline" | "blocked";
+export type ClientAgentState = "online" | "unpaired" | "offline";
 
 export type ClientAgentHealth = {
   ok: boolean;
@@ -70,12 +66,6 @@ export type ClientDirEntry = {
   link?: boolean;
 };
 
-export type ClientOmittedEntry = {
-  name: string;
-  reason: string;
-  detail?: string;
-};
-
 export type ClientDirListing = {
   ok: boolean;
   path: string;
@@ -83,8 +73,6 @@ export type ClientDirListing = {
   entries: ClientDirEntry[];
   count: number;
   truncated: boolean;
-  /** Directories the agent could see but could not open. */
-  omitted?: ClientOmittedEntry[];
 };
 
 export type ClientShare = {
@@ -120,12 +108,6 @@ export class ClientAgentError extends Error {
 }
 
 let preferredBase: string | null = null;
-let healthInFlight: Promise<ClientAgentStatus> | null = null;
-let offlineUntilMs = 0;
-let offlineStreak = 0;
-
-/** Tests probe every call. A real browser backs off so a down agent is not an exception storm. */
-const HEALTH_BACKOFF = import.meta.env.MODE !== "test";
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
   const controller = new AbortController();
@@ -174,71 +156,12 @@ async function agentJson<T>(path: string, init: RequestInit = {}, timeoutMs = 80
   return body as T;
 }
 
-export async function clientAgentStatus(
-  timeoutMs = 1500,
-  opts?: { force?: boolean },
-): Promise<ClientAgentStatus> {
-  if (HEALTH_BACKOFF && !opts?.force && Date.now() < offlineUntilMs) {
-    return { state: "offline", health: null };
-  }
-  if (healthInFlight) return healthInFlight;
-  healthInFlight = probeClientAgent(timeoutMs).finally(() => {
-    healthInFlight = null;
-  });
-  return healthInFlight;
-}
-
-/**
- * Browsers gate requests from a public site to 127.0.0.1 behind a per-site permission ("Local
- * network access", Chrome 142+; split into local-network / loopback-network in Chrome 145, with
- * the old name kept as an alias). A denied permission looks exactly like a missing agent unless
- * it is checked. Returns null when the browser has no such permission.
- */
-export async function loopbackPermissionState(): Promise<PermissionState | null> {
-  const perms = typeof navigator !== "undefined" ? navigator.permissions : undefined;
-  if (!perms?.query) return null;
-  for (const name of ["loopback-network", "local-network-access"]) {
-    try {
-      const status = await perms.query({ name } as unknown as PermissionDescriptor);
-      return status.state;
-    } catch {
-      /* unknown permission name in this browser */
-    }
-  }
-  return null;
-}
-
-/**
- * V1.31.8: helper 5.63+ reports whether the agent answers on this computer. When it says no, the page does
- * not call 127.0.0.1:9877 itself: every refused call shows as a red ERR_CONNECTION_REFUSED console error.
- */
-async function helperSaysAgentIsDown(): Promise<boolean> {
-  try {
-    let health = lastFullHelperHealth(15_000);
-    if (!health && getCachedHelperOnline() === true) health = await getLocalHelperIdentity(1_500);
-    return health?.client_agent_running === false;
-  } catch {
-    return false; // best effort: without an answer, ask the agent as before
-  }
-}
-
-async function probeClientAgent(timeoutMs: number): Promise<ClientAgentStatus> {
-  if (await helperSaysAgentIsDown()) {
-    offlineStreak += 1;
-    if (HEALTH_BACKOFF) offlineUntilMs = Date.now() + Math.min(8_000 * 1.5 ** Math.max(offlineStreak - 1, 0), 30_000);
-    return { state: "offline", health: null };
-  }
+export async function clientAgentStatus(timeoutMs = 1500): Promise<ClientAgentStatus> {
   try {
     const health = await agentJson<ClientAgentHealth>("/health", {}, timeoutMs);
-    offlineStreak = 0;
-    offlineUntilMs = 0;
     if (!health.ok) return { state: "offline", health: null };
     return { state: health.origin_allowed === false ? "unpaired" : "online", health };
   } catch {
-    offlineStreak += 1;
-    const wait = Math.min(8_000 * 1.5 ** Math.max(offlineStreak - 1, 0), 30_000);
-    if (HEALTH_BACKOFF) offlineUntilMs = Date.now() + wait;
-    if ((await loopbackPermissionState()) === "denied") return { state: "blocked", health: null };
     return { state: "offline", health: null };
   }
 }
@@ -287,14 +210,9 @@ export async function createClientShare(opts: {
 export type ClientRelayTarget = { url: string; service: string };
 
 export function clientRelayTarget(jobId: string): ClientRelayTarget {
-  return clientRelayTargetForService(inferApiService(`/api/jobs/${jobId}/evidence/client-source`));
-}
-
-/** Outbound target for a share that is not bound to a job yet (mobile image copy, V1.27.0). */
-export function clientRelayTargetForService(service: string): ClientRelayTarget {
   const path = resolveApiUrl("/api/client-agent/relay");
   const url = /^https?:\/\//i.test(path) ? path : `${consoleOrigin()}${path}`;
-  return { url, service };
+  return { url, service: inferApiService(`/api/jobs/${jobId}/evidence/client-source`) };
 }
 
 export async function revokeClientShare(shareId: string): Promise<void> {

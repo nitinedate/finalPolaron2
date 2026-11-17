@@ -760,6 +760,21 @@ def create_job(
         except Exception:
             pass
         evidence_path = (body.evidence_path or "").strip()
+        if evidence_path.startswith("mobile-transfer:"):
+            # The browser passes only the opaque verified receipt reference.
+            # Resolve it within this service, tenant and (if given) case.
+            from app.services.mobile_acquire.secure_transfer import MobileEvidenceTransfer, TransferError
+            try:
+                evidence_path = str(MobileEvidenceTransfer().resolve(
+                    evidence_path,
+                    tenant=current.tenant,
+                    platform=mobile_os,
+                    case_id=str(body.case_id) if body.case_id else None,
+                ).parent)
+            except TransferError as exc:
+                # Do not commit an unusable job with an unresolved client path.
+                db.rollback()
+                raise HTTPException(status_code=400, detail=f"Unverified mobile evidence: {exc}") from exc
         if evidence_path:
             # Do NOT list/register synchronously here: a 100 GiB phone tree on a
             # bind mount used to hold this POST for hours and surface as gateway

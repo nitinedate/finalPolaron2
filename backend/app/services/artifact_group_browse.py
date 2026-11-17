@@ -145,19 +145,6 @@ def _meta(row: dict[str, Any]) -> dict[str, Any]:
     return meta if isinstance(meta, dict) else {}
 
 
-def chat_label_sort_key(label: str) -> tuple:
-    """Letters A–Z first, then labels that start with a number."""
-    text = str(label or "").strip().casefold()
-    head = text[:1]
-    if head.isalpha():
-        rank = 0
-    elif head.isdigit():
-        rank = 1
-    else:
-        rank = 2
-    return (rank, text)
-
-
 def _normalize_label(label: str) -> str:
     s = (label or "").strip().lower()
     s = re.sub(r"\(group\)|\(deleted\)|\(recovered\)", "", s)
@@ -805,9 +792,19 @@ def group_message_rows_as_persons(
     out = list(buckets.values())
     out.sort(
         key=lambda r: (
-            *chat_label_sort_key(str((r.get("metadata") or {}).get("person_name_base") or r.get("title") or "")),
+            str((r.get("metadata") or {}).get("person_name_base") or r.get("title") or "").lower(),
             1 if (r.get("metadata") or {}).get("deleted_bucket") else 0,
+            str((r.get("metadata") or {}).get("last_timestamp") or ""),
         ),
+    )
+    # Sort contacts A→Z but keep live before [deleted] for the same name; within
+    # that, newest activity first for different contacts — re-sort by activity:
+    out.sort(
+        key=lambda r: (
+            str((r.get("metadata") or {}).get("last_timestamp") or ""),
+            int((r.get("metadata") or {}).get("message_count") or 0),
+        ),
+        reverse=True,
     )
     return out
 

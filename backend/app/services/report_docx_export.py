@@ -33,7 +33,6 @@ _USABLE_WIDTH_MM = 178  # A4 210mm minus 16mm left/right margins.
 
 
 DEFAULT_FONT_SIZE = 11.5
-_FONT = "Times New Roman"
 _DISPLAY_CONTROL_RE = re.compile(r"[​‌‍‎‏‪-‮⁠﻿]")
 
 
@@ -68,9 +67,7 @@ def _combined_header_png() -> bytes:
     """Return header artwork with the confidential seal already positioned."""
     from PIL import Image
 
-    from app.services.report_letterhead import prepare_header_png
-
-    header_raw = prepare_header_png(_asset("letterhead-header.png"))
+    header_raw = _asset("letterhead-header.png")
     if not header_raw:
         return b""
     header = Image.open(io.BytesIO(header_raw)).convert("RGBA")
@@ -211,97 +208,19 @@ def _configure_a4_section(section) -> None:
         fp_img.add_run().add_picture(io.BytesIO(footer_raw), width=Mm(210), height=Mm(26))
 
 
-def _force_rfonts(rPr, name: str = _FONT) -> None:
-    """Set a real serif face. A theme font such as Calibri wins if asciiTheme remains."""
-    r_fonts = rPr.find(qn("w:rFonts"))
-    if r_fonts is None:
-        r_fonts = OxmlElement("w:rFonts")
-        rPr.append(r_fonts)
-    for attr in ("ascii", "hAnsi", "cs", "eastAsia"):
-        r_fonts.set(qn(f"w:{attr}"), name)
-    for attr in ("asciiTheme", "hAnsiTheme", "cstheme", "eastAsiaTheme"):
-        key = qn(f"w:{attr}")
-        if key in r_fonts.attrib:
-            del r_fonts.attrib[key]
-
-
-def _force_run_font(run, name: str = _FONT) -> None:
-    run.font.name = name
-    _force_rfonts(run._element.get_or_add_rPr(), name)
-
-
-def _set_doc_defaults(doc: Document) -> None:
-    styles_el = doc.styles.element
-    defaults = styles_el.find(qn("w:docDefaults"))
-    if defaults is None:
-        defaults = OxmlElement("w:docDefaults")
-        styles_el.insert(0, defaults)
-    r_pr_default = defaults.find(qn("w:rPrDefault"))
-    if r_pr_default is None:
-        r_pr_default = OxmlElement("w:rPrDefault")
-        defaults.append(r_pr_default)
-    r_pr = r_pr_default.find(qn("w:rPr"))
-    if r_pr is None:
-        r_pr = OxmlElement("w:rPr")
-        r_pr_default.append(r_pr)
-    _force_rfonts(r_pr)
-    for tag, val in (("sz", "22"), ("szCs", "22")):
-        node = r_pr.find(qn(f"w:{tag}"))
-        if node is None:
-            node = OxmlElement(f"w:{tag}")
-            r_pr.append(node)
-        node.set(qn("w:val"), val)
-
-
-def _force_document_fonts(doc: Document) -> None:
-    """Make every run use the same serif face the PDF embeds."""
-    _set_doc_defaults(doc)
-    for style in doc.styles:
-        try:
-            style.font.name = _FONT
-            r_pr = style.element.get_or_add_rPr()
-        except Exception:
-            continue
-        _force_rfonts(r_pr)
-
-    def walk(paragraphs, tables) -> None:
-        for paragraph in paragraphs:
-            for run in paragraph.runs:
-                _force_run_font(run)
-        for table in tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    walk(cell.paragraphs, cell.tables)
-
-    walk(doc.paragraphs, doc.tables)
-    for section in doc.sections:
-        for part in (section.header, section.footer):
-            walk(part.paragraphs, part.tables)
-
-
 def _configure_styles(doc: Document) -> None:
     normal = doc.styles["Normal"]
-    normal.font.name = _FONT
-    normal.font.size = Pt(11)
-    normal.paragraph_format.space_after = Pt(6)
-    normal.paragraph_format.line_spacing = 1.15
-    _force_rfonts(normal.element.get_or_add_rPr())
+    normal.font.name = "Times New Roman"
+    normal.font.size = Pt(10.5)
+    normal.paragraph_format.space_after = Pt(4)
+    normal.paragraph_format.line_spacing = 1.08
 
-    for style_name, size in (("Title", 16), ("Heading 1", 16), ("Heading 2", 12), ("Heading 3", 12)):
+    for style_name, size in (("Title", 18), ("Heading 1", 18), ("Heading 2", 14), ("Heading 3", 11.5)):
         style = doc.styles[style_name]
-        style.font.name = _FONT
+        style.font.name = "Times New Roman"
         style.font.size = Pt(size)
         style.font.color.rgb = RGBColor.from_string(_NAVY)
         style.font.bold = True
-        _force_rfonts(style.element.get_or_add_rPr())
-    for style_name in ("List Bullet", "List Number"):
-        try:
-            style = doc.styles[style_name]
-        except KeyError:
-            continue
-        style.font.name = _FONT
-        style.font.size = Pt(11)
-        _force_rfonts(style.element.get_or_add_rPr())
 
 
 def _set_cell_shading(cell, fill: str) -> None:
@@ -427,9 +346,10 @@ def _add_table(doc: Document, header: list[str], rows: list[list[str]]) -> None:
         p.paragraph_format.space_after = Pt(0)
         run = p.add_run(header[ci] if ci < len(header) else "")
         run.bold = True
-        run.font.name = _FONT
-        run.font.size = Pt(10)
+        run.font.name = "Times New Roman"
+        run.font.size = Pt(11)
 
+    wide = cols >= 5
     for ri, row_values in enumerate(rows):
         row = table.add_row()
         _keep_row_together(row)
@@ -446,7 +366,7 @@ def _add_table(doc: Document, header: list[str], rows: list[list[str]]) -> None:
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER if widths[ci].mm < 25 else WD_ALIGN_PARAGRAPH.LEFT
             _add_inline_runs(p, row_values[ci] if ci < len(row_values) else "")
             for run in p.runs:
-                run.font.size = Pt(10)
+                run.font.size = Pt(10 if wide else 11)
 
     doc.add_paragraph().paragraph_format.space_after = Pt(2)
 
@@ -531,8 +451,8 @@ def _add_packed_tables(doc: Document, tables: list[dict[str, Any]], *, section_t
             p = doc.add_paragraph(style="Heading 3")
             _set_keep_with_next(p)
             run = p.add_run(title.upper())
-            run.font.name = _FONT
-            run.font.size = Pt(12)
+            run.font.name = "Times New Roman"
+            run.font.size = Pt(14)
             run.bold = True
             run.font.color.rgb = RGBColor.from_string("103B63")
         note = table.get("note")
@@ -719,8 +639,8 @@ def _add_section_heading(doc: Document, title: str, *, major: bool = True) -> No
     p.paragraph_format.space_before = Pt(4)
     p.paragraph_format.space_after = Pt(8)
     run = p.add_run(title.upper() if major else title)
-    run.font.name = _FONT
-    run.font.size = Pt(16 if major else 12)
+    run.font.name = "Times New Roman"
+    run.font.size = Pt(18 if major else 14)
     run.font.color.rgb = RGBColor.from_string(_NAVY)
     run.bold = True
     run.underline = True
@@ -897,8 +817,8 @@ def _add_cover(doc: Document, content: str, *, mobile: bool) -> None:
     p.paragraph_format.space_after = Pt(12)
     run = p.add_run(title)
     run.bold = True
-    run.font.name = _FONT
-    run.font.size = Pt(18)
+    run.font.name = "Times New Roman"
+    run.font.size = Pt(22)
     run.font.color.rgb = RGBColor.from_string(_NAVY)
     if subject:
         p = doc.add_paragraph()
@@ -911,8 +831,8 @@ def _add_cover(doc: Document, content: str, *, mobile: bool) -> None:
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     r = p.add_run(company)
     r.bold = True
-    r.font.name = _FONT
-    r.font.size = Pt(14)
+    r.font.name = "Times New Roman"
+    r.font.size = Pt(13)
 
 
 def _add_artifact_summary_section(doc: Document, section: dict) -> bool:
@@ -944,7 +864,7 @@ def _add_artifact_summary_section(doc: Document, section: dict) -> bool:
         gp.paragraph_format.space_after = Pt(6)
         gr = gp.add_run(f"{gi}. {_display_artifact_group_title(group.get('title') or 'Artifacts')}:")
         gr.bold = True
-        gr.font.size = Pt(13)
+        gr.font.size = Pt(14)
         gr.font.name = "Times New Roman"
         try:
             gr.font.color.rgb = RGBColor(47, 111, 178)
@@ -1007,7 +927,7 @@ def build_report_docx(
 
     section_map = {str(s.get("section_key")): s for s in sections}
     keys = list(order or section_map.keys())
-    opened = False
+    first_content = True
     hidden = {"limitations"} | ({"evidence_details"} if not mobile else set())
 
     for key in keys:
@@ -1020,14 +940,14 @@ def build_report_docx(
         from app.services.source_coverage import strip_source_coverage_from_report
         content = strip_source_coverage_from_report(strip_redundant_section_heading(sec.get("content_md") or "", title))
 
-        # The PDF starts every major heading on its own page. The cover is the first page.
-        if opened:
-            doc.add_page_break()
-        opened = True
-
         if key == "cover_page":
             _add_cover(doc, content, mobile=mobile)
+            doc.add_page_break()
+            first_content = False
             continue
+
+        # Later sections stay on the open page when it still has room.
+        first_content = False
 
         # Use the report's formal section labels, not internal key names.  Introduction
         # is a reference-trained formal letter, not a generic markdown section.
@@ -1103,7 +1023,6 @@ def build_report_docx(
     doc.core_properties.subject = "Digital forensic examination report"
     doc.core_properties.author = "POLARON TECHNOLOGIES PVT. LTD."
     doc.core_properties.keywords = "forensic, digital evidence, report"
-    _force_document_fonts(doc)
 
     buf = io.BytesIO()
     doc.save(buf)

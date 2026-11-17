@@ -7,23 +7,10 @@ on every launch and retain Docker's dependency cache.
 | --- | --- | --- | --- |
 | `start_docker_local.cmd` | `http://localhost:3000/` and `http://localhost:3001/` | None required for local HTTP | None; gateway binds to loopback |
 | `start_docker_nitin.cmd` | `https://future-softtech.co.in/` and `https://122.179.140.167/` by default | Separate trusted domain and IP certificates | TCP 80 and 443 |
-| `start_docker_prod.cmd` | `https://<PUBLIC_HTTPS_IP>/` and, when set, `https://<PUBLIC_HTTPS_DOMAIN>/` (root `.env`) | Trusted IP certificate; domain certificate only when a domain is set | TCP 80 and 443 |
+| `start_docker_prod.cmd` | `https://122.179.141.248/` by default | Trusted IP certificate; no domain required | TCP 80 and 443 |
 
-The public address is configuration, not automatic detection of your ISP
-address. For `start_docker_prod.cmd` set it in the root `.env` (V1.29):
-
-```ini
-PUBLIC_HTTPS_IP=122.179.141.248      # static public IPv4 of this server (required)
-PUBLIC_HTTPS_DOMAIN=                 # optional; empty = HTTPS on the IP only
-PUBLIC_HTTPS_EMAIL=admin@your-company.com   # Let's Encrypt notices; asked once if empty
-```
-
-With a domain, both `https://<IP>/` and `https://<domain>/` work, each with its
-own trusted certificate; plain HTTP redirects to HTTPS on whichever of the two
-was typed. Without a domain only the IP is served. While `PUBLIC_HTTPS_IP` is
-empty, the `prod` entry of `script_docker/start_docker.settings.json` is used as
-before (the launcher then prints the `.env` lines to add). `start_docker_nitin.cmd`
-keeps using its settings-file entry.
+Both public addresses are editable defaults, not automatic detection of your
+ISP address. Set the actual public static IP for each Windows machine.
 
 ## Install and launch
 
@@ -45,11 +32,9 @@ keeps using its settings-file entry.
    inbound ports in Windows Firewall. Running the launcher as Administrator
    creates the named firewall rules. The ISP must allow inbound public TCP 80
    for certificate validation and renewal.
-5. When a domain is used (always for Nitin, optional `PUBLIC_HTTPS_DOMAIN` for
-   production), its public DNS A record must point to the static IP. Any AAAA
-   record must also reach the challenge-serving host. If the domain certificate
-   cannot be issued yet (DNS not ready), production starts HTTPS on the IP only,
-   prints the reason, and adds the domain on a later launch.
+5. For Nitin, the configured domain's DNS A record must point to the configured
+   static IP. Any AAAA record must also reach the challenge-serving host.
+   Production does not require DNS.
 
 Run one profile from PowerShell:
 
@@ -68,16 +53,17 @@ Set-Location E:\polaron-forensic
 .\script_docker\start_docker_prod.cmd
 ```
 
-On the first public launch without an email (`PUBLIC_HTTPS_EMAIL`, `-AcmeEmail`
-or `CERTBOT_EMAIL`), enter the email address for Let's Encrypt; it is saved in
-`script_docker/start_docker.settings.json`. The launcher never rewrites `.env`.
-Values that come from `.env` are not copied into the settings file.
+On the first public launch, enter the email address for Let's Encrypt.
+The selected host settings and email are saved in
+`script_docker/start_docker.settings.json`; later launches reuse them. You can
+edit that automatically created file or copy `start_docker.settings.example.json` and edit its
+`nitin` and `prod` settings before starting. Keep `prod.domain` empty.
 
-Arguments override `.env` and the settings file for that launch (they are saved
-to the settings file only when `.env` does not set that value):
+To use different host settings, replace the placeholders below with your real
+values. Arguments override saved settings and are saved for future launches:
 
 ```powershell
-.\script_docker\start_docker_prod.cmd -PublicIP "YOUR_STATIC_PUBLIC_IP" -Domain "your-domain.example" -AcmeEmail "admin@your-company.com"
+.\script_docker\start_docker_prod.cmd -PublicIP "YOUR_STATIC_PUBLIC_IP" -AcmeEmail "admin@your-company.com"
 .\script_docker\start_docker_nitin.cmd -PublicIP "YOUR_STATIC_PUBLIC_IP" -Domain "your-domain.example" -AcmeEmail "admin@your-company.com"
 ```
 
@@ -94,27 +80,6 @@ in automated runs. Failures propagate a nonzero exit code.
 | Unified, Android and iOS UIs | Three fresh TypeScript/Vite builds | One shared `npm ci` layer from `package-lock.json`; npm downloads are cached |
 | Database, Redis, MinIO, nginx and scanner vendor images | Existing images reused; missing images pulled | Update deliberately during maintenance |
 | Certificates | Existing ACME lineages reused; Certbot renews only when due | New certificate issued for a new IP/domain or required renewal |
-
-**Installed libraries are reused, not reinstalled (V1.29.1).** Each library stage has its own image:
-- `aetheris-backend-deps`: CUDA, apt, PyTorch and the Python requirements;
-- `aetheris-malware-deps`;
-- `aetheris-scanner-deps`;
-- `aetheris-frontend-deps`: `npm ci`.
-
-Each image is labeled with a fingerprint of what it installs: its Dockerfile stage, the requirement files and
-`TORCH_INDEX_URL`. When the fingerprint matches, the launcher reuses the image and the application images are
-built `FROM` it. No apt, pip or npm step runs, even after Docker Desktop pruned its build cache (which is what
-made earlier launches download PyTorch/cuDNN again).
-
-An image built by an earlier release is checked and reused once by labeling it. The check is read-only:
-- same base image layers;
-- the same `RUN` steps in its history;
-- byte-identical requirement files;
-- the same Trivy version for the scanner.
-
-Libraries are installed only when a requirement file or a library stage of a Dockerfile changes, or with
-`-RefreshDependencies`. Other builders than Docker Desktop's default `docker` driver keep the previous
-cache-based behaviour.
 
 The first build of the updated Dockerfiles installs any missing or newly
 changed dependencies. Later launches keep those layers cached. Removing Docker
@@ -140,54 +105,6 @@ Ordinary launches never set `--no-cache` or `--pull` for application builds.
 The legacy positional `cache` option now means the ordinary cached mode.
 `nocache`, `no-cache` and `-NoCache` remain explicit maintenance aliases.
 
-## Caddy already on this server (V1.30)
-
-If Caddy already serves TCP 80/443 on the Windows server, Polaron joins it instead of starting its own
-HTTPS gateway. Set `PUBLIC_HTTPS_PROXY=caddy` in `.env`; the default `auto` does this whenever a Caddy
-process holds TCP 80/443. Then `start_docker_prod.cmd`:
-
-1. finds the running Caddy and the Caddyfile it uses, from the Caddy process's `--config` or from
-   `CADDY_EXE` / `CADDY_CONFIG` in `.env`;
-2. writes `polaron.caddy` next to that Caddyfile, with a site for `https://<PUBLIC_HTTPS_IP>` and, when set,
-   `https://<PUBLIC_HTTPS_DOMAIN>`. Both proxy to the Polaron gateway on `127.0.0.1:3001`;
-3. appends one line to the Caddyfile, `import polaron*.caddy`, and keeps a backup
-   (`Caddyfile.polaron-backup-<time>`). Because the import is a glob, a deleted `polaron.caddy` never stops
-   Caddy from starting;
-4. runs `caddy validate`, then `caddy reload`. Caddy's other sites keep running. If Caddy rejects the
-   config (for example, another site already uses the same IP) or the reload fails, both files are
-   restored, Caddy keeps its current config and startup stops **before** any Polaron container is
-   stopped;
-5. starts the Polaron gateway on loopback only (`127.0.0.1:3000/3001`) and removes Polaron's own Certbot
-   containers.
-
-**Certificates:** Caddy obtains and renews them.
-- **IP:** a Let's Encrypt short-lived certificate (`profile shortlived`), using HTTP-01 on Caddy's TCP 80.
-  It needs Caddy 2.10 or later; 2.11 or later is recommended.
-- **Domain:** Caddy's default certificate.
-
-**Settings:** `CADDY_MANAGE_CONFIG=false` writes `deployment/caddy/polaron.caddy` only and leaves Caddy
-untouched, for administrators who edit Caddy themselves. `PUBLIC_HTTPS_PROXY=builtin` uses Polaron's own
-nginx and Certbot on TCP 80/443.
-
-**Caddy not running (V1.31.1).** `caddy reload` needs a running Caddy (its admin API, `localhost:2019` by
-default). When nothing listens on TCP 80/443 and the admin API does not answer, the launcher starts Caddy
-once the new Caddyfile has passed `caddy validate`, then reloads:
-- **Windows service** for Caddy (sc.exe, WinSW or NSSM): started. A service set to *Manual* gets a warning,
-  because it stays stopped after a reboot (`Set-Service -Name caddy -StartupType Automatic`).
-- **Scheduled task** that runs Caddy: run.
-- **Neither:** `caddy.exe run --config <CADDY_CONFIG> --adapter caddyfile` in its own hidden console, with
-  its log in `deployment\caddy\caddy-background.log`. It keeps running when the launcher window closes,
-  but not after a reboot or sign-out. `CADDY_AUTOSTART=service` registers the Windows service `caddy`
-  (automatic start, restart on crash) instead.
-- **TCP 80/443 held by another program** (IIS/http.sys, another web server, a container): startup stops
-  and names it. Polaron's own builtin-mode gateway is the exception: it is stopped so Caddy can listen,
-  and started again if Caddy fails.
-- A Caddyfile with `admin off` is reported before anything is changed.
-
-If Polaron's sites cannot be added, everything is put back: both files are restored, the Caddy that was
-started is stopped again (a service it registered is removed), and Polaron's own gateway is restarted.
-`CADDY_AUTOSTART=off` turns this off; `CADDY_START_SECONDS` (default 45) is how long the launcher waits.
-
 ## HTTPS and renewal
 
 The public profiles use pinned **Certbot v5.8.0** in Linux Docker and the
@@ -196,17 +113,6 @@ the required `shortlived` profile. IP certificates last about six days, so
 the `certbot-renewer` service checks renewal every six hours and reloads nginx
 only after successful renewal. It shares nginx's PID namespace and does not
 mount the Docker socket.
-
-`certbot-renewer` renews only the certificates the gateway serves
-(`AETHERIS_CERT_NAMES`, set by the launcher): a certificate for an old IP or a
-removed domain left in the volume is no longer retried every six hours. Domain
-certificates last 90 days and also renew automatically. Both the IP and the
-domain renew one at a time, so one failing identity never blocks the other.
-
-A launch whose certificates have more than 36 hours left needs no HTTP-01
-challenge: the gateway is recreated with the new frontend and the renewer is
-restarted, without pausing TCP 80. Emailed activation, reset and login links use
-`https://<domain, or IP>` while `APP_BASE_URL` in `.env` is a localhost address.
 
 The first acquisition uses an HTTP-only bootstrap on TCP 80 if the current
 gateway cannot already serve the ACME webroot. The bootstrap is removed before
@@ -224,9 +130,8 @@ the public IP/domain identity without disabling TLS verification. It also verifi
 the gateway's proxied backend health endpoint. Windows overrides keep Docker
 Desktop's native `host.docker.internal` routing.
 
-Public HTTP redirects to HTTPS on the IP or domain that was requested while
-retaining the HTTP-01 challenge location. The HTTPS gateway uses the same routes
-and readable "API not reachable" errors as the local gateway. Infrastructure/API ports remain loopback-bound.
+Public HTTP redirects to the configured HTTPS identity while retaining the
+HTTP-01 challenge location. Infrastructure/API ports remain loopback-bound.
 For public profiles, compact Android/iOS UIs also bind to loopback; users
 access mobile pages through the unified HTTPS website.
 

@@ -27,12 +27,6 @@ def extract(name, filename, namespace):
     return namespace[name]
 
 
-def _v128_tar_source():
-    """The real V1.28.0 buffered tar source, extracted the same way as the function under test."""
-    namespace = {"io": __import__("io"), "_TAR_RECORD_BUFSIZE": 64 * 1024}
-    return extract("_tar_source", "tar_cache.py", namespace)
-
-
 def test_parallel_parse_persists_fast_files_while_slow_file_works():
     completed = []
     commits = []
@@ -269,9 +263,6 @@ def test_streaming_headers_validate_full_sha256_and_size_before_use():
         open_object_stream=lambda part: (opens.append(part) or io.BytesIO(payload)),
         zstd=SimpleNamespace(ZstdDecompressor=lambda: SimpleNamespace(stream_reader=lambda obj: nullcontext(obj))),
         tarfile=tarfile,
-        # V1.28.0 helpers: the seekable part cache is off here, so this exercises the streaming path.
-        _acquire_cached_part=lambda part: None,
-        _tar_source=_v128_tar_source(),
     )
     fn=extract('iter_files_from_part','tar_cache.py',namespace)
     result = dict(fn('part.tar.zst', {'ok.bin','bad.bin','missing.bin'},
@@ -304,8 +295,6 @@ def test_shard_scan_reports_bytes_while_skipping_other_members():
         open_object_stream=lambda part: io.BytesIO(payload),
         zstd=SimpleNamespace(ZstdDecompressor=lambda: SimpleNamespace(stream_reader=lambda obj, **_kw: nullcontext(obj))),
         tarfile=tarfile,
-        _acquire_cached_part=lambda part: None,
-        _tar_source=_v128_tar_source(),
     )
     fn = extract('iter_files_from_part', 'tar_cache.py', namespace)
     found = dict(fn('part.tar.zst', {'keep.bin'}, max_bytes_by_path={'keep.bin': 4096}, on_detail=details.append))

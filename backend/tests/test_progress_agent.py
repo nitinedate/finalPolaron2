@@ -47,7 +47,6 @@ def stage(**overrides):
     (stage(operation_deadline=NOW-timedelta(seconds=120), operation='Counting image and video files', total_items=10, completed_items=0), 'cancel'),
     (stage(operation_deadline=NOW-timedelta(seconds=120), operation='Frame evidence persisted', total_items=10, completed_items=10), 'valid_wait'),
     (stage(status='queued',updated_at=NOW-timedelta(seconds=59)),'valid_wait'),
-    (stage(stage='graph',status='waiting',updated_at=NOW-timedelta(seconds=120),error='Neo4j unavailable; graph synchronization remains pending'),'skip_optional'),
     (stage(status='waiting',updated_at=NOW-timedelta(seconds=61),error='GPU lease capacity unavailable'),'retry_dependency'),
     (stage(status='waiting',updated_at=NOW-timedelta(seconds=120),error='OCR quality triage has not completed: Quality triage producer is still writing in'),'retry_dependency'),
     (stage(status='waiting',updated_at=NOW-timedelta(seconds=120),error='Parsing made no progress; remaining evidence claims must finish (pending=12, claimed=2)'),'retry_dependency'),

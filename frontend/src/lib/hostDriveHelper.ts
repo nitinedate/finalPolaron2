@@ -29,14 +29,6 @@ export type HostDriveHelperHealth = {
   service?: string;
   port?: number;
   busy?: boolean;
-  helper_version?: string;
-  /** Windows computer name of the PC running this helper (helper 5.58+). */
-  computer_name?: string;
-  /** Helper 5.58+: can store an image copied from a client PC. */
-  client_import?: boolean;
-  root?: string;
-  /** Helper 5.63+: whether the Client Evidence Agent answers on this computer (port 9877). */
-  client_agent_running?: boolean;
 };
 
 export type RefreshDriveMountsResult = {
@@ -114,8 +106,6 @@ export type HostMobileDevice = {
   live_acquire?: boolean;
   capability_label?: string;
   guidance?: string;
-  /** Helper 5.62+: "charging_only" or "driver_missing" for a phone that is plugged in but not usable yet. */
-  state?: string;
   ios_backup_roots?: string[];
   attach_host?: MobileAttachHost | string;
 };
@@ -147,12 +137,6 @@ export type HostDriveLettersResult = {
   message?: string;
   /** V1.10.10: helper online but its list was unavailable; only startup-mounted drives are shown */
   partial?: boolean;
-  /** V1.31.3: false when the list is frozen at the drives Docker mounted at startup (helper unreachable). */
-  live?: boolean;
-  /** V1.31.3: why the forensic server's containers cannot reach the workstation helper. */
-  helper_error?: string | null;
-  helper_errors?: string[];
-  start_hint?: string | null;
 };
 
 export type HostMobileDevicesResult = {
@@ -178,19 +162,7 @@ export function invalidateHelperHealthCache(): void {
   probeInFlight = null;
 }
 
-/** The last full /health answer (not the short cached "online" marker), with when it was read. */
-let lastFullHealth: { health: HostDriveHelperHealth; at: number } | null = null;
-
-/** V1.31.8: the helper's own /health, if one was read within maxAgeMs. */
-export function lastFullHelperHealth(maxAgeMs = 15_000): HostDriveHelperHealth | null {
-  if (!lastFullHealth || Date.now() - lastFullHealth.at > maxAgeMs) return null;
-  return lastFullHealth.health;
-}
-
 function markOnline(health: HostDriveHelperHealth): HostDriveHelperHealth {
-  if (health.helper_version !== undefined || health.port !== undefined || health.root !== undefined) {
-    lastFullHealth = { health, at: Date.now() };
-  }
   reachability = "online";
   offlineStreak = 0;
   offlineUntilMs = 0;
@@ -199,7 +171,6 @@ function markOnline(health: HostDriveHelperHealth): HostDriveHelperHealth {
 }
 
 function markOffline(): null {
-  lastFullHealth = null;
   reachability = "offline";
   onlineUntilMs = 0;
   offlineStreak += 1;
@@ -224,27 +195,6 @@ async function probeHelperHealth(timeoutMs: number): Promise<HostDriveHelperHeal
     return markOnline(health);
   } catch {
     return markOffline();
-  }
-}
-
-/**
- * Full /health of the helper on *this* PC (127.0.0.1), bypassing the reachability cache.
- * Used to tell whether this PC is the forensic server or a client workstation.
- */
-export async function getLocalHelperIdentity(timeoutMs = 2_500): Promise<HostDriveHelperHealth | null> {
-  try {
-    const res = await fetch(`${HELPER_BASE}/health`, {
-      method: "GET",
-      headers: helperHeaders(),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (!res.ok) return null;
-    const health = (await res.json()) as HostDriveHelperHealth;
-    if (!health?.ok) return null;
-    markOnline(health);
-    return health;
-  } catch {
-    return null;
   }
 }
 
@@ -329,53 +279,24 @@ export type HostAcquisitionDevice = {
   connection?: string;
   instance_id?: string;
   attach_host?: MobileAttachHost | string;
-  /** What to do on the phone before it can be collected (helper 5.62+). */
-  guidance?: string;
-  state?: string;
 };
-
-/** Helper 5.62+ lists an Android phone that is plugged in but not usable yet under this adapter. */
-export const PHONE_NEEDS_ACTION_ADAPTER = "android_usb";
-
-const NEEDS_ACTION_STATES = new Set(["charging_only", "driver_missing", "needs_action"]);
-
-/** True for a phone that is on the cable but cannot be collected until something is done on it. */
-export function deviceNeedsPhoneAction(device: {
-  adapter?: string;
-  status?: string;
-  state?: string;
-  connection?: string;
-}): boolean {
-  if (device.adapter === PHONE_NEEDS_ACTION_ADAPTER) return true;
-  if (device.connection === "usb" && NEEDS_ACTION_STATES.has(String(device.state || device.status || ""))) return true;
-  return false;
-}
-
-/** Short status shown on the card of a phone that needs something done on it. */
-export function phoneActionLabel(device: { status?: string; state?: string }): string {
-  const state = String(device.state || device.status || "");
-  if (state === "driver_missing") return "No Windows driver for its USB mode";
-  return "Connected for charging only";
-}
 
 export function hostMobileToAcquisitionDevice(
   device: HostMobileDevice,
   attachHost?: MobileAttachHost | string,
-): HostAcquisitionDevice {
+): HostAcquisitionDevice | null {
   const os = device.os_hint === "ios" ? "ios" : device.os_hint === "android" ? "android" : "other";
-  const needsAction = os !== "ios" && device.connection === "usb" && Boolean(device.state);
-  const adb = os !== "ios" && device.connection === "adb";
+  // Unsupported/unknown USB classes must NEVER be relabelled as Android.
+  if (os === "other") return null;
   return {
-    // V1.31.9: a USB-debugging phone is android_adb in both helper lists, so it is shown once.
-    adapter: os === "ios" ? "ios_lockdown" : needsAction ? PHONE_NEEDS_ACTION_ADAPTER : adb ? "android_adb" : "android_mtp",
+    adapter: os === "ios" ? "ios_lockdown" : "android_mtp",
     device_id: device.id,
     label: device.name,
-    status: needsAction ? device.state : adb ? "adb" : device.connection || "usb",
+    status: device.connection || "usb",
     os_family: os,
     connection: device.connection,
     instance_id: device.instance_id,
     attach_host: attachHost || device.attach_host,
-    ...(needsAction ? { guidance: device.guidance, state: device.state } : {}),
   };
 }
 
@@ -457,88 +378,11 @@ async function fromOfficeApiAcquisitionDevices(timeoutMs: number): Promise<{
   }
 }
 
-/** Oldest workstation helper whose phone list is trusted: it follows the cables (5.61) and recognises every
- * Android USB mode (5.62). An older helper can keep showing an unplugged phone and miss an Android phone,
- * so the page does not show its list (V1.31.8). */
-export const REQUIRED_HELPER_VERSION = "5.62";
-
-/** Compare dotted helper versions ("5.61" < "5.62" < "5.100"). Missing parts count as 0. */
-export function compareHelperVersions(a: string | null | undefined, b: string | null | undefined): number {
-  const pa = String(a || "").split(".").map((x) => Number.parseInt(x, 10) || 0);
-  const pb = String(b || "").split(".").map((x) => Number.parseInt(x, 10) || 0);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) {
-    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
-    if (d !== 0) return d < 0 ? -1 : 1;
-  }
-  return 0;
-}
-
-/** True when this computer's helper is too old for its phone list to be trusted (full /health answers only). */
-export function isHelperOutdated(health: HostDriveHelperHealth | null | undefined): boolean {
-  if (!health?.ok) return false;
-  const version = String(health.helper_version || "").trim();
-  if (version) return compareHelperVersions(version, REQUIRED_HELPER_VERSION) < 0;
-  // No version: only a full /health answer (not the short cached "online" marker) means an old helper.
-  return health.root !== undefined || health.port !== undefined;
-}
-
-/** V1.31.7/V1.31.8: why this computer's phones are not listed while its helper is outdated, and the fix. */
-export function helperVersionWarning(health: HostDriveHelperHealth | null | undefined): string | null {
-  if (!isHelperOutdated(health)) return null;
-  const version = String(health?.helper_version || "").trim();
-  return (
-    `The Polaron helper on this computer is ${version ? `version ${version}` : "an older version"}, too old to ` +
-    "report which phones are plugged in here (it can keep showing a phone that was unplugged and miss an Android " +
-    "phone), so its phone list is not shown. Click Update this computer, open the downloaded file, then Rescan. " +
-    "From then on this computer updates itself from the server."
-  );
-}
-
-/** How old this computer's phone list may be before the page says it is not updating (helper 5.61 refreshes every 10-15 s). */
-export const DEVICE_LIST_STALE_MS = 120_000;
-
-/** V1.31.9: true when the list says when it was read and that is longer ago than DEVICE_LIST_STALE_MS. */
-export function isDeviceListStale(data: { scanned_utc?: string }, now: number = Date.now()): boolean {
-  const scanned = data.scanned_utc ? Date.parse(data.scanned_utc) : NaN;
-  return Number.isFinite(scanned) && now - scanned > DEVICE_LIST_STALE_MS;
-}
-
-/**
- * V1.31.6: the workstation helper serves its phone list from a cache refreshed in the background.
- * Say so when that list is old (the watcher stopped) or read in a reduced way, instead of showing an
- * unplugged phone as connected without comment.
- */
-export function deviceListFreshnessWarnings(
-  data: { scanned_utc?: string; note?: string },
-  now: number = Date.now(),
-): string[] {
-  const out: string[] = [];
-  const scanned = data.scanned_utc ? Date.parse(data.scanned_utc) : NaN;
-  if (isDeviceListStale(data, now)) {
-    const minutes = Math.max(2, Math.round((now - scanned) / 60_000));
-    const at = new Date(scanned).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    out.push(
-      `This computer's phone list was last read at ${at} (${minutes} min ago) and is not updating, so its phones are not shown: a phone plugged in since then would be missing, and an unplugged one may still be listed. ` +
-        "Update this computer (the helper there reads the phones live from 5.64), or restart the workstation helper on this computer (scripts\\ensure-host-drive-helper.ps1 -ForceRestart), but not while a collection is running.",
-    );
-  }
-  if (data.note) out.push(data.note);
-  return out;
-}
-
-export type LocalHelperState = {
-  version: string;
-  outdated: boolean;
-  /** V1.31.9: its list is older than DEVICE_LIST_STALE_MS, so its phones are not shown. */
-  stale?: boolean;
-};
-
 async function fromLocalHelperAcquisitionDevices(timeoutMs: number): Promise<{
   ok: boolean;
   devices: HostAcquisitionDevice[];
   warnings: string[];
   error?: string;
-  helper?: LocalHelperState;
 }> {
   const health = await hostDriveHelperHealth(2_000, { force: true });
   if (!health?.ok) return { ok: false, devices: [], warnings: [], error: "Host drive helper is offline" };
@@ -553,22 +397,12 @@ async function fromLocalHelperAcquisitionDevices(timeoutMs: number): Promise<{
       devices?: HostAcquisitionDevice[];
       warnings?: string[];
       error?: string;
-      scanned_utc?: string;
-      source?: string;
-      note?: string;
     };
-    const outdated = isHelperOutdated(health);
-    const stale = !outdated && isDeviceListStale(data);
     return {
       ok: Boolean(res.ok && data.ok !== false),
-      // V1.31.8: an outdated helper's list is not shown (it kept showing an unplugged iPhone).
-      // V1.31.9: nor a list that stopped updating (it showed "ADB Device" with nothing plugged in).
-      devices: outdated || stale ? [] : tagAttachHost(data.devices ?? [], "this_pc"),
-      warnings: outdated
-        ? [helperVersionWarning(health) as string]
-        : [...(data.warnings ?? []), ...deviceListFreshnessWarnings(data)],
+      devices: tagAttachHost(data.devices ?? [], "this_pc"),
+      warnings: data.warnings ?? [],
       error: data.error,
-      helper: { version: String(health.helper_version || ""), outdated, stale },
     };
   } catch (e: unknown) {
     return { ok: false, devices: [], warnings: [], error: e instanceof Error ? e.message : "Host device scan failed" };
@@ -581,8 +415,6 @@ export async function getHostAcquisitionDevices(timeoutMs = 20_000): Promise<{
   devices: HostAcquisitionDevice[];
   warnings: string[];
   error?: string;
-  /** This computer's helper: its version, and whether it is too old to list phones (null = not running). */
-  local_helper: LocalHelperState | null;
 }> {
   const [office, local] = await Promise.all([
     fromOfficeApiAcquisitionDevices(timeoutMs),
@@ -596,7 +428,6 @@ export async function getHostAcquisitionDevices(timeoutMs = 20_000): Promise<{
     devices,
     warnings,
     error: ok ? undefined : local.error || office?.error,
-    local_helper: local.helper ?? null,
   };
 }
 
@@ -816,19 +647,11 @@ export type HostDirectoryEntry = {
   size_bytes?: number | null;
 };
 
-export type HostOmittedEntry = {
-  name: string;
-  reason: string;
-  detail?: string;
-};
-
 export type HostDirectoryResult = {
   ok: boolean;
   path?: string | null;
   count?: number;
   entries?: HostDirectoryEntry[];
-  /** Directories Windows could see but could not open. */
-  omitted?: HostOmittedEntry[];
   error?: string;
   source?: string;
   healed?: boolean;
@@ -957,9 +780,7 @@ export async function listHostMobileDevices(timeoutMs = 4000): Promise<HostMobil
   const office = await fromOfficeApiMobileDevices(timeoutMs);
   const online = await hostDriveHelperHealth(1500);
   let local: HostMobileDevicesResult | null = null;
-  // V1.31.8: an outdated helper's phone list is not shown (see helperVersionWarning).
-  const full = online?.ok ? lastFullHelperHealth(60_000) ?? (await getLocalHelperIdentity(2_000)) : null;
-  if (online?.ok && !isHelperOutdated(full)) {
+  if (online?.ok) {
     try {
       const res = await fetch(`${HELPER_BASE}/mobile-devices`, {
         method: "GET",

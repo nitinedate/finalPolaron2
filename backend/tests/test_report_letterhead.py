@@ -6,7 +6,6 @@ from PIL import Image
 from app.services.report_letterhead import (
     apply_forensic_letterhead,
     flatten_letterhead_band,
-    prepare_header_png,
     white_letterhead_png,
 )
 
@@ -63,36 +62,6 @@ def test_letterhead_assets_have_white_paper():
             chroma = max(red, green, blue) - min(red, green, blue)
             if chroma < 14:
                 assert min(red, green, blue) >= 250, (name, x, y, (red, green, blue))
-
-
-def test_prepared_header_shrinks_the_logo_and_keeps_a_left_margin():
-    root = Path(__file__).resolve().parents[1] / "app" / "static" / "report"
-    raw = (root / "letterhead-header.png").read_bytes()
-    source = Image.open(BytesIO(raw)).convert("RGB")
-    prepared = Image.open(BytesIO(prepare_header_png(raw))).convert("RGB")
-    width, height = prepared.size
-
-    def first_ink(image: Image.Image) -> int:
-        pixels = image.load()
-        for x in range(image.size[0]):
-            for y in range(image.size[1]):
-                if min(pixels[x, y]) < 245:
-                    return x
-        return image.size[0]
-
-    def logo_width(image: Image.Image) -> int:
-        pixels = image.load()
-        cols = [
-            x
-            for x in range(image.size[0] // 2)
-            if any(min(pixels[x, y]) < 245 for y in range(image.size[1]))
-        ]
-        return (cols[-1] - cols[0] + 1) if cols else 0
-
-    assert first_ink(prepared) >= int(width * 0.06)
-    assert first_ink(prepared) > first_ink(source)
-    assert logo_width(prepared) < logo_width(source)
-    assert abs((width / height) - (210 / 44)) < 0.05
 
 
 def test_white_letterhead_png_keeps_safe_left_and_right_margins():

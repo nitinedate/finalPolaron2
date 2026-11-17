@@ -1,0 +1,19 @@
+Polaron V1.31.10 - cumulative list for POLARON_V1_31_10_UPDATED_FILES.zip (V1.31.0 to V1.31.10)
+
+V1.31.10 (this update; copy onto the computer that runs the launcher)
+  scripts/ensure_host_surya.ps1                    App Control block of llama-server.exe -> the same llama.cpp
+                                                   server in Docker (polaron-surya-ocr, ghcr.io/ggml-org/llama.cpp
+                                                   server-cuda or server), remembered in surya-runtime.json;
+                                                   SURYA_HOST_RUNTIME, SURYA_DOCKER_IMAGE, SURYA_DOCKER_GPU
+  scripts/align_surya_env.ps1                      passes the .env SURYA_* host settings to the manager
+  script_docker/start_docker.ps1                   an OCR failure no longer stops the launch (SURYA_REQUIRED=true
+                                                   keeps the old behaviour); OCR state shown next to READY
+  .env.example                                     SURYA_HOST_RUNTIME=auto, SURYA_REQUIRED=false
+  backend/tests/test_surya_host_bootstrap.py       argument list updated; Docker fallback wiring test
+  tests/surya_app_control_checks.ps1               20 checks (new)
+  RELEASE_V1_31_10_SURYA_APP_CONTROL.md, CHANGED_FILES_V1_31_10.txt
+  recovery-snapshots/pre-v1.31.10-surya-app-control-20261117/  the V1.31.9 versions of the changed files
+
+Earlier: CHANGED_FILES_V1_31_9.txt, _V1_31_8, _V1_31_7, _V1_31_6, _V1_31_5, _V1_31_4, _V1_31_3, _V1_31_2.
+
+Not in the ZIP: .env (optional: add SURYA_HOST_RUNTIME=auto and SURYA_REQUIRED=false; both are the defaults)

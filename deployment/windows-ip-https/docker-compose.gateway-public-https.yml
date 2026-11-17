@@ -59,9 +59,6 @@ services:
       - certbot_etc:/etc/letsencrypt
       - certbot_www:/var/www/certbot
       - ./script_docker:/tools:ro
-    environment:
-      # Set by start_docker.ps1 to the certificates the gateway serves; empty renews all.
-      AETHERIS_CERT_NAMES: ${AETHERIS_CERT_NAMES:-}
     entrypoint: ["/bin/sh", "/tools/renew-certificates.sh"]
 
 volumes:

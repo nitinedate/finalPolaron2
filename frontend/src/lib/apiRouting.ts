@@ -113,10 +113,7 @@ export function inferApiService(path: string, explicit?: ApiService): ApiService
     if (pinned) return pinned;
   }
   if (path.startsWith("/api/acquisition")) return browserRouteService() || configuredMobileService() || "mobile-android";
-  if (
-    path.startsWith("/api/jobs") || path.startsWith("/api/reports") || path.startsWith("/api/cases") ||
-    path.startsWith("/api/hostdrive") || path.startsWith("/api/client-kit")
-  ) {
+  if (path.startsWith("/api/jobs") || path.startsWith("/api/reports") || path.startsWith("/api/cases") || path.startsWith("/api/hostdrive")) {
     return browserRouteService() || configuredMobileService() || "forensic";
   }
   return configuredMobileService() || "forensic";

@@ -365,32 +365,6 @@ def load_gap_finding_inventory(db, case_id: str, scan_job_id: str | None = None)
     return _finding_inventory_from_rows(_load_open_finding_rows(db, case_id, scan_job_id))
 
 
-def omit_low_from_download(inventory: dict[str, Any]) -> dict[str, Any]:
-    """PDF and Word downloads do not include Low findings. The case screen still does."""
-    findings = [
-        row for row in (inventory.get("findings") or [])
-        if str(row.get("risk") or "") != "Low"
-    ]
-    summary = dict(inventory.get("finding_summary") or {})
-    try:
-        low = int(summary.get("Low") or 0)
-    except (TypeError, ValueError):
-        low = 0
-    if low or "Low" in summary:
-        summary["Low"] = 0
-    if "total" in summary:
-        try:
-            summary["total"] = max(0, int(summary.get("total") or 0) - low)
-        except (TypeError, ValueError):
-            pass
-    if "actionable" in summary:
-        try:
-            summary["actionable"] = max(0, int(summary.get("actionable") or 0) - low)
-        except (TypeError, ValueError):
-            pass
-    return {**inventory, "findings": findings, "finding_summary": summary}
-
-
 def load_grouped_findings(db, case_id: str) -> list[dict[str, Any]]:
     return load_gap_finding_inventory(db, case_id)["findings"]
 
@@ -582,7 +556,7 @@ def build_gap_report_context(
         _apply_derived_site_facts(db, case_id, site, scan_job_id)
     else:
         _apply_derived_site_facts(db, case_id, site)
-    inventory = omit_low_from_download(load_gap_finding_inventory(db, case_id, **job_kw(scan_job_id)))
+    inventory = load_gap_finding_inventory(db, case_id, **job_kw(scan_job_id))
     findings = inventory["findings"]
     client = site.get("client_name") or case_row.get("title") or "Client"
     if findings:
@@ -1431,12 +1405,12 @@ def build_merged_gap_report_context(
         if jid:
             assessment_states.append(load_case_scan_assessment(db, cid, jid))
             service_coverage_jobs.extend(load_service_coverage(db, case_id=cid, scan_job_id=jid))
-            inventory = omit_low_from_download(load_gap_finding_inventory(db, cid, jid))
+            inventory = load_gap_finding_inventory(db, cid, jid)
         else:
             assessment_states.append(load_case_scan_assessment(db, cid))
             service_coverage_jobs.extend(load_service_coverage(db, case_id=cid))
             # Merge on raw scanner text before LLM rewrite so identical findings share IPs.
-            inventory = omit_low_from_download(load_gap_finding_inventory(db, cid))
+            inventory = load_gap_finding_inventory(db, cid)
         findings_lists.append(inventory["findings"])
         informational_lists.append(inventory["informational_findings"])
         summary_items.append(inventory["finding_summary"])

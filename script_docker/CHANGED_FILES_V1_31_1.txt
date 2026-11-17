@@ -1,0 +1,29 @@
+Polaron V1.31.1 - the prod launcher starts Caddy when it is stopped
+
+New
+  RELEASE_V1_31_1_CADDY_AUTOSTART.md
+  CHANGED_FILES_V1_31_1.txt
+
+Changed
+  script_docker/start_docker.ps1       Resolve-CaddySetup: stopped Caddy detected (no listener, admin API silent),
+                                       'admin off' refused, CADDY_AUTOSTART / CADDY_START_SECONDS read;
+                                       new Test-CaddyAdminApi, Find-CaddyService, Find-CaddyScheduledTask,
+                                       Register-CaddyService, Start-CaddyService, Start-CaddyProcessInBackground,
+                                       Get-HttpsPortHolders, Wait-CaddyReady, Start-StoppedCaddy, Undo-CaddyStart;
+                                       Publish-CaddySite: validate -> start Caddy if stopped -> reload, full
+                                       rollback on failure, refused-reload message names the real cause
+  script_docker/start_docker.lib.ps1   Get-CaddyAutostartSetting, Get-CaddyAdminAddress, ConvertTo-CaddyAdminUrl
+  script_docker/start_docker_prod.cmd  banner line about starting a stopped Caddy
+  script_docker/README.md              "Caddy not running (V1.31.1)" section
+  tests/caddy_integration_checks.ps1   90 checks (40 new)
+  .env.example                         CADDY_AUTOSTART, CADDY_START_SECONDS (commented; defaults need no change)
+
+Not changed
+  .env (no change needed; not in the ZIP)
+  V1.31.0 browser-folder files (separate ZIP, independent of this one)
+
+Written at launch on the server (outside the ZIP), only when Caddy is stopped
+  deployment\caddy\caddy-background.log and caddy-background.json (background start)
+  Windows service "caddy" (only with CADDY_AUTOSTART=service)
+
+Originals: recovery-snapshots/pre-v1.31.1-caddy-autostart-20261116/

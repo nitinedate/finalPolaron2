@@ -2,16 +2,12 @@
 # The engine's built-in BuildKit frontend is intentional. A syntax=docker/dockerfile
 # pin pulls docker/dockerfile from Docker Hub before the build and aborts when
 # registry-1.docker.io does not resolve.
-# The Windows starter passes AETHERIS_DEPS_IMAGE=<dependency image it built and checked>, so the
-# application stage starts from the installed libraries and never reinstalls them. Without it
-# the application stage is built from the dependencies stage below, as before.
-ARG AETHERIS_DEPS_IMAGE=dependencies
 FROM node:20-alpine AS dependencies
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
 
-FROM ${AETHERIS_DEPS_IMAGE} AS build
+FROM dependencies AS build
 
 # Empty = same-origin /api (nginx proxies to gateway). Set only for external API hosts.
 ARG VITE_API_BASE=

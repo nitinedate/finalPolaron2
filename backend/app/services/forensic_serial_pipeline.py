@@ -396,13 +396,10 @@ def serial_progress_snapshot(db, job_id: str, *, row=None) -> dict | None:
             work_done = int(work["done"] or 0)
             # Mobile bundles are the same extracted files. Adding the two
             # counts made 26,987 files display as 53,974.
-            if native.get("mobile_work_active") and work_total > 0:
-                # The file pass is already finished. The live card is the
-                # bundle queue. Pairing bundle completions with the file
-                # total showed about 2,000 of 9,250 while most bundles were done.
-                active_row["total_items"] = work_total
-                active_row["completed_items"] = work_done
-                active_row["failed_items"] = int(work["failed"] or 0)
+            if native.get("mobile_work_active") and native_total > 0 and work_total > 0:
+                # Keep the extracted-file denominator. Bundle progress is the
+                # same files and must not replace or add to the parse counters.
+                active_row["total_items"] = native_total
             elif native_total <= 0 and work_total > 0:
                 active_row["total_items"] = work_total
                 active_row["completed_items"] = work_done

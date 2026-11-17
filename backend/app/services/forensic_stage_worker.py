@@ -322,13 +322,7 @@ def run_isolated_report(schema_name,job_id,report_run_id=None,*,task_id=None):
         ensure_progress_schema(db)
         with pipeline_execution_lock(db,schema_name,str(job_id)) as acquired:
             if not acquired:
-                reason = 'Writing in: evidence processing still owns this job. The report starts when processing finishes.'
-                if report_run_id:
-                    execute(db,"""UPDATE report_runs SET status='waiting', error=:err
-                        WHERE id=:id AND job_id=:jid AND status IN ('queued','waiting')""",
-                        {'id':report_run_id,'jid':job_id,'err':reason})
-                    db.commit()
-                return {'status':'waiting','reason':reason}
+                return {'status':'held','reason':'An existing report process owns this job'}
             if report_run_id is None:
                 report_run_id=str(fetchone(db,"INSERT INTO report_runs(job_id,status,started_at) VALUES(:jid,'queued',NOW()) RETURNING id",{'jid':job_id})['id'])
             run=fetchone(db,'SELECT * FROM report_runs WHERE id=:rid AND job_id=:jid',{'rid':report_run_id,'jid':job_id})

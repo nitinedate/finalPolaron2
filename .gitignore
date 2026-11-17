@@ -58,7 +58,3 @@ Thumbs.db
 # IDE
 .idea/
 .vscode/
-
-# Sample reports used only to train ReportTrain. The model JSON stays.
-backend/app/knowledge/reports_train/**/*.pdf
-backend/app/knowledge/reports_train/**/*.docx

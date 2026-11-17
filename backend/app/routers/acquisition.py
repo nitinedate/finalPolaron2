@@ -9,12 +9,6 @@ Endpoint flow mirrors the examiner's screen sequence:
     POST /api/acquisition/verify            §12   re-verify a stored extraction
     GET  /api/acquisition/methods           §6    method reference for the UI
 
-    V1.27.0 — phone attached to a client PC (image created there in C:\\evidence):
-    GET  /api/acquisition/client-import/capabilities   server helper identity / support
-    POST /api/acquisition/client-import                 copy the run from the client share
-    GET  /api/acquisition/client-import/{id}            copy progress + server-path result
-    POST /api/acquisition/client-import/{id}/cancel
-
 `preview` is deliberately separate from `start`: §7 requires the examiner to see
 the resolved capability, the cable/preparation instructions and the coverage
 limitations of each method BEFORE a collection begins. Collapsing the two would
@@ -28,7 +22,7 @@ import json
 import os
 from typing import Any, AsyncIterator
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -134,32 +128,6 @@ class ValidationRecordRequest(BaseModel):
 class VerifyRequest(BaseModel):
     extraction_path: str
     manifest_path: str
-
-
-class ClientImportRequest(BaseModel):
-    """Read-only share of the client case folder, as returned by the Client Evidence Agent."""
-
-    share_id: str = Field(min_length=10, max_length=80, pattern=r"^ce[0-9a-f]{16,64}$")
-    token: str = Field(min_length=24, max_length=256)
-    port: int = Field(default=9877, ge=1, le=65535)
-    addresses: list[str] = Field(default_factory=list, max_length=16)
-    hostname: str = Field(default="", max_length=253)
-    client_root: str = Field(default="", max_length=1024)
-    file_count: int = Field(default=0, ge=0)
-    total_bytes: int = Field(default=0, ge=0)
-    manifest_sha256: str = Field(default="", max_length=64)
-    agent_url: str | None = Field(default=None, max_length=200)
-    relay: bool = False
-    # V1.31.2: the folder was chosen in the browser and this tab serves it (outbound connection only).
-    browser: bool = False
-    skipped: int = Field(default=0, ge=0)
-    agent_version: str = Field(default="", max_length=40)
-    # Which run to copy. Empty run_name = newest sealed run in the folder.
-    case_id: str = Field(default="", max_length=128)
-    run_name: str = Field(default="", max_length=255)
-    # full = whole run (original, working copy, exports, logs, hashes) like a server-side
-    # collection; packages = 05_Exports + logs/hashes only (much less to send off-site).
-    scope: str = Field(default="full", pattern=r"^(full|packages)$")
 
 
 class RemoveRunRequest(BaseModel):
@@ -722,113 +690,6 @@ def remove_run(
     }
 
 
-# ---------------------------------------------------------------------------
-# V1.27.0 — image created on a client PC, copied to the forensic server
-# ---------------------------------------------------------------------------
-
-def _client_import_error(exc: Exception) -> HTTPException:
-    message = str(exc)
-    if "could not reach" in message or "Timed out" in message:
-        status, code = 502, "client_agent_unreachable"
-    elif "HostDrive helper" in message:
-        status, code = 503, "server_helper_unavailable"
-    elif "/dev/fuse" in message or "libfuse" in message or "disabled" in message:
-        status, code = 503, "client_import_unavailable"
-    else:
-        status, code = 400, "client_import_failed"
-    return HTTPException(status_code=status, detail={"error": {"code": code, "message": message}})
-
-
-@router.get("/client-import/capabilities")
-def client_import_capabilities(
-    user: CurrentUser = Depends(require_firm_permission("forensic.job.read")),
-) -> dict[str, Any]:
-    """Whether this server can store client-created images, and which computer its helper runs on.
-
-    The browser compares ``office_helper.computer_name`` with its own local helper's
-    name: equal means the phone is on the forensic server itself (normal flow).
-    """
-    from app.services.client_evidence import enabled as client_evidence_enabled
-    from app.services.mobile_acquire import client_import
-
-    caps = client_import.helper_capabilities()
-    return {
-        "enabled": client_import.enabled() and client_evidence_enabled(),
-        "office_helper": caps,
-        "default_client_case_root": os.environ.get("CLIENT_MOBILE_CASE_ROOT", "C:\\evidence") or "C:\\evidence",
-        "server_case_root": client_import.server_case_root(),
-        "scopes": ["full", "packages"],
-    }
-
-
-@router.post("/client-import")
-def start_client_import(
-    payload: ClientImportRequest,
-    request: Request,
-    user: CurrentUser = Depends(require_firm_permission("forensic.job.create")),
-) -> dict[str, Any]:
-    """Copy a run collected on the examiner's PC into the server case folder ("as usual")."""
-    from app.routers.client_evidence import _request_ip
-    from app.services.client_evidence import ClientEvidenceError
-    from app.services.mobile_acquire import client_import
-
-    try:
-        return client_import.start_import(
-            share_id=payload.share_id,
-            token=payload.token,
-            port=payload.port,
-            addresses=payload.addresses,
-            hostname=payload.hostname,
-            client_root=payload.client_root,
-            file_count=payload.file_count,
-            total_bytes=payload.total_bytes,
-            manifest_sha256=payload.manifest_sha256,
-            agent_url=payload.agent_url,
-            relay_supported=payload.relay,
-            browser_share=payload.browser,
-            skipped=payload.skipped,
-            agent_version=payload.agent_version,
-            case_id=payload.case_id,
-            run_name=payload.run_name,
-            scope=payload.scope,
-            request_ip=_request_ip(request),
-            user_email=str(getattr(user, "email", "") or ""),
-            platform=_required_mobile_platform(),
-        )
-    except ClientEvidenceError as exc:
-        raise _client_import_error(exc)
-
-
-@router.get("/client-import/{import_id}")
-def get_client_import(
-    import_id: str,
-    user: CurrentUser = Depends(require_firm_permission("forensic.job.read")),
-) -> dict[str, Any]:
-    from app.services.mobile_acquire import client_import
-
-    state = client_import.load_state(import_id)
-    if state is None:
-        raise HTTPException(status_code=404, detail="Copy not found (it may have expired).")
-    return client_import.public_state(state)
-
-
-@router.post("/client-import/{import_id}/cancel")
-def cancel_client_import(
-    import_id: str,
-    user: CurrentUser = Depends(require_firm_permission("forensic.job.create")),
-) -> dict[str, Any]:
-    from app.services.mobile_acquire import client_import
-
-    accepted = client_import.request_cancel(import_id)
-    return {
-        "accepted": accepted,
-        "message": (
-            "Stopping the copy. Files already verified on the server are kept."
-            if accepted else "This copy is not running."
-        ),
-    }
-
-
 @router.get("/runs/{run_id}/stream")
 async def stream_run(
     run_id: str,
@@ -1019,3 +880,127 @@ def verify_extraction(
             "record the discrepancy."
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# Private agent-to-server evidence transfer.  Never expose source paths/files to
+# browser code, and never accept a generic user bearer token as an upload key.
+# ---------------------------------------------------------------------------
+
+class TransferTicketRequest(BaseModel):
+    platform: str
+    case_id: str
+    evidence_id: str
+
+
+class TransferCompleteRequest(BaseModel):
+    part_count: int = Field(ge=1, le=131072)
+    size_bytes: int = Field(ge=1)
+    sha256: str = Field(min_length=64, max_length=64)
+
+
+def _transfer_service_platform() -> str:
+    platform = _required_mobile_platform()
+    if platform not in ("android", "ios"):
+        raise HTTPException(status_code=403, detail="Private evidence transfer requires an isolated Android or iOS backend")
+    return platform
+
+
+def _transfer_claims(auth: str, transfer_id: str, tenant_header: str | None) -> dict[str, Any]:
+    from app.services.mobile_acquire.secure_transfer import MobileEvidenceTransfer, TransferError
+
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="A scoped evidence transfer ticket is required")
+    try:
+        claims = MobileEvidenceTransfer().verify_ticket(
+            auth[7:].strip(), service_platform=_transfer_service_platform()
+        )
+        if transfer_id != claims["tid"]:
+            raise TransferError("Ticket and transfer identifier do not match")
+        if (tenant_header or "").strip().lower() != claims["tenant"]:
+            raise TransferError("Ticket and tenant do not match")
+        return claims
+    except TransferError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@router.post("/transfer/ticket")
+def create_transfer_ticket(
+    body: TransferTicketRequest,
+    user: CurrentUser = Depends(require_firm_permission("job:run")),
+) -> dict[str, Any]:
+    """Authenticate the examiner once; grant a scoped 24h transfer capability."""
+    from app.services.mobile_acquire.secure_transfer import MobileEvidenceTransfer, TransferError
+
+    platform = _transfer_service_platform()
+    if body.platform != platform:
+        raise HTTPException(status_code=403, detail="Wrong mobile backend")
+    try:
+        return MobileEvidenceTransfer().ticket(
+            tenant=user.tenant, platform=platform, case_id=body.case_id,
+            evidence_id=body.evidence_id, examiner=user.user_id,
+        )
+    except TransferError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put("/transfer/{transfer_id}/chunks/{index}")
+async def upload_transfer_part(
+    transfer_id: str,
+    index: int,
+    request: "Request",
+    authorization: str = Header(default="", alias="Authorization"),
+    x_tenant: str = Header(default="", alias="X-Tenant"),
+    x_chunk_sha256: str = Header(default="", alias="X-Chunk-SHA256"),
+) -> dict[str, Any]:
+    from app.services.mobile_acquire.secure_transfer import CHUNK_BYTES, MobileEvidenceTransfer, TransferError
+
+    claims = _transfer_claims(authorization, transfer_id, x_tenant)
+    blob = bytearray()
+    async for block in request.stream():
+        blob.extend(block)
+        if len(blob) > CHUNK_BYTES:
+            raise HTTPException(status_code=413, detail="Mobile transfer chunk exceeds 8 MiB")
+    try:
+        return MobileEvidenceTransfer().put_part(claims, index, bytes(blob), x_chunk_sha256)
+    except TransferError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/transfer/{transfer_id}/complete")
+def complete_mobile_transfer(
+    transfer_id: str,
+    body: TransferCompleteRequest,
+    authorization: str = Header(default="", alias="Authorization"),
+    x_tenant: str = Header(default="", alias="X-Tenant"),
+) -> dict[str, Any]:
+    from app.services.mobile_acquire.secure_transfer import MobileEvidenceTransfer, TransferError
+
+    claims = _transfer_claims(authorization, transfer_id, x_tenant)
+    try:
+        return MobileEvidenceTransfer().complete(
+            claims, part_count=body.part_count,
+            byte_count=body.size_bytes, sha256=body.sha256,
+        )
+    except TransferError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+class TransferVerifyRequest(BaseModel):
+    evidence_ref: str
+
+
+@router.post("/transfer/verify")
+def reverify_server_evidence(
+    body: TransferVerifyRequest,
+    user: CurrentUser = Depends(require_firm_permission("job:run")),
+) -> dict[str, Any]:
+    """Recalculate server SHA-256 without disclosing private source paths."""
+    from app.services.mobile_acquire.secure_transfer import MobileEvidenceTransfer, TransferError
+
+    try:
+        return MobileEvidenceTransfer().verify_sealed(
+            body.evidence_ref, tenant=user.tenant, platform=_transfer_service_platform()
+        )
+    except TransferError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

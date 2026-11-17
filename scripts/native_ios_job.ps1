@@ -109,9 +109,8 @@ if (Get-Command Invoke-IosToolAcquire -ErrorAction SilentlyContinue) {
             $ok = $false
             break
         }
-        # V1.31.4: a retry continues the earlier attempt's staging folder (same stamp) instead of a new full backup.
         $ios = Invoke-IosToolAcquire -OutDir $original -LogPath $logPath -Udid ([string]$p.device_id) `
-            -ProgressFile $progress -RunName $runName -Stamp $stamp -Resume:($tryN -gt 1)
+            -ProgressFile $progress -RunName $runName -Stamp $stamp
         if ($ios.ok) {
             $backupPath = [string]$ios.backup_path
             $backupComplete = $false
@@ -142,10 +141,6 @@ if (Get-Command Invoke-IosToolAcquire -ErrorAction SilentlyContinue) {
         }
         if ($err -match 'not_enough_disk|device_locked|pair_|cancelled') { break }
         if ($tryN -lt $maxBackupTries) {
-            $retryDetail = "USB backup dropped before Manifest.db. Keep the iPhone unlocked - resuming attempt $($tryN + 1) of $maxBackupTries into the same staging folder."
-            if ($err -eq "ios_backup_stalled_no_data_from_iphone") {
-                $retryDetail = "The iPhone stopped sending data before the backup was complete. Unlock it and keep the screen on - resuming attempt $($tryN + 1) of $maxBackupTries into the same staging folder."
-            }
             Write-Prog @{
                 stage        = "acquire"
                 item         = "ios_backup"
@@ -153,7 +148,7 @@ if (Get-Command Invoke-IosToolAcquire -ErrorAction SilentlyContinue) {
                 files_seen   = $copied
                 run_name     = $runName
                 progress_pct = 6
-                detail       = $retryDetail
+                detail       = "USB backup dropped before Manifest.db. Keep the iPhone unlocked - resuming attempt $($tryN + 1) of $maxBackupTries into the same staging folder."
                 category     = "Collecting"
             }
             if (Get-Command Write-AcquireLog -ErrorAction SilentlyContinue) {
@@ -310,6 +305,25 @@ if (-not $ok -and $err) { $errList.Add([string]$err) | Out-Null }
 if (-not $ok -and $afcFiles -gt 0) {
     $errList.Add(("ios_afc_collected_but_itunes_backup_incomplete files={0} bytes={1}" -f $afcFiles, $afcBytes)) | Out-Null
 }
+# Transfer the complete verified ZIP to the case's isolated server before
+# publishing success. A failed upload remains RETRYABLE; do not claim complete.
+$serverTransfer = @{}
+if ($ok) {
+    Write-Prog @{
+        stage = "transfer"; item = "server_upload"; bytes_done = $bytes
+        files_seen = $copied; run_name = $runName
+        detail = "Securely transferring acquired evidence to the forensic server"
+        category = "Transferring"
+    }
+    $handoff = Invoke-MobileEvidenceTransfer -Payload $p -Exports $exports -Logs $logs
+    if ($handoff.ok) {
+        $serverTransfer = $handoff.receipt
+    } else {
+        $ok = $false
+        $err = [string]$handoff.error
+        $errList.Add($err) | Out-Null
+    }
+}
 $summary = @{
     ok                 = $ok
     run_name           = $runName
@@ -336,6 +350,7 @@ $summary = @{
     errors             = @($errList)
     content_inventory  = $inventory
     export_packages    = $exportPkg
+    server_transfer     = $serverTransfer
     verification       = @{ ok = $ok; verified = $(if ($ok) { $copied } else { 0 }) }
     acquisition_record = @{ output_size = $bytes; file_count = $copied; missing_fields = @() }
     evidence_package   = @{
@@ -382,11 +397,14 @@ $res = @{
     acquisition_record = $summary.acquisition_record
     content_inventory  = $inventory
     export_packages    = $exportPkg
+    server_transfer     = $serverTransfer
     verification       = $summary.verification
 }
 $resJson = if (Get-Command Convert-AcquireResultToJson -ErrorAction SilentlyContinue) {
     Convert-AcquireResultToJson -Obj $res
 } else { $res | ConvertTo-Json -Compress -Depth 12 }
 $resJson | Set-Content -LiteralPath $ResultFile -Encoding UTF8
+# Remove short-lived upload ticket and collection secrets from local temp.
+Remove-Item -LiteralPath $PayloadFile -Force -ErrorAction SilentlyContinue
 if (-not $ok) { exit 1 }
 exit 0

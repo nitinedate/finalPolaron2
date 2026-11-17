@@ -5,10 +5,6 @@
 # PostgreSQL/Redis/MinIO remain vendor images; API/Celery/report/RAG/OCR services
 # all inherit this image and can probe/use the NVIDIA device when admitted by
 # the shared adaptive GPU semaphore.
-# The Windows starter passes AETHERIS_DEPS_IMAGE=<dependency image it built and checked>, so the
-# application stage starts from the installed libraries and never reinstalls them. Without it
-# the application stage is built from the dependencies stage below, as before.
-ARG AETHERIS_DEPS_IMAGE=dependencies
 FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04 AS dependencies
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -94,7 +90,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Windows starter sets it from the application source. Unchanged source keeps
 # this layer cached. A changed requirements file rebuilds only the install
 # above, and pip reuses wheels already in the BuildKit cache.
-FROM ${AETHERIS_DEPS_IMAGE} AS application
+FROM dependencies AS application
 ARG AETHERIS_APP_BUILD_ID=source
 COPY . .
 RUN test -n "$AETHERIS_APP_BUILD_ID" && python -m compileall -q app

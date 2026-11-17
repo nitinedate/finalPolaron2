@@ -32,8 +32,8 @@ x-extract-env: &extract-env
   RESOURCE_GOVERNOR_GPU_MAX_SLOTS: ${RESOURCE_GOVERNOR_GPU_MAX_SLOTS:-4}
   GPU_RELEASE_MODEL_AFTER_TASK: ${GPU_RELEASE_MODEL_AFTER_TASK:-true}
   MINIO_ENDPOINT: minio:9000
-  MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minio123}
-  MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minio123}
+  MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+  MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
   MINIO_BUCKET: ${MINIO_BUCKET:-mobile-extract}
   HOST_EVIDENCE_ENABLED: ${HOST_EVIDENCE_ENABLED:-true}
   HOST_DRIVE_HELPER_URL: ${HOST_DRIVE_HELPER_URL:-http://host.docker.internal:9876}
@@ -109,10 +109,6 @@ services:
       - type: bind
         source: ${AETHERIS_BACKUP_DIR:-./backup}/forensic-data/mobile-extract
         target: /app/data
-      # V1.28.0: shared scratch, also holds the seekable part cache (/scratch/part-cache).
-      - type: bind
-        source: ${EXTRACT_SCRATCH_HOST_DIR:-${AETHERIS_BACKUP_DIR:-./backup}/forensic-data/scratch}
-        target: /scratch
     extra_hosts:
       - "host.docker.internal:host-gateway"
     command: ["/scripts/start-api-container.sh", "app.main_mobile_extract:app"]
@@ -147,10 +143,6 @@ services:
       - type: bind
         source: ${AETHERIS_BACKUP_DIR:-./backup}/forensic-data/mobile-extract
         target: /app/data
-      # V1.28.0: shared scratch, also holds the seekable part cache (/scratch/part-cache).
-      - type: bind
-        source: ${EXTRACT_SCRATCH_HOST_DIR:-${AETHERIS_BACKUP_DIR:-./backup}/forensic-data/scratch}
-        target: /scratch
       - type: bind
         source: ${AETHERIS_BACKUP_DIR:-./backup}/forensic-data/mobile-extract/uploads
         target: /app/data/uploads
@@ -194,8 +186,8 @@ services:
       RESOURCE_GOVERNOR_GPU_MAX_SLOTS: ${RESOURCE_GOVERNOR_GPU_MAX_SLOTS:-4}
       GPU_RELEASE_MODEL_AFTER_TASK: ${GPU_RELEASE_MODEL_AFTER_TASK:-true}
       MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minio123}
-      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minio123}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
       MINIO_BUCKET: ${MINIO_BUCKET:-mobile-extract}
       HOST_EVIDENCE_ENABLED: ${HOST_EVIDENCE_ENABLED:-true}
       HOST_DRIVE_HELPER_URL: ${HOST_DRIVE_HELPER_URL:-http://host.docker.internal:9876}
@@ -326,10 +318,6 @@ services:
       - type: bind
         source: ${AETHERIS_BACKUP_DIR:-./backup}/forensic-data/mobile-extract
         target: /app/data
-      # V1.28.0: shared scratch, also holds the seekable part cache (/scratch/part-cache).
-      - type: bind
-        source: ${EXTRACT_SCRATCH_HOST_DIR:-${AETHERIS_BACKUP_DIR:-./backup}/forensic-data/scratch}
-        target: /scratch
       - type: bind
         source: ${AETHERIS_BACKUP_DIR:-./backup}/huggingface
         target: /root/.cache/huggingface
@@ -385,10 +373,6 @@ services:
       - type: bind
         source: ${AETHERIS_BACKUP_DIR:-./backup}/forensic-data/mobile-extract
         target: /app/data
-      # V1.28.0: shared scratch, also holds the seekable part cache (/scratch/part-cache).
-      - type: bind
-        source: ${EXTRACT_SCRATCH_HOST_DIR:-${AETHERIS_BACKUP_DIR:-./backup}/forensic-data/scratch}
-        target: /scratch
       - type: bind
         source: ${AETHERIS_BACKUP_DIR:-./backup}/huggingface
         target: /root/.cache/huggingface
@@ -444,10 +428,6 @@ services:
       - type: bind
         source: ${AETHERIS_BACKUP_DIR:-./backup}/forensic-data/mobile-extract
         target: /app/data
-      # V1.28.0: shared scratch, also holds the seekable part cache (/scratch/part-cache).
-      - type: bind
-        source: ${EXTRACT_SCRATCH_HOST_DIR:-${AETHERIS_BACKUP_DIR:-./backup}/forensic-data/scratch}
-        target: /scratch
       - type: bind
         source: ${AETHERIS_BACKUP_DIR:-./backup}/forensic-data/mobile-extract/uploads
         target: /app/data/uploads

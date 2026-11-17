@@ -1137,7 +1137,7 @@ def execute_stage(db, job_id, stage, *, schema_name, stage_run_id):
         result = sync_job_graph_serial(
             db, job_id, schema_name=schema_name, mobile=mobile
         )
-        if result.get("status") not in {"ok", "skipped"}:
+        if result.get("status") != "ok":
             raise StageWaiting(
                 "Graph synchronization unavailable; graph barrier remains pending"
             )
@@ -1172,83 +1172,52 @@ def _enrich_mobile(db, job_id, stats, *, table="mobile_normalized_artifacts", pr
         f"COALESCE(SUM(regexp_count(sample, :{kind}_re, 1, 'i')),0) AS {kind}_n"
         for kind in _SQL_COUNT_RES
     )
-    # A keyset cursor that reaches the last id is not finished when rows were
-    # inserted behind it. One empty batch used to set complete and leave those
-    # rows out of the accounted total, which failed the stage and held the report.
-    for pass_no in range(1, 4):
-        if pass_no > 1:
-            last = ""
-            scanned = 0
-            by_type = {}
-            total = int(
-                fetchone(
-                    db,
-                    f"SELECT count(*) AS c FROM {table} WHERE job_id=:jid",
-                    {"jid": job_id},
-                )["c"]
-            )
-        while True:
-            if pipeline_should_stop(db, job_id):
-                raise StageWaiting("Mobile enrichment paused by user")
-            params = {
-                "jid": job_id,
-                "last": last,
-                **{f"{kind}_re": pattern for kind, pattern in _SQL_COUNT_RES.items()},
-            }
-            row = fetchone(
-                db,
-                f"""WITH batch AS (SELECT artifact_id,data::text AS sample
-                FROM {table} WHERE job_id=:jid AND artifact_id>:last ORDER BY artifact_id LIMIT 500)
-                SELECT (SELECT artifact_id FROM batch ORDER BY artifact_id DESC LIMIT 1) AS last_id,
-                    count(*) AS scanned,{columns} FROM batch""",
-                params,
-            )
-            count = int(row["scanned"])
-            if not count:
-                break
+    while True:
+        if pipeline_should_stop(db, job_id):
+            raise StageWaiting("Mobile enrichment paused by user")
+        params = {
+            "jid": job_id,
+            "last": last,
+            **{f"{kind}_re": pattern for kind, pattern in _SQL_COUNT_RES.items()},
+        }
+        row = fetchone(
+            db,
+            f"""WITH batch AS (SELECT artifact_id,data::text AS sample
+            FROM {table} WHERE job_id=:jid AND artifact_id>:last ORDER BY artifact_id LIMIT 500)
+            SELECT (SELECT artifact_id FROM batch ORDER BY artifact_id DESC LIMIT 1) AS last_id,
+                count(*) AS scanned,{columns} FROM batch""",
+            params,
+        )
+        count = int(row["scanned"])
+        if count:
             last = row["last_id"]
             scanned += count
             for kind in _SQL_COUNT_RES:
                 by_type[kind] = int(by_type.get(kind) or 0) + int(row[f"{kind}_n"])
-            stats.update(
-                {
-                    prefix+"_scanned": scanned,
-                    prefix+"_total": total,
-                    prefix+"_last_artifact_id": last,
-                    prefix+"_entity_by_type": by_type,
-                    prefix+"_complete": scanned >= total,
-                }
-            )
-            persist_enrichment_stats(db, job_id, stats)
-            report_progress(
-                db,
-                job_id,
-                "enrichment",
-                total=int(stats.get("parse_total") or 0) + total,
-                completed=int(stats.get("scanned") or 0) + scanned,
-                label=f"Full normalized {prefix} evidence enrichment",
-            )
-            if scanned >= total:
-                break
-        if scanned >= total:
-            stats.update(
-                {
-                    prefix+"_scanned": scanned,
-                    prefix+"_total": total,
-                    prefix+"_last_artifact_id": last,
-                    prefix+"_entity_by_type": by_type,
-                    prefix+"_complete": True,
-                }
-            )
-            persist_enrichment_stats(db, job_id, stats)
+        stats.update(
+            {
+                prefix+"_scanned": scanned,
+                prefix+"_total": total,
+                prefix+"_last_artifact_id": last,
+                prefix+"_entity_by_type": by_type,
+                prefix+"_complete": not count or scanned >= total,
+            }
+        )
+        persist_enrichment_stats(db, job_id, stats)
+        report_progress(
+            db,
+            job_id,
+            "enrichment",
+            total=int(stats.get("parse_total") or 0) + total,
+            completed=int(stats.get("scanned") or 0) + scanned,
+            label=f"Full normalized {prefix} evidence enrichment",
+        )
+        if stats[prefix+"_complete"]:
             return {
                 **stats,
                 "parse_total": int(stats.get("parse_total") or 0) + total,
                 "scanned": int(stats.get("scanned") or 0) + scanned,
             }
-    raise StageWaiting(
-        "Writing in: mobile enrichment still has normalized records behind its cursor"
-    )
 
 
 def validate_stage_barrier(db, job_id, stage, result, *, stage_run_id):

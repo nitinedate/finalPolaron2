@@ -398,8 +398,7 @@ tr[class*="bg-brand-100"] th {
 .report-a4-letterhead-header {
   top: 0;
   height: var(--a4-header) !important;
-  object-fit: contain;
-  object-position: left center;
+  object-position: left top;
 }
 
 .report-a4-letterhead-footer {
@@ -526,7 +525,7 @@ tr[class*="bg-brand-100"] th {
     display: block !important;
     width: 210mm !important;
     max-width: none !important;
-    object-fit: contain !important;
+    object-fit: fill !important;
   }
   .report-a4-letterhead-header {
     height: 44mm !important;

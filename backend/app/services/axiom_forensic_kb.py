@@ -423,13 +423,6 @@ def objective_knowledge_plan(title: str, statement: str = "") -> dict[str, Any]:
     except Exception:
         document_model = {}
 
-    try:
-        from app.services.report_train_agent import data_plan
-
-        report_train = data_plan(title, statement)
-    except Exception:
-        report_train = {}
-
     return {
         "title": str(title or "").strip(),
         "statement": str(statement or "").strip(),
@@ -450,7 +443,6 @@ def objective_knowledge_plan(title: str, statement: str = "") -> dict[str, Any]:
         "reference_exemplar_guidance": reference_guidance,
         "reference_exemplar_fingerprint": reference_fingerprint,
         "document_report_model": document_model,
-        "report_train": report_train,
         "knowledge_base_counts": {
             "procedures": len(load_knowledge_base().get("procedures", [])),
             "reports": len(load_knowledge_base().get("reports", [])),

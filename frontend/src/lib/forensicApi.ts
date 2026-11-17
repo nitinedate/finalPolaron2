@@ -80,9 +80,6 @@ import type {
   AcquisitionRunDetail,
   AcquisitionRunList,
   AcquisitionRunSummary,
-  ClientImportCapabilities,
-  ClientImportStartPayload,
-  ClientImportState,
   DetectedDeviceList,
   MethodCoverage,
 } from "./types/forensic";
@@ -254,6 +251,27 @@ export const acquisitionApi = {
    * streamed separately, so a dropped connection cannot orphan a multi-hour
    * collection. A 409 means the device is already being acquired.
    */
+  /** Authenticate the examiner; issue a scoped private acquisition transfer. */
+  createTransferTicket: (platform: "android" | "ios", caseId: string, evidenceId: string) =>
+    api.post<{
+      token: string;
+      transfer_id: string;
+      platform: "android" | "ios";
+      tenant: string;
+      expires_at: string;
+    }>(
+      "/api/acquisition/transfer/ticket",
+      { platform, case_id: caseId, evidence_id: evidenceId },
+      { timeoutMs: 20_000, service: platform === "android" ? "mobile-android" : "mobile-ios" },
+    ),
+
+  verifyServerEvidence: (platform: "android" | "ios", evidenceRef: string) =>
+    api.post<{ ok: boolean; verified: boolean; sha256: string; size_bytes: number }>(
+      "/api/acquisition/transfer/verify",
+      { evidence_ref: evidenceRef },
+      { service: platform === "android" ? "mobile-android" : "mobile-ios", timeoutMs: 120_000 },
+    ),
+
   startAcquisition: (payload: AcquisitionStartPayload) =>
     api.post<AcquisitionRunSummary>("/api/acquisition/start", payload, {
       timeoutMs: 60_000,
@@ -324,29 +342,6 @@ export const acquisitionApi = {
       { extraction_path: extractionPath, manifest_path: manifestPath },
       { timeoutMs: 30 * 60 * 1000 },
     ),
-
-  // V1.27.0 — phone on a client PC: the image is created there (C:\evidence) and the
-  // forensic server copies it into its own case folder before processing.
-
-  /** Whether the server can store client images, and which computer its USB helper runs on. */
-  clientImportCapabilities: () =>
-    api.get<ClientImportCapabilities>("/api/acquisition/client-import/capabilities", undefined, {
-      timeoutMs: 15_000,
-    }),
-
-  /** Start copying one run from a read-only share of the client case folder. */
-  startClientImport: (payload: ClientImportStartPayload) =>
-    api.post<ClientImportState>("/api/acquisition/client-import", payload, { timeoutMs: 180_000 }),
-
-  getClientImport: (importId: string) =>
-    api.get<ClientImportState>(`/api/acquisition/client-import/${importId}`, undefined, { timeoutMs: 20_000 }),
-
-  cancelClientImport: (importId: string) =>
-    api.post<{ accepted: boolean; message: string }>(
-      `/api/acquisition/client-import/${importId}/cancel`,
-      {},
-      { timeoutMs: 15_000 },
-    ),
 };
 
 export type ExtractReviewState = {
@@ -400,8 +395,6 @@ export type ClientEvidenceSourceStatus = {
   transfer?: { logical_bytes: number; wire_bytes: number; zero_bytes: number; requests: number };
   /** Live reader state written by the server's FUSE reader. */
   reader?: { state?: "ok" | "waiting" | "failed"; detail?: string; bytes_fetched?: number; updated_at?: number };
-  /** The folder is served by the examiner's browser tab (chosen in the browser's folder window). */
-  browser_share?: boolean;
 };
 
 export type HostFolderListing = {
@@ -732,8 +725,6 @@ export const forensicApi = {
       replace_existing?: boolean;
       /** The agent also connects out to this server (works outside the office network). */
       relay?: boolean;
-      /** Served by the examiner's browser tab (no agent): the server uses only the outbound connection. */
-      browser?: boolean;
     }
   ) =>
     api.post<ClientEvidenceSourceResult>(`/api/jobs/${jobId}/evidence/client-source`, payload, {
@@ -1371,7 +1362,6 @@ export const forensicApi = {
       sections_total: number;
       duration_ms?: number;
       error?: string;
-      message?: string;
     }>(`/api/jobs/${jobId}/report`),
 
   startReport: (jobId: string, payload?: ReportStartPayload) =>

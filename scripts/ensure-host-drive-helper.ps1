@@ -1,8 +1,6 @@
 # Ensure the host drive helper is running on port 9876 (Windows examiner workstation).
 param(
-    [switch]$ForceRestart,
-    # Set by polaron-client-update.ps1 (it has just updated the files) and by the re-run below.
-    [switch]$SkipKitUpdate
+    [switch]$ForceRestart
 )
 
 $ErrorActionPreference = "Stop"
@@ -22,32 +20,7 @@ function Get-HelperScriptVersion {
     return $null
 }
 $agent = Join-Path $root "scripts\hostdrive-agent.ps1"
-$ExpectedHelperVersion = "5.64"
-
-# V1.31.8: a computer set up with Polaron-Setup-This-Computer.cmd keeps its client files equal to the
-# server's. The updater checks at most every 10 minutes, downloads only files that differ, verifies each
-# against the server's SHA-256, and never applies anything while a phone collection is running. When it
-# changed files, this script itself may be new: run the new copy instead of continuing with this one.
-if (-not $SkipKitUpdate) {
-    $kitUpdater = Join-Path $root "scripts\polaron-client-update.ps1"
-    $kitConfig = Join-Path (Join-Path $env:LOCALAPPDATA "Aetheris") "client-kit.json"
-    if ((Test-Path -LiteralPath $kitUpdater) -and (Test-Path -LiteralPath $kitConfig)) {
-        $kitExit = 0
-        try {
-            $psExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-            if (-not (Test-Path -LiteralPath $psExe)) { $psExe = "powershell.exe" }
-            & $psExe -NoProfile -ExecutionPolicy Bypass -File $kitUpdater -Watchdog
-            $kitExit = $LASTEXITCODE
-        } catch { $kitExit = 0 }
-        if ($kitExit -eq 10) {
-            Write-Host "Polaron client files were updated from the server; continuing with the new version."
-            $rerun = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $PSCommandPath, "-SkipKitUpdate")
-            if ($ForceRestart) { $rerun += "-ForceRestart" }
-            & $psExe @rerun
-            exit $LASTEXITCODE
-        }
-    }
-}
+$ExpectedHelperVersion = "5.57"
 
 # The logon/5-minute watchdog calls this script constantly. When the helper is already
 # the right process, return before the examiner-kit check (that check installs drivers
@@ -249,37 +222,10 @@ function Test-HelperStale {
     return $false
 }
 
-# V1.31.8: restarting the helper stops a running phone collection. A restart that nobody asked for
-# (an older helper found by the watchdog) waits until the collection has finished.
-function Test-CollectionRunning {
-    try {
-        $h = @{}
-        if ($env:HOST_DRIVE_HELPER_TOKEN) { $h["X-Host-Helper-Token"] = $env:HOST_DRIVE_HELPER_TOKEN }
-        $jobs = Invoke-RestMethod -UseBasicParsing -Uri "http://127.0.0.1:$Port/acquisition/jobs" -Headers $h -TimeoutSec 5
-        if (@($jobs.jobs | Where-Object { [string]$_.status -eq "running" }).Count -gt 0) { return $true }
-    } catch {}
-    try {
-        $procs = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)
-        $alive = @{}
-        foreach ($p in $procs) { $alive[[int]$p.ProcessId] = $true }
-        foreach ($p in $procs) {
-            $cmd = [string]$p.CommandLine
-            if ($cmd -notmatch '(?i)ios_usbmux_backup\.py|ios_usbmux_afc\.py|native_ios_job\.ps1|native_mtp_job\.ps1|host-mobile-acquire\.ps1') { continue }
-            if ($cmd -match '(?i)--verify\b|recover-stalled-ios-backup') { continue }
-            if ($alive.ContainsKey([int]$p.ParentProcessId)) { return $true }
-        }
-    } catch {}
-    return $false
-}
-
 $currentHealth = Get-HelperHealth
 if ((-not $ForceRestart) -and $currentHealth -and [bool]$currentHealth.ok) {
     if (-not (Test-HelperStale -Health $currentHealth)) {
         Write-Host ("Host drive helper already running on {0} (root={1}, job v{2}, pid {3})" -f $healthUrl, $currentHealth.root, $currentHealth.job_script_version, $currentHealth.helper_pid)
-        exit 0
-    }
-    if (Test-CollectionRunning) {
-        Write-Host "A phone collection is running; the helper restart waits until it has finished (the watchdog retries every 5 minutes)."
         exit 0
     }
     $ForceRestart = $true

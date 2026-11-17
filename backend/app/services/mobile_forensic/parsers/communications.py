@@ -1,11 +1,7 @@
 """Mail, structured exports, generic message SQLite and binary evidence plugins."""
 from __future__ import annotations
 
-import csv
-import json
-import plistlib
 from pathlib import PurePosixPath
-from xml.etree import ElementTree as ET
 
 from app.parsers.communications import (EMAIL_EXTENSIONS,STRUCTURED_EXTENSIONS,BINARY_EXTENSIONS,
     MAX_READABLE_BYTES,iter_mail_records,iter_structured_records,iter_binary_strings,iter_protobuf_fields,utc_timestamp)
@@ -30,11 +26,6 @@ class CommunicationEvidenceParser(ArtifactParser):
     name='communication_evidence';version='1.0.0';domains=('email','messaging_apps','files')
 
     def supports(self,item,context):
-        path=item.path.replace('\\','/').lower()
-        name=path.rsplit('/',1)[-1]
-        # macOS AppleDouble forks are not mail or structured exports.
-        if '/__macosx/' in path or name.startswith('._'):
-            return False
         mime=(item.mime_hint or str((item.meta or {}).get('detected_mime') or '')).lower()
         if _ext(item) in EMAIL_EXTENSIONS|STRUCTURED_EXTENSIONS|BINARY_EXTENSIONS or mime=='message/rfc822':
             return True
@@ -44,17 +35,6 @@ class CommunicationEvidenceParser(ArtifactParser):
         return False
 
     def parse(self,item,context):
-        try:
-            yield from self._parse(item,context)
-        except (UnicodeDecodeError, ET.ParseError, json.JSONDecodeError, plistlib.InvalidFileException, csv.Error):
-            return
-        except ValueError as exc:
-            text=str(exc)
-            if 'External entities' in text or 'nesting depth' in text:
-                return
-            raise
-
-    def _parse(self,item,context):
         data=_read(item,context);ext=_ext(item)
         mime=(item.mime_hint or str((item.meta or {}).get('detected_mime') or '')).lower()
         from app.parsers.email_mime_parser import is_extensionless_email_candidate

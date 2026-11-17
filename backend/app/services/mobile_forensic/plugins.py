@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import threading
 from collections import OrderedDict
 from abc import ABC, abstractmethod
 from typing import Any, Iterator
@@ -142,23 +141,14 @@ class PluginRegistry:
 
 
 _REGISTRY: PluginRegistry | None = None
-_REGISTRY_LOCK = threading.Lock()
 
 
 def get_plugin_registry() -> PluginRegistry:
     global _REGISTRY
-    existing = _REGISTRY
-    if existing is not None and existing.parsers:
-        return existing
-    with _REGISTRY_LOCK:
-        # Publish the registry only after every parser is registered. Assigning
-        # it first let another worker route msgstore.db against an empty list
-        # and mark the database done without reading a chat.
-        if _REGISTRY is None or not _REGISTRY.parsers:
-            reg = PluginRegistry()
-            _register_builtin_plugins(reg)
-            _REGISTRY = reg
-        return _REGISTRY
+    if _REGISTRY is None:
+        _REGISTRY = PluginRegistry()
+        _register_builtin_plugins(_REGISTRY)
+    return _REGISTRY
 
 
 def reset_plugin_registry_for_tests() -> None:

@@ -81,8 +81,8 @@ x-worker-env: &worker-env
   DB_MAX_OVERFLOW: ${WORKER_DB_MAX_OVERFLOW:-8}
   DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-90}
   MINIO_ENDPOINT: minio:9000
-  MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minio123}
-  MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minio123}
+  MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+  MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
   MINIO_BUCKET: ${MINIO_BUCKET:-forensic}
   HOST_EVIDENCE_ENABLED: ${HOST_EVIDENCE_ENABLED:-true}
   HOST_EVIDENCE_ROOT: ${HOST_EVIDENCE_ROOT:-}
@@ -356,10 +356,6 @@ services:
       - type: bind
         source: ${AETHERIS_BACKUP_DIR:-./backup}/forensic-data
         target: /app/data
-      # V1.28.0: shared scratch, also holds the seekable part cache (/scratch/part-cache).
-      - type: bind
-        source: ${EXTRACT_SCRATCH_HOST_DIR:-${AETHERIS_BACKUP_DIR:-./backup}/forensic-data/scratch}
-        target: /scratch
     extra_hosts:
       - "host.docker.internal:host-gateway"
     deploy:
@@ -462,10 +458,6 @@ services:
       - type: bind
         source: ${AETHERIS_BACKUP_DIR:-./backup}/forensic-data/job-data
         target: /app/data
-      # V1.28.0: shared scratch, also holds the seekable part cache (/scratch/part-cache).
-      - type: bind
-        source: ${EXTRACT_SCRATCH_HOST_DIR:-${AETHERIS_BACKUP_DIR:-./backup}/forensic-data/scratch}
-        target: /scratch
     depends_on:
       api:
         condition: service_healthy
@@ -510,10 +502,6 @@ services:
       - type: bind
         source: ${AETHERIS_BACKUP_DIR:-./backup}/forensic-data/job-data
         target: /app/data
-      # V1.28.0: shared scratch, also holds the seekable part cache (/scratch/part-cache).
-      - type: bind
-        source: ${EXTRACT_SCRATCH_HOST_DIR:-${AETHERIS_BACKUP_DIR:-./backup}/forensic-data/scratch}
-        target: /scratch
     depends_on:
       api:
         condition: service_healthy
@@ -566,10 +554,6 @@ services:
       - type: bind
         source: ${AETHERIS_BACKUP_DIR:-./backup}/forensic-data
         target: /app/data
-      # V1.28.0: shared scratch, also holds the seekable part cache (/scratch/part-cache).
-      - type: bind
-        source: ${EXTRACT_SCRATCH_HOST_DIR:-${AETHERIS_BACKUP_DIR:-./backup}/forensic-data/scratch}
-        target: /scratch
       - type: bind
         source: ${AETHERIS_BACKUP_DIR:-./backup}/huggingface
         target: /root/.cache/huggingface
@@ -631,10 +615,6 @@ services:
       - type: bind
         source: ${AETHERIS_BACKUP_DIR:-./backup}/forensic-data
         target: /app/data
-      # V1.28.0: shared scratch, also holds the seekable part cache (/scratch/part-cache).
-      - type: bind
-        source: ${EXTRACT_SCRATCH_HOST_DIR:-${AETHERIS_BACKUP_DIR:-./backup}/forensic-data/scratch}
-        target: /scratch
       - type: bind
         source: ${AETHERIS_BACKUP_DIR:-./backup}/huggingface
         target: /root/.cache/huggingface
@@ -677,10 +657,6 @@ services:
       - type: bind
         source: ${AETHERIS_BACKUP_DIR:-./backup}/forensic-data
         target: /app/data
-      # V1.28.0: shared scratch, also holds the seekable part cache (/scratch/part-cache).
-      - type: bind
-        source: ${EXTRACT_SCRATCH_HOST_DIR:-${AETHERIS_BACKUP_DIR:-./backup}/forensic-data/scratch}
-        target: /scratch
     depends_on:
       api:
         condition: service_healthy
@@ -719,10 +695,6 @@ services:
       - type: bind
         source: ${AETHERIS_BACKUP_DIR:-./backup}/forensic-data
         target: /app/data
-      # V1.28.0: shared scratch, also holds the seekable part cache (/scratch/part-cache).
-      - type: bind
-        source: ${EXTRACT_SCRATCH_HOST_DIR:-${AETHERIS_BACKUP_DIR:-./backup}/forensic-data/scratch}
-        target: /scratch
     depends_on:
       api:
         condition: service_healthy
@@ -774,8 +746,8 @@ services:
       DB_MAX_OVERFLOW: '1'
       DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-90}
       MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minio123}
-      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minio123}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
       MINIO_BUCKET: ${MINIO_BUCKET:-forensic}
       HOST_EVIDENCE_ENABLED: ${HOST_EVIDENCE_ENABLED:-true}
       HOST_EVIDENCE_ROOT: ${HOST_EVIDENCE_ROOT:-}
@@ -970,10 +942,6 @@ services:
     - type: bind
       source: ${AETHERIS_BACKUP_DIR:-./backup}/forensic-data
       target: /app/data
-    # V1.28.0: shared scratch, also holds the seekable part cache (/scratch/part-cache).
-    - type: bind
-      source: ${EXTRACT_SCRATCH_HOST_DIR:-${AETHERIS_BACKUP_DIR:-./backup}/forensic-data/scratch}
-      target: /scratch
     depends_on:
       api:
         condition: service_healthy
@@ -1057,10 +1025,6 @@ services:
       - type: bind
         source: ${AETHERIS_BACKUP_DIR:-./backup}/forensic-data/job-data
         target: /app/data
-      # V1.28.0: shared scratch, also holds the seekable part cache (/scratch/part-cache).
-      - type: bind
-        source: ${EXTRACT_SCRATCH_HOST_DIR:-${AETHERIS_BACKUP_DIR:-./backup}/forensic-data/scratch}
-        target: /scratch
     depends_on:
       api:
         condition: service_healthy

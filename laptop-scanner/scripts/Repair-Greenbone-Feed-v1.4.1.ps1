@@ -242,7 +242,7 @@ if ([string]::IsNullOrWhiteSpace($gvmUser)) { $gvmUser = 'admin' }
 if ([string]::IsNullOrWhiteSpace($gvmPassword)) { $gvmPassword = 'admin' }
 
 Write-Host '=============================================================================='
-Write-Host 'Aetheris Greenbone feed / Full-and-fast repair v1.4.9'
+Write-Host 'Aetheris Greenbone feed / Full-and-fast repair v1.4.8'
 Write-Host '=============================================================================='
 Write-Host "Root=$Root"
 Write-Host "Compose=$script:ComposeFile"
@@ -250,21 +250,8 @@ Write-Host "GVM user=$gvmUser"
 Write-Host 'No Docker volumes are deleted by this repair.'
 Write-Host ''
 
-# docker info calls /info. This Docker Desktop returns HTTP 500 for that route
-# (and the call can hang) while container queries still succeed. A short VM
-# blip must not skip Feed Import Owner and the data-object rebuild.
-$engineReady = $false
-$engineDetail = ''
-for ($engineTry = 1; $engineTry -le 6; $engineTry++) {
-    $engine = Run-Docker -ArgumentList @('ps', '-q') -AllowFailure
-    if ($engine.ExitCode -eq 0) { $engineReady = $true; break }
-    $engineDetail = (($engine.Text -replace '\s+', ' ').Trim())
-    if ($engineDetail.Length -gt 300) { $engineDetail = $engineDetail.Substring(0, 300) }
-    Write-Host ("[WARN] Docker engine not answering (attempt {0}/6): {1}" -f $engineTry, $engineDetail) -ForegroundColor Yellow
-    if ($engineTry -lt 6) { Start-Sleep -Seconds 10 }
-}
-if (-not $engineReady) { throw 'Docker Desktop Linux engine is not ready.' }
-Write-Host '[OK] Docker Desktop Linux engine answers container queries.' -ForegroundColor Green
+$info = Run-Docker -ArgumentList @('info') -AllowFailure
+if ($info.ExitCode -ne 0) { throw 'Docker Desktop Linux engine is not ready.' }
 
 Write-Host '==> Verifying Docker Compose argument forwarding'
 $composeVersion = Run-Docker -ArgumentList @('compose', 'version') -AllowFailure

@@ -25,7 +25,17 @@ CHARGING_ONLY = {
 }
 
 
+def _fresh(payload):
+    # V1.31.13: helper lists carry the time they were read; these lists were just read.
+    if isinstance(payload, dict) and "scanned_utc" not in payload:
+        from datetime import datetime, timezone
+        payload = {**payload, "scanned_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")}
+    return payload
+
+
 def _fake_get_json(acq, mobile):
+    acq, mobile = _fresh(acq), _fresh(mobile)
+
     def fake(path, timeout_sec=3.0):
         if path == "/acquisition/devices":
             return acq
@@ -79,7 +89,7 @@ def test_malware_live_devices_marks_needs_action_phone_not_ready(monkeypatch):
 
 
 def test_helper_recognises_android_by_its_usb_interfaces():
-    assert 'HelperVersion = "5.64"' in HELPER  # 5.62 Android USB states; 5.63 V1.31.8; 5.64 V1.31.9
+    assert 'HelperVersion = "5.65"' in HELPER  # 5.62 Android USB states; 5.63 V1.31.8; 5.64 V1.31.9; 5.65 V1.31.13
     assert HELPER.count("function Get-AndroidUsbStates") == 2  # startup scan and background refresh
     assert HELPER.count("$usbStates = Get-AndroidUsbStates -Lines $script:LastConnectedUsbLines") == 2
     assert HELPER.count("$usbStates.MtpKeys.Contains(") == 2

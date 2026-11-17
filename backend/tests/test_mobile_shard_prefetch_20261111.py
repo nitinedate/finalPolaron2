@@ -83,19 +83,6 @@ def test_byte_budget_and_multiple_shards_always_respected():
     assert sum(size for entries in groups.values() for _, size, _ in entries) <= 90
 
 
-def test_header_budget_does_not_rescan_large_cache_files():
-    rows = [item(f"cache{i}.exo", "part", 5_000_000) for i in range(20)]
-    claim = [{"payload": rows}]
-    full = prefetch.choose_prefetch_groups(claim, max_member=8_000_000, max_batch=12_000_000)
-    capped = prefetch.choose_prefetch_groups(
-        claim, max_member=8_000_000, max_batch=12_000_000,
-        retain_bytes={row["path"]: 4096 for row in rows},
-    )
-    assert len(full["part"]) == 2
-    assert len(capped["part"]) == 20
-    assert capped["part"][0][1] == 5_000_000
-
-
 def test_bad_size_is_not_fatal_to_other_forensic_files():
     rows = [item("broken", "p", "corrupt"), item("a", "p", 5), item("b", "p", 5)]
     groups = prefetch.choose_prefetch_groups([{"payload": rows}], max_batch=10)

@@ -52,11 +52,7 @@ def _get_driver():
         return None
     for uri in _neo4j_uris():
         try:
-            driver = GraphDatabase.driver(
-                uri,
-                auth=(settings.neo4j_user, settings.neo4j_password),
-                connection_timeout=3,
-            )
+            driver = GraphDatabase.driver(uri, auth=(settings.neo4j_user, settings.neo4j_password))
             driver.verify_connectivity()
             _driver = driver
             return _driver
@@ -496,25 +492,7 @@ def sync_job_graph_serial(db, job_id: str, *, schema_name: str, mobile: bool = F
     _driver_failed = False  # Allow the watchdog to recover after a transient outage.
     driver = _get_driver()
     if driver is None:
-        # Neo4j is a relationship view. Chats, files, and entities stay in the
-        # case database, so a missing graph server must not hold the job.
-        execute(
-            db,
-            """INSERT INTO graph_sync_state (job_id, status, error)
-               VALUES (:jid, 'skipped', 'Neo4j unavailable')
-               ON CONFLICT (job_id) DO UPDATE SET status='skipped', error='Neo4j unavailable'""",
-            {"jid": job_id},
-        )
-        db.commit()
-        return {
-            "status": "skipped",
-            "reason": "Neo4j unavailable; evidence remains in the case database",
-            "total": 1,
-            "completed": 1,
-            "skipped": 1,
-            "nodes": 0,
-            "edges": 0,
-        }
+        raise StageWaiting("Neo4j unavailable; graph synchronization remains pending")
     total = int(fetchone(db, "SELECT count(*) AS c FROM job_artifacts WHERE job_id=:jid", {"jid": job_id})["c"])
     nodes = edges = scanned = 0
     from app.services.progress_agent import note_operation

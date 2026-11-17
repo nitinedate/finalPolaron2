@@ -69,8 +69,7 @@ def register_client_source(
             request_ip=_request_ip(request),
             user_email=getattr(current, "email", "") or "",
             replace_existing=body.replace_existing,
-            relay_supported=body.relay or body.browser,
-            browser_share=body.browser,
+            relay_supported=body.relay,
         )
     except ClientEvidenceError as exc:
         db.rollback()

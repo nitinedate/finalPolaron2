@@ -76,8 +76,6 @@ def test_build_report_docx_is_valid_editable_a4_docx():
     assert abs(section.right_margin.mm - 16) < 0.5
     assert len(doc.tables) >= 1
     assert any("CYBER FORENSIC ANALYSIS REPORT" in p.text for p in doc.paragraphs)
-    assert 'w:ascii="Times New Roman"' in document_xml
-    assert "asciiTheme" not in document_xml
     table_xml = doc.tables[0]._tbl.xml
     assert "FFC000" in table_xml
     assert "D9E2F3" in table_xml or "d9e2f3" in table_xml.lower()

@@ -199,22 +199,15 @@ services:
   openvasd:
     image: registry.community.greenbone.net/community/openvas-scanner:stable
     restart: on-failure
-    # The feed hash cache defaults to SQLite on /dev/shm. Docker's 64 MB shm
-    # fills (openvasd.sql ~60 MB) and every feed check then fails with
-    # SQLite code 13 "database or disk is full". Keep the cache on a volume.
-    shm_size: "256mb"
     environment:
       OPENVASD_MODE: service_notus
       GNUPGHOME: /etc/openvas/gnupg
       LISTENING: 0.0.0.0:80
-      STORAGE_TYPE: fs
-      STORAGE_PATH: /var/lib/openvasd
     volumes:
       - gvm_openvas_data:/etc/openvas
       - gvm_openvas_log:/var/log/openvas
       - gvm_gpg_data:/etc/openvas/gnupg
       - gvm_notus_data:/var/lib/notus
-      - gvm_openvasd_data:/var/lib/openvasd
       # NASL feed: openvasd still verifies sha256sums.asc hourly even in service_notus.
       - gvm_vt_data:/var/lib/openvas/plugins
     depends_on:
@@ -468,4 +461,3 @@ volumes:
   gvm_redis_socket:
   gvm_openvas_data:
   gvm_openvas_log:
-  gvm_openvasd_data:
