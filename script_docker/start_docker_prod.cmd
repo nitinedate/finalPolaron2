@@ -9,17 +9,22 @@ echo.
 echo ==============================================================
 echo  POLARON FORENSIC SUITE - PRODUCTION HTTPS
 echo ==============================================================
-echo  HTTPS    : configured in script_docker\start_docker.settings.json
+echo  HTTPS    : https://PUBLIC_HTTPS_IP/ and, when set, https://PUBLIC_HTTPS_DOMAIN/
+echo             Both come from the root .env. An empty domain means IP only.
+echo  Certs    : trusted Let's Encrypt certificates, renewed automatically.
+echo  Caddy    : if Caddy already serves TCP 80/443 here, Polaron joins it
+echo             (PUBLIC_HTTPS_PROXY in .env); Caddy then renews the certificates.
+echo             A stopped Caddy is started first (CADDY_AUTOSTART in .env).
 echo  Common   : PostgreSQL, Redis, MinIO, OpenSearch, pgAdmin,
-echo             MailHog - reusable infrastructure; never shut down.
+echo             MailHog - shared with other projects, not stopped.
 echo  Neo4j    : Polaron-owned Docker service.
-echo  AI       : installed host Ollama; auto-provisioned native SuryaOCR inference.
-echo  Models   : NotMythos forensics; The-Xploiter on demand.
-echo  Safety   : preserves Docker volumes, evidence and other projects.
+echo  AI       : host Ollama and auto-provisioned host SuryaOCR; no Docker Ollama.
+echo  Models   : NotMythos forensics; The-Xploiter on-demand review.
+echo  Evidence : no Docker volume prune; keep existing case volumes.
 echo  Build    : check cached packages, stop Polaron apps, compile, restart.
 echo  Cache    : reuse CUDA, Python, pip, npm and Docker image layers.
 echo  Legacy  : one-time index handover requires -HandoverLegacyOpenSearch.
-echo  Required : valid production TLS settings and TCP 80/443 routing.
+echo  Required : production TLS needs public TCP 80 and 443 forwarded to this PC.
 echo.
 if not exist "%LAUNCHER%" goto :missing
 if not exist "%ROOT%\services\common\docker-compose.yml" goto :missingcommon
@@ -51,7 +56,7 @@ echo.
 if not "%EXITCODE%"=="0" (
   echo Startup failed with exit code %EXITCODE%.
 ) else (
-  echo Production Docker startup finished. Check the configured HTTPS URL.
+  echo Production Docker startup finished. Open the READY HTTPS address shown above.
 )
 if not "%AETHERIS_NO_PAUSE%"=="1" pause
 exit /b %EXITCODE%

@@ -20,6 +20,15 @@ if (-not $mode -and $url -and $url -ne $old) { $mode = 'external' }
 if (-not $mode) { $mode = 'native' }
 if ($mode -notin @('native','external','disabled')) { throw "Unsupported SURYA_HOST_MODE '$mode'" }
 $env:SURYA_HOST_MODE = $mode
+# V1.31.10: the host OCR settings in .env reach ensure_host_surya.ps1 (a value already set in the
+# environment wins). Before, only SURYA_HOST_MODE was read from .env.
+foreach ($key in @('SURYA_HOST_PORT', 'SURYA_HOST_ACCELERATOR', 'SURYA_HOST_GPU_LAYERS', 'SURYA_HOST_CONTEXT',
+        'SURYA_HOST_CACHE_DIR', 'SURYA_HOST_RUNTIME', 'SURYA_REQUIRED', 'SURYA_DOCKER_IMAGE', 'SURYA_DOCKER_GPU')) {
+    $value = Get-Setting $key
+    if ($value -and -not [Environment]::GetEnvironmentVariable($key, 'Process')) {
+        [Environment]::SetEnvironmentVariable($key, $value, 'Process')
+    }
+}
 if ($mode -ne 'native') { Write-Host "[Surya] Existing $mode configuration retained."; return }
 $port = if ($env:SURYA_HOST_PORT) { [int]$env:SURYA_HOST_PORT } else { 8000 }
 $updated = @()

@@ -54,6 +54,23 @@ def helper_base_url() -> str:
     return _ACTIVE_HELPER_URL or _candidate_helper_urls()[0]
 
 
+def helper_auth_headers(url: str | None = None) -> dict[str, str]:
+    """Shared secret for the helper when HOST_DRIVE_HELPER_TOKEN is configured on both sides.
+
+    With *url*, also the Host header a helper bound to 127.0.0.1 needs when it is reached through
+    host.docker.internal (V1.31.3, see hostdrive_agent.docker_host_header).
+    """
+    token = (os.environ.get("HOST_DRIVE_HELPER_TOKEN") or "").strip()
+    headers = {"X-Host-Helper-Token": token} if token else {}
+    if url:
+        from app.services.hostdrive_agent import docker_host_header
+
+        host = docker_host_header(url)
+        if host:
+            headers["Host"] = host
+    return headers
+
+
 def is_host_job_id(run_id: str | None) -> bool:
     return bool(_HOST_JOB_ID_RE.match(str(run_id or "").strip()))
 
@@ -163,7 +180,7 @@ def helper_reachable(timeout_sec: float = 2.0) -> bool:
     last_exc: Exception | None = None
     for base in _candidate_helper_urls():
         try:
-            req = urllib.request.Request(f"{base}/health", method="GET")
+            req = urllib.request.Request(f"{base}/health", method="GET", headers=helper_auth_headers(base))
             with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
                 data = json.loads(resp.read().decode("utf-8", errors="replace"))
                 if bool(data.get("ok")):
@@ -181,7 +198,7 @@ def helper_reachable(timeout_sec: float = 2.0) -> bool:
 def _get_json(path: str, *, timeout_sec: float = 30.0) -> dict[str, Any] | None:
     url = f"{helper_base_url()}{path}"
     try:
-        req = urllib.request.Request(url, method="GET")
+        req = urllib.request.Request(url, method="GET", headers=helper_auth_headers(url))
         with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
             return json.loads(resp.read().decode("utf-8", errors="replace"))
     except Exception as exc:
@@ -197,7 +214,7 @@ def _post_json(path: str, body: dict[str, Any], *, timeout_sec: float = 1800.0) 
             url,
             data=raw,
             method="POST",
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **helper_auth_headers(url)},
         )
         with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
             return json.loads(resp.read().decode("utf-8", errors="replace"))
@@ -266,22 +283,84 @@ def fetch_host_adapters() -> list[dict[str, Any]]:
     return list(data.get("adapters") or [])
 
 
+# V1.31.13: a helper phone list is trusted only while it is current. Helper 5.64+ reads the phones live at
+# each request; an older helper returns a file its background job writes every 10-15 s, which on some
+# computers stopped being written and kept listing phones that were unplugged long ago.
+HELPER_LIST_STALE_SEC = 120
+_ISO_RE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:?\d\d)?$")
+
+
+def _parse_helper_time(value: Any) -> datetime | None:
+    m = _ISO_RE.match(str(value or "").strip())
+    if not m:
+        return None
+    frac = (m.group(2) or "")[:6].ljust(6, "0")
+    zone = m.group(3) or "Z"
+    zone = "+00:00" if zone == "Z" else (zone if ":" in zone else zone[:3] + ":" + zone[3:])
+    try:
+        return datetime.fromisoformat(f"{m.group(1)}.{frac}{zone}")
+    except ValueError:
+        return None
+
+
+def helper_list_staleness(data: Any, *, now: datetime | None = None) -> str:
+    """'' when the helper's phone list can be shown; otherwise why not (for the warnings)."""
+    if not isinstance(data, dict):
+        return ""
+    rows = data.get("devices")
+    if rows is None:
+        rows = data.get("mobile_devices")
+    scanned = _parse_helper_time(data.get("scanned_utc"))
+    if scanned is None:
+        if rows:
+            return (
+                "The phone list of the Polaron helper on the forensic server does not say when it was read "
+                "(helper older than 5.61), so its phones are not shown. On the server run "
+                "scripts\\ensure-host-drive-helper.ps1 -ForceRestart when no collection is running."
+            )
+        return ""
+    age = ((now or datetime.now(timezone.utc)) - scanned).total_seconds()
+    if age <= HELPER_LIST_STALE_SEC:
+        return ""
+    minutes = max(1, int(round(age / 60)))
+    return (
+        f"The phone list of the Polaron helper on the forensic server was last read {minutes} min ago and is not "
+        "updating, so its phones are not shown (they may have been unplugged). On the server run "
+        "scripts\\ensure-host-drive-helper.ps1 -ForceRestart when no collection is running."
+    )
+
+
 def fetch_host_devices() -> tuple[list[dict[str, Any]], list[str]]:
     data = _get_json("/acquisition/devices", timeout_sec=3.0)
+    if data:
+        stale = helper_list_staleness(data)
+        if stale:
+            return [], [stale]
     if not data:
         mobile = _get_json("/mobile-devices", timeout_sec=3.0) or {}
+        if not mobile.get("scanned_utc"):
+            # Helper older than 5.64: its mobile list is the background file; only trust a current one.
+            mobile = {**mobile, "scanned_utc": None}
+        stale = helper_list_staleness(mobile)
+        if stale:
+            return [], [stale]
         raw = list(mobile.get("mobile_devices") or [])
         mapped: list[dict[str, Any]] = []
         for item in raw:
             os_hint = str(item.get("os_hint") or "android")
+            # Helper 5.62+: a phone on the cable that is not usable yet (charging only / no driver).
+            needs_action = os_hint != "ios" and item.get("connection") == "usb" and bool(item.get("state"))
+            adb = os_hint != "ios" and item.get("connection") == "adb"
             mapped.append({
-                "adapter": "ios_lockdown" if os_hint == "ios" else "android_mtp",
+                "adapter": "ios_lockdown" if os_hint == "ios" else (
+                    "android_usb" if needs_action else ("android_adb" if adb else "android_mtp")),
                 "device_id": item.get("id") or item.get("instance_id") or "",
                 "label": item.get("name") or "Phone",
-                "status": "wpd",
+                "status": str(item.get("state")) if needs_action else ("adb" if adb else "wpd"),
                 "os_family": os_hint,
                 "instance_id": item.get("instance_id") or "",
                 "connection": item.get("connection") or "mtp",
+                **({"state": item.get("state"), "guidance": item.get("guidance") or ""} if needs_action else {}),
             })
         if mapped:
             return mapped, []

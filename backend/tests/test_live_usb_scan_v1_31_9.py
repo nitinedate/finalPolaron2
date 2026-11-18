@@ -184,4 +184,4 @@ def test_endpoints_use_the_live_read():
     assert 'path == "/acquisition/devices") WriteLiveDevices(ctx, query);' in text
     assert 'WriteLiveMobile(ctx, query);' in text
     assert "SetupDiGetClassDevsW(IntPtr.Zero, \"USB\", IntPtr.Zero, DIGCF_PRESENT | DIGCF_ALLCLASSES)" in text
-    assert 'HelperVersion = "5.65"' in text
+    assert 'HelperVersion = "5.66"' in text

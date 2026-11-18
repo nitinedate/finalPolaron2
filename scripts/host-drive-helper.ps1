@@ -65,11 +65,11 @@ function Get-HostPython {
 
 function New-HostDevicePreview {
     param([string]$Adapter, [string]$DeviceId, [string]$NameHint = "")
-    if ($Adapter -notin @("android_adb", "android_mtp", "ios_lockdown")) {
-        return @{ ok = $false; error = "Unsupported mobile adapter" }
-    }
-    $os = $(if ($Adapter -eq "ios_lockdown") { "ios" } else { "android" })
-    $name = $(if ($NameHint) { $NameHint } else { "Unknown model" })
+    $os = "android"
+    if ($Adapter -match 'ios') { $os = "ios" }
+    $name = $(if ($NameHint) { $NameHint } else { $DeviceId })
+    if ($name -match '(?i)iPhone|iPad|iPod|Apple') { $os = "ios" }
+    elseif ($name -match '(?i)Android|Samsung|Galaxy|Pixel|Xiaomi|Huawei|Honor|OnePlus|Oppo|Vivo') { $os = "android" }
     $logicalOnly = ($Adapter -match 'mtp' -or $Adapter -eq "android_mtp")
     $methods = if ($os -eq "ios") { @("backup", "advanced_logical", "logical") } else { @("logical", "advanced_logical", "backup", "file_system", "full_file_system") }
     $manufacturer = if ($os -eq "ios") { "Apple" } elseif ($name -match '(?i)Samsung|Galaxy') { "Samsung" } elseif ($name -match '(?i)Oppo') { "OPPO" } else { "" }
@@ -93,7 +93,7 @@ function New-HostDevicePreview {
             encryption_state = "unknown"
             connection_mode = $(if ($logicalOnly) { "mtp" } else { "usb" })
             usb_debugging_authorized = [bool]($Adapter -eq "android_adb")
-            pairing_trusted = $false
+            pairing_trusted = [bool]($os -eq "ios")
             developer_mode = $false
             rooted_or_jailbroken = $null
             battery_percent = $null
@@ -264,7 +264,12 @@ $script:AcquireJobs = @{}
 $script:RefreshStatusFile = Join-Path $env:TEMP ("aetheris_drive_refresh_{0}.json" -f $PID)
 $script:RefreshProcess = $null
 $refreshJobScript = Join-Path $root "scripts\refresh-drive-mounts-job.ps1"
-$script:HelperVersion = "5.57"  # USB-debugging phones (ADB, no MTP volume) are detected; 5.56 remediation endpoints
+$script:HelperComputerName = [string]$env:COMPUTERNAME
+# Where a client-created mobile image is copied on this server (V1.27.0). Default:
+# the same case root server-side collections use. HOST_IMPORT_CASE_ROOT overrides it.
+$script:ImportCasesRootOverride = [string]$env:HOST_IMPORT_CASE_ROOT
+$script:ImportCasesRoot = $(if ($script:ImportCasesRootOverride) { $script:ImportCasesRootOverride } else { Join-Path $root "evidence\cases" })
+$script:HelperVersion = "5.66"  # 5.66 a collection on this computer is sent to the forensic server while it runs (polaron-stream-upload.ps1, destination = the server of the setup file); 5.65 the phones in /drives are live too; 5.64 phone lists read live from Windows on each request (no frozen list); 5.63 /health says whether the Client Evidence Agent runs; kept up to date from the server (polaron-client-update.ps1); 5.62 Android phones found by their File transfer interface; charging-only / no-driver phones listed with what to do; 5.61 phone list follows the cables during a copy (registry read) and ignores leftover copy processes; 5.60 do not kill pnputil or re-enumerate USB during a phone copy; 5.59 C# taskkill fallbacks keep `$_ (stop USB collection works)
 $script:DeviceCacheAt = [datetime]::MinValue
 $script:DeviceCache = @()
 $script:DeviceScanBusy = $false
@@ -863,26 +868,43 @@ function Invoke-ListDir {
     }
     $item = Get-Item -LiteralPath $norm -Force -ErrorAction Stop
     $folder = if ($item.PSIsContainer) { [string]$item.FullName } else { [string]$item.DirectoryName }
-    $entries = @(Get-ChildItem -LiteralPath $folder -Force -ErrorAction SilentlyContinue | Sort-Object -Property Name)
     $files = New-Object System.Collections.Generic.List[hashtable]
-    foreach ($e in $entries) {
-        $isDir = $false
-        try { $isDir = [bool]$e.PSIsContainer } catch { $isDir = $false }
-        $size = $null
-        if (-not $isDir) {
-            try { $size = [int64]$e.Length } catch { $size = $null }
+    $omitted = New-Object System.Collections.Generic.List[hashtable]
+    $names = @()
+    try {
+        $names = @([System.IO.Directory]::GetFileSystemEntries($folder))
+    }
+    catch [System.UnauthorizedAccessException] {
+        throw "Windows denied access to $folder"
+    }
+    foreach ($entryPath in $names) {
+        $name = [System.IO.Path]::GetFileName($entryPath)
+        try {
+            $attr = [System.IO.File]::GetAttributes($entryPath)
+            $isDir = ($attr -band [System.IO.FileAttributes]::Directory) -ne 0
+            $size = $null
+            if (-not $isDir) {
+                try { $size = [int64](New-Object System.IO.FileInfo($entryPath)).Length } catch { $size = $null }
+            }
+            $files.Add(@{
+                name       = [string]$name
+                kind       = $(if ($isDir) { "dir" } else { "file" })
+                size_bytes = $size
+            }) | Out-Null
         }
-        $files.Add(@{
-            name       = [string]$e.Name
-            kind       = $(if ($isDir) { "dir" } else { "file" })
-            size_bytes = $size
-        }) | Out-Null
+        catch [System.UnauthorizedAccessException] {
+            $omitted.Add(@{ name = [string]$name; reason = "access_denied"; detail = "Windows denied access" }) | Out-Null
+        }
+        catch {
+            $omitted.Add(@{ name = [string]$name; reason = "unavailable"; detail = $_.Exception.Message }) | Out-Null
+        }
     }
     return @{
         ok         = $true
         path       = $folder
         count      = $files.Count
         entries    = $files.ToArray()
+        omitted    = $omitted.ToArray()
         error      = $null
     }
 }
@@ -1210,16 +1232,15 @@ function Get-StartedUsbInstanceIds {
     $err = $tmp + ".err"
     $pnputil = Join-Path $env:SystemRoot "System32\pnputil.exe"
     $pnputilOk = $false
+    $finished = $false
     try {
         if (Test-Path -LiteralPath $pnputil) {
             $proc = Start-Process -FilePath $pnputil -ArgumentList @("/enum-devices", "/connected", "/ids") `
                 -PassThru -WindowStyle Hidden -RedirectStandardOutput $tmp -RedirectStandardError $err
-            if (-not $proc.WaitForExit(5000)) {
-                try { $proc.Kill() } catch {}
-            } else {
-                $pnputilOk = ($proc.ExitCode -eq 0)
-            }
-            if ($pnputilOk -and (Test-Path -LiteralPath $tmp)) {
+            # Never kill pnputil. Aborting enumeration resets the phone USB interfaces.
+            $finished = $false
+            try { $finished = $proc.WaitForExit(20000) } catch { $finished = $false }
+            if ($finished -and $proc.ExitCode -eq 0 -and (Test-Path -LiteralPath $tmp)) {
                 $script:LastConnectedUsbLines = @(Get-Content -LiteralPath $tmp -ErrorAction SilentlyContinue)
                 foreach ($line in $script:LastConnectedUsbLines) {
                     if ($line -match '(?i)Instance ID:\s+(\S+)') {
@@ -1227,15 +1248,61 @@ function Get-StartedUsbInstanceIds {
                         if ($id -match '(?i)USB\\VID_') { [void]$ids.Add($id) }
                     }
                 }
-                # An incomplete/failed pnputil run is not authoritative.
+                $pnputilOk = $true
             }
         }
     } catch {}
     finally {
-        Remove-Item -LiteralPath $tmp, $err -Force -ErrorAction SilentlyContinue
+        if ($finished) {
+            Remove-Item -LiteralPath $tmp, $err -Force -ErrorAction SilentlyContinue
+        }
     }
-    # No historical Windows registry fallback: fail closed on transient PnP errors.
+    if ($pnputilOk) { return $ids }
+    $svcRoot = "HKLM:\SYSTEM\CurrentControlSet\Services"
+    try {
+        Get-ChildItem -LiteralPath $svcRoot -ErrorAction SilentlyContinue | ForEach-Object {
+            $enumPath = Join-Path $_.PSPath "Enum"
+            if (-not (Test-Path -LiteralPath $enumPath)) { return }
+            $enum = Get-ItemProperty -LiteralPath $enumPath -ErrorAction SilentlyContinue
+            if (-not $enum) { return }
+            $count = 0
+            try { $count = [int]$enum.Count } catch { $count = 0 }
+            if ($count -le 0) { return }
+            for ($i = 0; $i -lt $count; $i++) {
+                $id = [string]$enum."$i"
+                if ($id -match '(?i)USB\\VID_') { [void]$ids.Add($id) }
+            }
+        }
+    } catch {}
+    $script:LastConnectedUsbLines = @(Get-RegistryUsbLines -Ids $ids)
     return $ids
+}
+
+function Get-RegistryUsbLines {
+    # V1.31.6: pnputil-style lines (Instance ID / Device Description / Status / Compatible IDs) read from
+    # the registry for the USB devices Windows is running, so USB-debugging phones are still recognised
+    # (interface class FF/42/01) when pnputil is not used. Reading the registry never touches USB.
+    param($Ids)
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($id in @($Ids)) {
+        if (-not $id) { continue }
+        $props = Get-ItemProperty -LiteralPath ("HKLM:\SYSTEM\CurrentControlSet\Enum\" + $id) -ErrorAction SilentlyContinue
+        $desc = ""
+        if ($props -and $props.PSObject.Properties['DeviceDesc']) { $desc = [string]$props.DeviceDesc }
+        if ($desc -match ';(.+)$') { $desc = $Matches[1] }
+        $lines.Add("Instance ID:                $id")
+        $lines.Add("Device Description:         $desc")
+        if ($props -and $props.PSObject.Properties['Mfg']) {
+            $mfg = [string]$props.Mfg
+            if ($mfg -match ';(.+)$') { $mfg = $Matches[1] }
+            $lines.Add("Manufacturer Name:          $mfg")
+        }
+        $lines.Add("Status:                     Started")
+        if ($props -and $props.PSObject.Properties['CompatibleIDs']) {
+            foreach ($c in @($props.CompatibleIDs)) { if ($c) { $lines.Add("Compatible IDs:             $c") } }
+        }
+    }
+    return [string[]]$lines.ToArray()
 }
 
 function Test-WpdIdCurrentlyAttached {
@@ -1279,7 +1346,7 @@ function Get-ConnectedAdbPhones {
             if (-not $seen.ContainsKey($key)) {
                 $seen[$key] = $true
                 $name = [string]$desc
-                if (-not $name -or $name -match '(?i)^(USB Composite Device|USB Device|WinUsb Device|ADB Interface|Android ADB Interface)$') {
+                if (-not $name -or $name -match '(?i)^(USB Composite Device|USB Device|WinUsb Device|ADB Interface|ADB Device|Android ADB Interface|Android Composite ADB Interface)$') {
                     $name = "Android phone"
                 }
                 $phones.Add(@{
@@ -1316,8 +1383,120 @@ function Get-ConnectedAdbPhones {
     return [object[]]$phones.ToArray()
 }
 
+function Get-AndroidUsbStates {
+    # V1.31.7: what Windows shows of Android phones on USB, from pnputil-style lines (pnputil or registry).
+    #   MtpKeys - VID|PID of phones with a running File transfer (MTP) interface, whatever Windows calls them
+    #             (many phones are listed only by a model code such as SM-A546E or CPH2451).
+    #   Ready   - phones with a running File transfer interface that Windows' portable-device list does not
+    #             show (the collection finds them by their USB vendor and product ID).
+    #   Rows    - phones that are plugged in but not usable yet (charging only, or no Windows driver for their
+    #             interface), with what to do on the phone. Before, such a phone was simply not listed.
+    param([string[]]$Lines)
+    $phoneVendors = @('18D1', '2717', '2A70', '22D9', '2D95', '22B8', '339B', '2A45', '2E04', '29A9', '2B4C')
+    $maybeVendors = @('04E8', '0FCE', '1004', '0B05', '0E8D', '05C6', '12D1', '19D2', '0BB4')
+    $notPhoneWords = '(?i)modem|network|broadband|mobile connect|card reader|keyboard|mouse|headset|webcam|printer|bluetooth|mass storage|ssd|flash drive'
+    $phoneWords = '(?i)android|phone|galaxy|pixel|redmi|xiaomi|poco|oneplus|oppo|vivo|realme|iqoo|moto|nokia|honor|huawei|nothing|infinix|tecno|itel|xperia|mobile'
+    $genericDesc = '(?i)^(USB Composite Device|USB Device|WinUsb Device|ADB Interface|ADB Device|Android ADB Interface|Android Composite ADB Interface|MTP USB Device|USB Input Device|Generic USB Hub|USB Mass Storage Device)$'
+    # Names used only when nothing better is shown: the File transfer interface carries the phone's own name.
+    $fallbackDesc = '(?i)Composite Device$|ADB Interface$|Modem$'
+    $groups = @{}
+    $block = $null
+    $flush = {
+        if ($block -and $block.Id -match '(?i)^USB\\VID_([0-9A-F]{4})&PID_([0-9A-F]{4})(&MI_[0-9A-F]{2})?\\(.+)$') {
+            $vid = $Matches[1].ToUpperInvariant()
+            $prodId = $Matches[2].ToUpperInvariant()
+            $iface = [bool]$Matches[3]
+            $tail = [string]$Matches[4]
+            if ($vid -ne '05AC') {
+                $key = "android|$vid|$prodId"
+                if (-not $groups.ContainsKey($key)) {
+                    $groups[$key] = @{ Vid = $vid; ProdId = $prodId; Serial = ''; Instance = ''; Desc = ''; Phone = $false; AdbOk = $false; AdbBad = $false; MtpOk = $false; MtpBad = $false; MsMtp = $false; MtpDesc = ''; FallbackDesc = '' }
+                }
+                $g = $groups[$key]
+                $ids = [string]$block.Ids
+                $started = ((-not $block.Status) -or $block.Status -eq 'Started')
+                $isAdb = ($ids -match '(?i)SubClass_42&Prot_01|MS_COMP_ADB')
+                $isMtp = (($ids -match '(?i)MS_COMP_MTP') -or ($ids -match '(?i)Class_06&SubClass_01&Prot_01'))
+                if ($isAdb) { if ($started) { $g.AdbOk = $true } else { $g.AdbBad = $true } }
+                if ($isMtp) { if ($started) { $g.MtpOk = $true } else { $g.MtpBad = $true } }
+                if ($ids -match '(?i)MS_COMP_MTP') { $g.MsMtp = $true }
+                if ((-not $iface) -and $tail -notmatch '&') { $g.Serial = $tail; $g.Instance = $block.Id }
+                if (-not $g.Instance) { $g.Instance = $block.Id }
+                $words = ([string]$block.Desc + ' ' + [string]$block.Mfr)
+                if ($isAdb -or ($phoneVendors -contains $vid) -or ((($maybeVendors -contains $vid) -or $isMtp) -and $words -match $phoneWords -and $words -notmatch $notPhoneWords)) { $g.Phone = $true }
+                if ($block.Desc -and $block.Desc -notmatch $genericDesc) {
+                    if ($isMtp -and -not $g.MtpDesc) { $g.MtpDesc = [string]$block.Desc }
+                    if ($block.Desc -match $fallbackDesc) { if (-not $g.FallbackDesc) { $g.FallbackDesc = [string]$block.Desc } }
+                    elseif (-not $g.Desc) { $g.Desc = [string]$block.Desc }
+                }
+            }
+        }
+    }
+    foreach ($line in @($Lines)) {
+        $text = [string]$line
+        if ($text -match '(?i)^\s*Instance ID:\s+(\S+)') {
+            $newId = [string]$Matches[1]   # read before the flush, which runs its own matches
+            . $flush
+            $block = @{ Id = $newId; Desc = ''; Mfr = ''; Status = ''; Ids = '' }
+            continue
+        }
+        if (-not $block) { continue }
+        if ($text -match '(?i)^\s*Device Description:\s+(.+?)\s*$') { $block.Desc = [string]$Matches[1]; continue }
+        if ($text -match '(?i)^\s*Manufacturer Name:\s+(.+?)\s*$') { $block.Mfr = [string]$Matches[1]; continue }
+        if ($text -match '(?i)^\s*Status:\s+(\S+)') { $block.Status = [string]$Matches[1]; continue }
+        $block.Ids = [string]$block.Ids + ' ' + $text.Trim()
+    }
+    . $flush
+    $mtpKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $rows = @()
+    $ready = @()
+    foreach ($key in @($groups.Keys)) {
+        $g = $groups[$key]
+        # A camera uses the same picture-transfer class; Android's File transfer also says MS_COMP_MTP.
+        if ($g.MtpOk -and ($g.Phone -or $g.MsMtp)) {
+            [void]$mtpKeys.Add($g.Vid + '|' + $g.ProdId)
+            $ready += @{
+                id               = $g.Instance
+                name             = $(if ($g.MtpDesc) { $g.MtpDesc } elseif ($g.Desc) { $g.Desc } elseif ($g.FallbackDesc) { $g.FallbackDesc } else { 'Android phone (File transfer)' })
+                device_class     = 'WPD'
+                connection       = 'mtp'
+                os_hint          = 'android'
+                instance_id      = $g.Instance
+                has_drive_letter = $false
+                live_acquire     = $true
+                capability_label = 'SUPPORTED_DIRECT_LOGICAL'
+                guidance         = 'Connected phone detected (File transfer). Use Start extraction.'
+                ios_backup_roots = @()
+            }
+        }
+        if ((-not $g.Phone) -or $g.AdbOk -or $g.MtpOk) { continue }
+        $state = 'charging_only'
+        $guidance = 'Connected for charging only. Unlock the phone, open the USB notification on it and choose File transfer (for a deeper collection also turn on USB debugging and tap Allow), then Rescan.'
+        if ($g.AdbBad -or $g.MtpBad) {
+            $state = 'driver_missing'
+            $guidance = 'Windows has no working driver for this phone''s USB interface (Device Manager shows it with a warning). On the phone choose USB: File transfer, which needs no extra driver, or install the phone maker''s USB driver, then Rescan.'
+        }
+        $rows += @{
+            id               = $(if ($g.Serial) { $g.Serial } else { $g.Instance })
+            name             = $(if ($g.Desc) { $g.Desc } elseif ($g.FallbackDesc) { $g.FallbackDesc } else { 'Android phone' })
+            device_class     = 'USB'
+            connection       = 'usb'
+            os_hint          = 'android'
+            instance_id      = $g.Instance
+            has_drive_letter = $false
+            live_acquire     = $false
+            state            = $state
+            capability_label = 'NEEDS_ACTION'
+            guidance         = $guidance
+            ios_backup_roots = @()
+        }
+    }
+    return @{ MtpKeys = $mtpKeys; Ready = $ready; Rows = $rows }
+}
+
 function Get-PresentWpdPhones {
     $started = Get-StartedUsbInstanceIds
+    $usbStates = Get-AndroidUsbStates -Lines $script:LastConnectedUsbLines
     $list = @()
     $seen = @{}
     foreach ($regRoot in @(
@@ -1332,14 +1511,14 @@ function Get-PresentWpdPhones {
             if (-not $name) { $name = $id }
             if (-not $id) { return }
             if ($name -match '(?i)^(Local Disk|Windows|Network|CD Drive|DVD|Removable Disk|New Volume|CCCOMA_|RUFUS_)') { return }
+            $mtpPhone = $false
+            if ($id -match '(?i)VID_([0-9A-F]{4}).*?PID_([0-9A-F]{4})') { $mtpPhone = $usbStates.MtpKeys.Contains($Matches[1] + '|' + $Matches[2]) }
             $looksPhone = ($name -match '(?i)iPhone|iPad|iPod|Apple|Android|Samsung|Galaxy|Xiaomi|Redmi|Huawei|Honor|OnePlus|Pixel|Oppo|Vivo|Tecno|Infinix|Motorola|Nokia|Realme|Nothing|Phone') -or
-                ($id -match '(?i)VID_(05AC|18D1|04E8|2717|2A45|0E8D|2A70|19D2|22D9|29A9|05C6|12D1|22B8|0BB4|0FCE|1004|0B05|2B4C|2D95)')
+                ($id -match '(?i)VID_(05AC|18D1|04E8|2717|2A45|0E8D|2A70|19D2|22D9|29A9|05C6|12D1|22B8|0BB4|0FCE|1004|0B05|2B4C|2D95|339B|2E04)') -or $mtpPhone
             if (-not $looksPhone) { return }
             if (-not (Test-WpdIdCurrentlyAttached -WpdId $id -StartedIds $started)) { return }
-            $isApple = ($id -match '(?i)VID_05AC') -or ($name -match '(?i)iPhone|iPad|iPod|Apple')
-            $isAndroid = ($id -match '(?i)VID_(18D1|04E8|2717|2A45|0E8D|2A70|19D2|22D9|29A9|05C6|12D1|22B8|0BB4|0FCE|1004|0B05|2B4C|2D95)') -or ($name -match '(?i)Android|Samsung|Galaxy|Xiaomi|Redmi|Huawei|Honor|OnePlus|Pixel|Oppo|Vivo|Tecno|Infinix|Motorola|Nokia|Realme|Nothing')
-            if (-not $isApple -and -not $isAndroid) { return }
-            $os = $(if ($isApple) { "ios" } else { "android" })
+            $os = "android"
+            if ($name -match '(?i)iPhone|iPad|iPod|Apple' -or $id -match '(?i)VID_05AC') { $os = "ios" }
             $key = ($name + "|" + $os).ToLowerInvariant()
             if ($id -match 'VID_([0-9A-Fa-f]{4}).*?PID_([0-9A-Fa-f]{4})') {
                 $key = $os + "|" + $Matches[1].ToUpperInvariant() + "|" + $Matches[2].ToUpperInvariant()
@@ -1381,6 +1560,15 @@ function Get-PresentWpdPhones {
         $seen[$key] = $true
         $list += $adbPhone
     }
+    foreach ($row in @(@($usbStates.Ready) + @($usbStates.Rows))) {
+        $rowKey = ""
+        if ([string]$row.instance_id -match 'VID_([0-9A-Fa-f]{4}).*?PID_([0-9A-Fa-f]{4})') {
+            $rowKey = "android|" + $Matches[1].ToUpperInvariant() + "|" + $Matches[2].ToUpperInvariant()
+        }
+        if (-not $rowKey -or $seen.ContainsKey($rowKey)) { continue }
+        $seen[$rowKey] = $true
+        $list += $row
+    }
     return $list
 }
 
@@ -1396,6 +1584,7 @@ function Write-MobileDeviceCaches {
         $status = "wpd"
         if ($os -eq "ios") { $adapter = "ios_lockdown" }
         elseif ($conn -eq "adb") { $adapter = "android_adb"; $status = "adb" }
+        elseif ($conn -eq "usb") { $adapter = "android_usb"; $status = [string]$d.state }
         $acq += @{
             adapter     = $adapter
             device_id   = [string]$d.id
@@ -1404,9 +1593,11 @@ function Write-MobileDeviceCaches {
             os_family   = $(if ($os) { $os } else { "android" })
             instance_id = [string]$d.instance_id
             connection  = $conn
+            guidance    = [string]$d.guidance
+            state       = [string]$d.state
         }
     }
-    $acqBody = @{ ok = $true; devices = $acq; warnings = @(); count = $acq.Count }
+    $acqBody = @{ ok = $true; devices = $acq; warnings = @(); count = $acq.Count; scanned_utc = (Get-Date).ToUniversalTime().ToString("o"); source = "startup" }
     [System.IO.File]::WriteAllText($script:AcqDevicesCacheFile, ($acqBody | ConvertTo-Json -Compress -Depth 6))
     $script:DeviceCache = $list
     $script:DeviceCacheAt = Get-Date
@@ -1414,19 +1605,18 @@ function Write-MobileDeviceCaches {
 
 function Read-MobileDeviceCacheFile {
     $file = $script:DeviceCacheFile
-    if (-not $file -or -not (Test-Path -LiteralPath $file)) { return @() }
-    if (((Get-Date).ToUniversalTime() - (Get-Item -LiteralPath $file).LastWriteTimeUtc).TotalSeconds -gt 15) { return @() }
+    if (-not $file -or -not (Test-Path -LiteralPath $file)) { return @($script:DeviceCache) }
     try {
         $raw = Get-Content -LiteralPath $file -Raw -ErrorAction Stop
-        if (-not $raw) { return @() }
+        if (-not $raw) { return @($script:DeviceCache) }
         $obj = $raw | ConvertFrom-Json
-        if ($null -eq $obj) { return @() }
+        if ($null -eq $obj) { return @($script:DeviceCache) }
         $rows = @($obj)
         $script:DeviceCache = $rows
         $script:DeviceCacheAt = Get-Date
         return $rows
     } catch {
-        return @()
+        return @($script:DeviceCache)
     }
 }
 
@@ -1437,53 +1627,110 @@ function Start-MobileDeviceRefresh {
             Remove-Job $script:DeviceRefreshJob -Force -ErrorAction SilentlyContinue
         }
     } catch {}
-    $probePython = Get-HostPython
-    $probeScript = Join-Path $root "scripts\mobile_device_probe.py"
     $script:DeviceRefreshJob = Start-Job -Name "aetheris-mobile-refresh" -ScriptBlock {
-        param($CacheFile, $AcqFile, $ProbePython, $ProbeScript)
-        function Get-LivePhoneProbe {
-            if (-not $ProbePython -or -not (Test-Path -LiteralPath $ProbePython) -or -not (Test-Path -LiteralPath $ProbeScript)) { return @() }
-            $stamp = [guid]::NewGuid().ToString("N")
-            $out = Join-Path $env:TEMP ("mobile_probe_" + $stamp + ".json")
-            $err = $out + ".err"
-            try {
-                $proc = Start-Process -FilePath $ProbePython -ArgumentList @(('"' + $ProbeScript + '"')) -WindowStyle Hidden `
-                    -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
-                if (-not $proc.WaitForExit(5000)) { try { $proc.Kill() } catch {}; return @() }
-                if ($proc.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $out)) { return @() }
-                $json = Get-Content -LiteralPath $out -Raw -Encoding UTF8 | ConvertFrom-Json
-                if (-not $json.ok) { return @() }
-                return @($json.mobile_devices | Where-Object { $_.os_hint -in @("android", "ios") })
-            } catch { return @() }
-            finally { Remove-Item -LiteralPath $out, $err -Force -ErrorAction SilentlyContinue }
-        }
-        function Get-StartedUsbInstanceIds {
+        param($CacheFile, $AcqFile)
+        $script:PnputilProc = $null
+        $script:PnputilOut = Join-Path $env:TEMP "aetheris_mobile_pnputil.txt"
+        $script:PnputilErr = Join-Path $env:TEMP "aetheris_mobile_pnputil.err"
+        $script:EnumFresh = $false
+        function Read-PnputilUsbIds {
+            param([string]$Path)
             $ids = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
             $script:LastConnectedUsbLines = @()
-            $tmp = Join-Path $env:TEMP ("aetheris_pnputil_" + [guid]::NewGuid().ToString("N") + ".txt")
-            $err = $tmp + ".err"
-            $pnputil = Join-Path $env:SystemRoot "System32\pnputil.exe"
-            $pnputilOk = $false
-            try {
-                if (Test-Path -LiteralPath $pnputil) {
-                    $proc = Start-Process -FilePath $pnputil -ArgumentList @("/enum-devices", "/connected", "/ids") `
-                        -PassThru -WindowStyle Hidden -RedirectStandardOutput $tmp -RedirectStandardError $err
-                    if (-not $proc.WaitForExit(5000)) { try { $proc.Kill() } catch {} }
-                    else { $pnputilOk = ($proc.ExitCode -eq 0) }
-                    if ($pnputilOk -and (Test-Path -LiteralPath $tmp)) {
-                        $script:LastConnectedUsbLines = @(Get-Content -LiteralPath $tmp -ErrorAction SilentlyContinue)
-                        foreach ($line in $script:LastConnectedUsbLines) {
-                            if ($line -match '(?i)Instance ID:\s+(\S+)') {
-                                $id = [string]$Matches[1]
-                                if ($id -match '(?i)USB\\VID_') { [void]$ids.Add($id) }
-                            }
-                        }
-                        # Do not trust output from a timed-out pnputil process.
-                    }
+            if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $ids }
+            $script:LastConnectedUsbLines = @(Get-Content -LiteralPath $Path -ErrorAction SilentlyContinue)
+            foreach ($line in $script:LastConnectedUsbLines) {
+                if ($line -match '(?i)Instance ID:\s+(\S+)') {
+                    $id = [string]$Matches[1]
+                    if ($id -match '(?i)USB\\VID_') { [void]$ids.Add($id) }
                 }
-            } catch {}
-            finally { Remove-Item -LiteralPath $tmp, $err -Force -ErrorAction SilentlyContinue }
-            # No historical Windows registry fallback.
+            }
+            return $ids
+        }
+        function Get-RegistryUsbLines {
+            param($Ids)
+            $lines = New-Object System.Collections.Generic.List[string]
+            foreach ($id in @($Ids)) {
+                if (-not $id) { continue }
+                $props = Get-ItemProperty -LiteralPath ("HKLM:\SYSTEM\CurrentControlSet\Enum\" + $id) -ErrorAction SilentlyContinue
+                $desc = ""
+                if ($props -and $props.PSObject.Properties['DeviceDesc']) { $desc = [string]$props.DeviceDesc }
+                if ($desc -match ';(.+)$') { $desc = $Matches[1] }
+                $lines.Add("Instance ID:                $id")
+                $lines.Add("Device Description:         $desc")
+                if ($props -and $props.PSObject.Properties['Mfg']) {
+                    $mfg = [string]$props.Mfg
+                    if ($mfg -match ';(.+)$') { $mfg = $Matches[1] }
+                    $lines.Add("Manufacturer Name:          $mfg")
+                }
+                $lines.Add("Status:                     Started")
+                if ($props -and $props.PSObject.Properties['CompatibleIDs']) {
+                    foreach ($c in @($props.CompatibleIDs)) { if ($c) { $lines.Add("Compatible IDs:             $c") } }
+                }
+            }
+            return [string[]]$lines.ToArray()
+        }
+        function Get-RegistryStartedUsbIds {
+            # The USB devices Windows is running, from each driver's Enum key. No USB traffic at all.
+            $ids = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            Get-ChildItem -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services" -ErrorAction SilentlyContinue | ForEach-Object {
+                $enumPath = Join-Path $_.PSPath "Enum"
+                if (-not (Test-Path -LiteralPath $enumPath)) { return }
+                $enum = Get-ItemProperty -LiteralPath $enumPath -ErrorAction SilentlyContinue
+                if (-not $enum) { return }
+                $count = 0
+                try { $count = [int]$enum.Count } catch { $count = 0 }
+                for ($i = 0; $i -lt $count; $i++) {
+                    $id = [string]$enum."$i"
+                    if ($id -match '(?i)USB\\VID_') { [void]$ids.Add($id) }
+                }
+            }
+            $script:LastConnectedUsbLines = @(Get-RegistryUsbLines -Ids $ids)
+            return $ids
+        }
+        function Get-StartedUsbInstanceIds {
+            param([switch]$RegistryOnly)
+            $script:EnumFresh = $false
+            if ($RegistryOnly) {
+                $ids = Get-RegistryStartedUsbIds
+                $script:EnumFresh = $true
+                return $ids
+            }
+            if ($script:PnputilProc -and -not $script:PnputilProc.HasExited) {
+                return (New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase))
+            }
+            if ($script:PnputilProc -and $script:PnputilProc.HasExited) {
+                $done = $script:PnputilProc
+                $script:PnputilProc = $null
+                $ids = Read-PnputilUsbIds -Path $script:PnputilOut
+                Remove-Item -LiteralPath $script:PnputilOut, $script:PnputilErr -Force -ErrorAction SilentlyContinue
+                if ($done.ExitCode -eq 0) {
+                    $script:EnumFresh = $true
+                    return $ids
+                }
+            }
+            $pnputil = Join-Path $env:SystemRoot "System32\pnputil.exe"
+            if (Test-Path -LiteralPath $pnputil) {
+                try {
+                    $proc = Start-Process -FilePath $pnputil -ArgumentList @("/enum-devices", "/connected", "/ids") `
+                        -PassThru -WindowStyle Hidden -RedirectStandardOutput $script:PnputilOut -RedirectStandardError $script:PnputilErr
+                    $finished = $false
+                    try { $finished = $proc.WaitForExit(20000) } catch { $finished = $false }
+                    if (-not $finished) {
+                        # Leave it running. Killing pnputil mid-enum resets Android and iPhone USB.
+                        $script:PnputilProc = $proc
+                        return (New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase))
+                    }
+                    $ids = Read-PnputilUsbIds -Path $script:PnputilOut
+                    Remove-Item -LiteralPath $script:PnputilOut, $script:PnputilErr -Force -ErrorAction SilentlyContinue
+                    if ($proc.ExitCode -eq 0) {
+                        $script:EnumFresh = $true
+                        return $ids
+                    }
+                } catch {}
+            }
+            $ids = Get-RegistryStartedUsbIds
+            $script:EnumFresh = $true
             return $ids
         }
         function Get-ConnectedAdbPhones {
@@ -1504,7 +1751,7 @@ function Start-MobileDeviceRefresh {
                     if (-not $seenAdb.ContainsKey($key)) {
                         $seenAdb[$key] = $true
                         $name = [string]$desc
-                        if (-not $name -or $name -match '(?i)^(USB Composite Device|USB Device|WinUsb Device|ADB Interface|Android ADB Interface)$') {
+                        if (-not $name -or $name -match '(?i)^(USB Composite Device|USB Device|WinUsb Device|ADB Interface|ADB Device|Android ADB Interface|Android Composite ADB Interface)$') {
                             $name = "Android phone"
                         }
                         $phones.Add(@{
@@ -1557,8 +1804,121 @@ function Start-MobileDeviceRefresh {
             }
             return $false
         }
+        function Get-AndroidUsbStates {
+            # V1.31.7: what Windows shows of Android phones on USB, from pnputil-style lines (pnputil or registry).
+            #   MtpKeys - VID|PID of phones with a running File transfer (MTP) interface, whatever Windows calls them
+            #             (many phones are listed only by a model code such as SM-A546E or CPH2451).
+            #   Ready   - phones with a running File transfer interface that Windows' portable-device list does not
+            #             show (the collection finds them by their USB vendor and product ID).
+            #   Rows    - phones that are plugged in but not usable yet (charging only, or no Windows driver for their
+            #             interface), with what to do on the phone. Before, such a phone was simply not listed.
+            param([string[]]$Lines)
+            $phoneVendors = @('18D1', '2717', '2A70', '22D9', '2D95', '22B8', '339B', '2A45', '2E04', '29A9', '2B4C')
+            $maybeVendors = @('04E8', '0FCE', '1004', '0B05', '0E8D', '05C6', '12D1', '19D2', '0BB4')
+            $notPhoneWords = '(?i)modem|network|broadband|mobile connect|card reader|keyboard|mouse|headset|webcam|printer|bluetooth|mass storage|ssd|flash drive'
+            $phoneWords = '(?i)android|phone|galaxy|pixel|redmi|xiaomi|poco|oneplus|oppo|vivo|realme|iqoo|moto|nokia|honor|huawei|nothing|infinix|tecno|itel|xperia|mobile'
+            $genericDesc = '(?i)^(USB Composite Device|USB Device|WinUsb Device|ADB Interface|ADB Device|Android ADB Interface|Android Composite ADB Interface|MTP USB Device|USB Input Device|Generic USB Hub|USB Mass Storage Device)$'
+            # Names used only when nothing better is shown: the File transfer interface carries the phone's own name.
+            $fallbackDesc = '(?i)Composite Device$|ADB Interface$|Modem$'
+            $groups = @{}
+            $block = $null
+            $flush = {
+                if ($block -and $block.Id -match '(?i)^USB\\VID_([0-9A-F]{4})&PID_([0-9A-F]{4})(&MI_[0-9A-F]{2})?\\(.+)$') {
+                    $vid = $Matches[1].ToUpperInvariant()
+                    $prodId = $Matches[2].ToUpperInvariant()
+                    $iface = [bool]$Matches[3]
+                    $tail = [string]$Matches[4]
+                    if ($vid -ne '05AC') {
+                        $key = "android|$vid|$prodId"
+                        if (-not $groups.ContainsKey($key)) {
+                            $groups[$key] = @{ Vid = $vid; ProdId = $prodId; Serial = ''; Instance = ''; Desc = ''; Phone = $false; AdbOk = $false; AdbBad = $false; MtpOk = $false; MtpBad = $false; MsMtp = $false; MtpDesc = ''; FallbackDesc = '' }
+                        }
+                        $g = $groups[$key]
+                        $ids = [string]$block.Ids
+                        $started = ((-not $block.Status) -or $block.Status -eq 'Started')
+                        $isAdb = ($ids -match '(?i)SubClass_42&Prot_01|MS_COMP_ADB')
+                        $isMtp = (($ids -match '(?i)MS_COMP_MTP') -or ($ids -match '(?i)Class_06&SubClass_01&Prot_01'))
+                        if ($isAdb) { if ($started) { $g.AdbOk = $true } else { $g.AdbBad = $true } }
+                        if ($isMtp) { if ($started) { $g.MtpOk = $true } else { $g.MtpBad = $true } }
+                        if ($ids -match '(?i)MS_COMP_MTP') { $g.MsMtp = $true }
+                        if ((-not $iface) -and $tail -notmatch '&') { $g.Serial = $tail; $g.Instance = $block.Id }
+                        if (-not $g.Instance) { $g.Instance = $block.Id }
+                        $words = ([string]$block.Desc + ' ' + [string]$block.Mfr)
+                        if ($isAdb -or ($phoneVendors -contains $vid) -or ((($maybeVendors -contains $vid) -or $isMtp) -and $words -match $phoneWords -and $words -notmatch $notPhoneWords)) { $g.Phone = $true }
+                        if ($block.Desc -and $block.Desc -notmatch $genericDesc) {
+                            if ($isMtp -and -not $g.MtpDesc) { $g.MtpDesc = [string]$block.Desc }
+                            if ($block.Desc -match $fallbackDesc) { if (-not $g.FallbackDesc) { $g.FallbackDesc = [string]$block.Desc } }
+                            elseif (-not $g.Desc) { $g.Desc = [string]$block.Desc }
+                        }
+                    }
+                }
+            }
+            foreach ($line in @($Lines)) {
+                $text = [string]$line
+                if ($text -match '(?i)^\s*Instance ID:\s+(\S+)') {
+                    $newId = [string]$Matches[1]   # read before the flush, which runs its own matches
+                    . $flush
+                    $block = @{ Id = $newId; Desc = ''; Mfr = ''; Status = ''; Ids = '' }
+                    continue
+                }
+                if (-not $block) { continue }
+                if ($text -match '(?i)^\s*Device Description:\s+(.+?)\s*$') { $block.Desc = [string]$Matches[1]; continue }
+                if ($text -match '(?i)^\s*Manufacturer Name:\s+(.+?)\s*$') { $block.Mfr = [string]$Matches[1]; continue }
+                if ($text -match '(?i)^\s*Status:\s+(\S+)') { $block.Status = [string]$Matches[1]; continue }
+                $block.Ids = [string]$block.Ids + ' ' + $text.Trim()
+            }
+            . $flush
+            $mtpKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            $rows = @()
+            $ready = @()
+            foreach ($key in @($groups.Keys)) {
+                $g = $groups[$key]
+                # A camera uses the same picture-transfer class; Android's File transfer also says MS_COMP_MTP.
+                if ($g.MtpOk -and ($g.Phone -or $g.MsMtp)) {
+                    [void]$mtpKeys.Add($g.Vid + '|' + $g.ProdId)
+                    $ready += @{
+                        id               = $g.Instance
+                        name             = $(if ($g.MtpDesc) { $g.MtpDesc } elseif ($g.Desc) { $g.Desc } elseif ($g.FallbackDesc) { $g.FallbackDesc } else { 'Android phone (File transfer)' })
+                        device_class     = 'WPD'
+                        connection       = 'mtp'
+                        os_hint          = 'android'
+                        instance_id      = $g.Instance
+                        has_drive_letter = $false
+                        live_acquire     = $true
+                        capability_label = 'SUPPORTED_DIRECT_LOGICAL'
+                        guidance         = 'Connected phone detected (File transfer). Use Start extraction.'
+                        ios_backup_roots = @()
+                    }
+                }
+                if ((-not $g.Phone) -or $g.AdbOk -or $g.MtpOk) { continue }
+                $state = 'charging_only'
+                $guidance = 'Connected for charging only. Unlock the phone, open the USB notification on it and choose File transfer (for a deeper collection also turn on USB debugging and tap Allow), then Rescan.'
+                if ($g.AdbBad -or $g.MtpBad) {
+                    $state = 'driver_missing'
+                    $guidance = 'Windows has no working driver for this phone''s USB interface (Device Manager shows it with a warning). On the phone choose USB: File transfer, which needs no extra driver, or install the phone maker''s USB driver, then Rescan.'
+                }
+                $rows += @{
+                    id               = $(if ($g.Serial) { $g.Serial } else { $g.Instance })
+                    name             = $(if ($g.Desc) { $g.Desc } elseif ($g.FallbackDesc) { $g.FallbackDesc } else { 'Android phone' })
+                    device_class     = 'USB'
+                    connection       = 'usb'
+                    os_hint          = 'android'
+                    instance_id      = $g.Instance
+                    has_drive_letter = $false
+                    live_acquire     = $false
+                    state            = $state
+                    capability_label = 'NEEDS_ACTION'
+                    guidance         = $guidance
+                    ios_backup_roots = @()
+                }
+            }
+            return @{ MtpKeys = $mtpKeys; Ready = $ready; Rows = $rows }
+        }
+
         function Read-WpdPhones {
-            $started = Get-StartedUsbInstanceIds
+            param([switch]$RegistryOnly)
+            $started = Get-StartedUsbInstanceIds -RegistryOnly:$RegistryOnly
+            $usbStates = Get-AndroidUsbStates -Lines $script:LastConnectedUsbLines
             $list = @()
             $seen = @{}
             foreach ($regRoot in @(
@@ -1573,14 +1933,14 @@ function Start-MobileDeviceRefresh {
                     if (-not $name) { $name = $id }
                     if (-not $id) { return }
                     if ($name -match '(?i)^(Local Disk|Windows|Network|CD Drive|DVD|Removable Disk|New Volume|CCCOMA_|RUFUS_)') { return }
+                    $mtpPhone = $false
+                    if ($id -match '(?i)VID_([0-9A-F]{4}).*?PID_([0-9A-F]{4})') { $mtpPhone = $usbStates.MtpKeys.Contains($Matches[1] + '|' + $Matches[2]) }
                     $looksPhone = ($name -match '(?i)iPhone|iPad|iPod|Apple|Android|Samsung|Galaxy|Xiaomi|Redmi|Huawei|Honor|OnePlus|Pixel|Oppo|Vivo|Tecno|Infinix|Motorola|Nokia|Realme|Nothing|Phone') -or
-                        ($id -match '(?i)VID_(05AC|18D1|04E8|2717|2A45|0E8D|2A70|19D2|22D9|29A9|05C6|12D1|22B8|0BB4|0FCE|1004|0B05|2B4C|2D95)')
+                        ($id -match '(?i)VID_(05AC|18D1|04E8|2717|2A45|0E8D|2A70|19D2|22D9|29A9|05C6|12D1|22B8|0BB4|0FCE|1004|0B05|2B4C|2D95|339B|2E04)') -or $mtpPhone
                     if (-not $looksPhone) { return }
                     if (-not (Test-WpdIdCurrentlyAttached -WpdId $id -StartedIds $started)) { return }
-                    $isApple = ($id -match '(?i)VID_05AC') -or ($name -match '(?i)iPhone|iPad|iPod|Apple')
-                    $isAndroid = ($id -match '(?i)VID_(18D1|04E8|2717|2A45|0E8D|2A70|19D2|22D9|29A9|05C6|12D1|22B8|0BB4|0FCE|1004|0B05|2B4C|2D95)') -or ($name -match '(?i)Android|Samsung|Galaxy|Xiaomi|Redmi|Huawei|Honor|OnePlus|Pixel|Oppo|Vivo|Tecno|Infinix|Motorola|Nokia|Realme|Nothing')
-                    if (-not $isApple -and -not $isAndroid) { return }
-                    $os = $(if ($isApple) { "ios" } else { "android" })
+                    $os = "android"
+                    if ($name -match '(?i)iPhone|iPad|iPod|Apple' -or $id -match '(?i)VID_05AC') { $os = "ios" }
                     $key = ($name + "|" + $os).ToLowerInvariant()
                     if ($id -match 'VID_([0-9A-Fa-f]{4}).*?PID_([0-9A-Fa-f]{4})') {
                         $key = $os + "|" + $Matches[1].ToUpperInvariant() + "|" + $Matches[2].ToUpperInvariant()
@@ -1620,51 +1980,153 @@ function Start-MobileDeviceRefresh {
                 $seen[$key] = $true
                 $list += $adbPhone
             }
+            foreach ($row in @(@($usbStates.Ready) + @($usbStates.Rows))) {
+                $rowKey = ""
+                if ([string]$row.instance_id -match 'VID_([0-9A-Fa-f]{4}).*?PID_([0-9A-Fa-f]{4})') {
+                    $rowKey = "android|" + $Matches[1].ToUpperInvariant() + "|" + $Matches[2].ToUpperInvariant()
+                }
+                if (-not $rowKey -or $seen.ContainsKey($rowKey)) { continue }
+                $seen[$rowKey] = $true
+                $list += $row
+            }
             return $list
         }
-        while ($true) {
+        function Get-UsbTransferProcesses {
+            # V1.31.6: phone copies in progress on this PC. A copy process whose parent is gone is a
+            # leftover of a stopped or crashed collection, not a copy in progress: it no longer counts.
+            # (Before, any leftover froze the phone list, so an unplugged iPhone stayed listed and a
+            # newly plugged Android never appeared.)
+            $out = @()
             try {
-                $list = @(Read-WpdPhones)
-                # Real connected transport enumeration is authoritative for model
-                # and serial. WPD is retained only when not the same phone.
-                foreach ($live in @(Get-LivePhoneProbe)) {
-                    $os = [string]$live.os_hint
-                    $id = [string]$live.id
-                    if (-not $id -or $os -notin @("android", "ios")) { continue }
-                    $list = @($list | Where-Object {
-                        $wpdId = [string]$_.id
-                        $sameSerial = $wpdId -match [regex]::Escape($id)
-                        $sameId = $wpdId -eq $id
-                        -not (([string]$_.os_hint -eq $os) -and ($sameSerial -or $sameId))
-                    })
-                    $list += $live
+                $all = @(Get-CimInstance Win32_Process -OperationTimeoutSec 20 -ErrorAction SilentlyContinue)
+                $alive = @{}
+                foreach ($p in $all) { $alive[[int]$p.ProcessId] = $true }
+                foreach ($p in $all) {
+                    $cmd = [string]$p.CommandLine
+                    if (-not $cmd) { continue }
+                    if ($cmd -match '--verify\b' -or $cmd -match 'recover-stalled-ios-backup') { continue }
+                    $what = ""
+                    if ($cmd -match 'ios_usbmux_backup') { $what = "iPhone backup" }
+                    elseif ($cmd -match 'ios_usbmux_afc') { $what = "iPhone shared files" }
+                    elseif ($cmd -match 'native_ios_job') { $what = "iPhone collection" }
+                    elseif ($cmd -match 'native_mtp_job') { $what = "Android collection" }
+                    elseif ($cmd -match 'host-mobile-acquire|acq_run_') { $what = "phone collection" }
+                    elseif (([string]$p.Name) -match '^(adb|adb\.exe)$' -and $cmd -match '\s(pull|backup|exec-out|shell)\b') { $what = "Android copy" }
+                    if (-not $what) { continue }
+                    if (-not $alive.ContainsKey([int]$p.ParentProcessId)) { continue }
+                    $out += [pscustomobject]@{ Pid = [int]$p.ProcessId; What = $what }
                 }
-                $json = if ($list.Count -eq 0) { "[]" } elseif ($list.Count -eq 1) { "[" + ($list[0] | ConvertTo-Json -Compress -Depth 6) + "]" } else { ($list | ConvertTo-Json -Compress -Depth 6) }
-                [System.IO.File]::WriteAllText($CacheFile, $json)
-                $acq = @()
-                foreach ($d in $list) {
-                    $os = [string]$d.os_hint
-                    $conn = [string]$d.connection
-                    $adapter = "android_mtp"
-                    $status = "wpd"
-                    if ($os -eq "ios") { $adapter = "ios_lockdown" }
-                    elseif ($conn -eq "adb") { $adapter = "android_adb"; $status = "adb" }
-                    $acq += @{
-                        adapter     = $adapter
-                        device_id   = [string]$d.id
-                        label       = [string]$d.name
-                        status      = $status
-                        os_family   = $(if ($os) { $os } else { "android" })
-                        instance_id = [string]$d.instance_id
-                        connection  = $conn
-                    }
-                }
-                $acqBody = @{ ok = $true; devices = $acq; warnings = @(); count = $acq.Count }
-                [System.IO.File]::WriteAllText($AcqFile, ($acqBody | ConvertTo-Json -Compress -Depth 6))
-            } catch {}
-            Start-Sleep -Seconds 6
+            } catch { }
+            return $out
         }
-    } -ArgumentList $script:DeviceCacheFile, $script:AcqDevicesCacheFile, $probePython, $probeScript
+        function Set-UsbStayAwake {
+            param([bool]$On)
+            if (-not ('AetherisStayAwake' -as [type])) {
+                Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public static class AetherisStayAwake { [DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags); }'
+            }
+            $flags = $(if ($On) { [uint32]0x80000003 } else { [uint32]0x80000000 })
+            try { [AetherisStayAwake]::SetThreadExecutionState($flags) | Out-Null } catch {}
+        }
+        function Write-DeviceCacheFiles {
+            param($List, [string]$Source, [string]$Note)
+            $list = @($List)
+            $json = if ($list.Count -eq 0) { "[]" } elseif ($list.Count -eq 1) { "[" + ($list[0] | ConvertTo-Json -Compress -Depth 6) + "]" } else { ($list | ConvertTo-Json -Compress -Depth 6) }
+            [System.IO.File]::WriteAllText($CacheFile, $json)
+            $acq = @()
+            foreach ($d in $list) {
+                $os = [string]$d.os_hint
+                $conn = [string]$d.connection
+                $adapter = "android_mtp"
+                $status = "wpd"
+                if ($os -eq "ios") { $adapter = "ios_lockdown" }
+                elseif ($conn -eq "adb") { $adapter = "android_adb"; $status = "adb" }
+                elseif ($conn -eq "usb") { $adapter = "android_usb"; $status = [string]$d.state }
+                $acq += @{
+                    adapter     = $adapter
+                    device_id   = [string]$d.id
+                    label       = [string]$d.name
+                    status      = $status
+                    os_family   = $(if ($os) { $os } else { "android" })
+                    instance_id = [string]$d.instance_id
+                    connection  = $conn
+                    guidance    = [string]$d.guidance
+                    state       = [string]$d.state
+                }
+            }
+            $acqBody = @{
+                ok          = $true
+                devices     = $acq
+                warnings    = @()
+                count       = $acq.Count
+                scanned_utc = (Get-Date).ToUniversalTime().ToString("o")
+                source      = $Source
+                note        = $Note
+            }
+            [System.IO.File]::WriteAllText($AcqFile, ($acqBody | ConvertTo-Json -Compress -Depth 6))
+        }
+        function Update-DeviceCacheOnce {
+            # One refresh of the phone lists the page reads. pnputil is not run during a phone copy
+            # (it can reset USB); the registry lists the devices Windows is running without touching
+            # USB, so the list follows the cables during a copy too, and when pnputil is busy.
+            $transfer = @(Get-UsbTransferProcesses)
+            $source = "pnputil"
+            $note = ""
+            if ($transfer.Count -gt 0) {
+                $list = @(Read-WpdPhones -RegistryOnly)
+                $source = "registry"
+                $note = "A phone copy is running on this computer (" + ((@($transfer | ForEach-Object { $_.What }) | Select-Object -Unique) -join ", ") + "); phones are listed from Windows without re-scanning USB."
+            } else {
+                $list = @(Read-WpdPhones)
+                if (-not $script:EnumFresh) {
+                    $list = @(Read-WpdPhones -RegistryOnly)
+                    $source = "registry"
+                    $note = "Windows USB enumeration (pnputil) is busy; phones are listed from the registry meanwhile."
+                }
+            }
+            # V1.31.9: write first. A failing stay-awake call threw before the write on every pass, so the
+            # list stayed at whatever the helper saw when it started.
+            Write-DeviceCacheFiles -List $list -Source $source -Note $note
+            try { Set-UsbStayAwake (($list.Count -gt 0) -or ($transfer.Count -gt 0)) } catch {}
+            return $source
+        }
+        if ($env:AETHERIS_DEVICE_REFRESH_FUNCTIONS_ONLY -eq "1") { return }
+        $statusFile = Join-Path $env:TEMP "aetheris_device_refresh_status.json"
+        while ($true) {
+            $source = "pnputil"
+            $status = @{ ok = $true; at_utc = (Get-Date).ToUniversalTime().ToString("o"); error = "" }
+            try { $source = Update-DeviceCacheOnce } catch { $status.ok = $false; $status.error = [string]$_.Exception.Message }
+            $status.source = $source
+            try { [System.IO.File]::WriteAllText($statusFile, ($status | ConvertTo-Json -Compress)) } catch {}
+            Start-Sleep -Seconds $(if ($source -eq "registry") { 10 } else { 15 })
+        }
+    } -ArgumentList $script:DeviceCacheFile, $script:AcqDevicesCacheFile
+    $script:DeviceRefreshStartedAt = Get-Date
+}
+
+# V1.31.9: restart the background refresh when it has stopped or stopped writing (checked every 30 s from
+# the request loop). The phone lists themselves are read live; this keeps the background file current for
+# the PowerShell side.
+function Test-MobileDeviceRefresh {
+    $now = Get-Date
+    if ($script:DeviceRefreshCheckedAt -and (($now - $script:DeviceRefreshCheckedAt).TotalSeconds -lt 30)) { return }
+    $script:DeviceRefreshCheckedAt = $now
+    try {
+        $job = $script:DeviceRefreshJob
+        $stale = $false
+        if ($job -and $job.State -eq "Running") {
+            $since = $script:DeviceRefreshStartedAt
+            $written = $null
+            if (Test-Path -LiteralPath $script:AcqDevicesCacheFile) { $written = (Get-Item -LiteralPath $script:AcqDevicesCacheFile).LastWriteTime }
+            if ($since -and (($now - $since).TotalSeconds -gt 120) -and ((-not $written) -or (($now - $written).TotalSeconds -gt 120))) { $stale = $true }
+        }
+        if ($job -and $job.State -eq "Running" -and -not $stale) { return }
+        if ($job) {
+            try { Stop-Job $job -ErrorAction SilentlyContinue } catch {}
+            try { Remove-Job $job -Force -ErrorAction SilentlyContinue } catch {}
+            $script:DeviceRefreshJob = $null
+        }
+        Start-MobileDeviceRefresh
+    } catch {}
 }
 
 function Write-HostAdapterCache {
@@ -2172,6 +2634,9 @@ function Handle-Request {
             started_utc        = $script:HelperStartedUtc
             malware_triage     = $true
             malware_remediate  = $true
+            computer_name      = $script:HelperComputerName
+            client_import      = $true
+            import_case_root   = $script:ImportCasesRoot
         }
         return
     }
@@ -2393,6 +2858,7 @@ function Handle-Request {
                 $adapterName = "android_mtp"
                 $statusName = $(if ($conn -eq "mtp") { "mtp" } else { "wpd" })
                 if ($conn -eq "adb") { $adapterName = "android_adb"; $statusName = "adb" }
+                if ($conn -eq "usb") { $adapterName = "android_usb"; $statusName = [string]$wpd.state }
                 $devices += @{
                     adapter     = $adapterName
                     device_id   = $wid
@@ -2401,6 +2867,7 @@ function Handle-Request {
                     os_family   = "android"
                     instance_id = $winst
                     connection  = $conn
+                    guidance    = [string]$wpd.guidance
                 }
             }
             Write-JsonResponse -Response $response -StatusCode 200 -Body @{ ok = $true; devices = @($devices); warnings = @($warnings); count = @($devices).Count }
@@ -2414,6 +2881,7 @@ function Handle-Request {
                     $adapterName = "android_mtp"
                     if ($os -eq "ios") { $adapterName = "ios_lockdown" }
                     elseif ($conn -eq "adb") { $adapterName = "android_adb" }
+                    elseif ($conn -eq "usb") { $adapterName = "android_usb" }
                     $fallback += @{
                         adapter     = $adapterName
                         device_id   = [string]$wpd.id
@@ -2676,7 +3144,7 @@ function Handle-Request {
             $tmpErr = Join-Path $env:TEMP ("acq_run_" + $stamp + ".err")
             [System.IO.File]::WriteAllText($tmpJson, ($runPayload | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
             $pyLines = @(
-                'import json, sys, traceback, subprocess'
+                'import json, sys, traceback'
                 'from pathlib import Path'
                 'from app.services.mobile_acquire import AcquisitionRequest, CollectionMethod, CollectionOrchestrator, DeviceDetector'
                 'payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8-sig"))'
@@ -2723,26 +3191,12 @@ function Handle-Request {
                 '    result = CollectionOrchestrator(DeviceDetector(), progress=_on_progress, cancel=_cancelled).run(req)'
                 '    try: _final_bytes = int((result.acquisition_record or {}).get("output_size") or 0)'
                 '    except Exception: _final_bytes = 0'
-                '    completed = result.as_dict()'
-                '    if result.ok:'
-                '        _write_progress({"stage":"transfer", "item":"server_upload", "bytes_done": _final_bytes, "detail":"Verifying acquired evidence on the forensic server", "category":"Transferring"})'
-                '        uploader = Path.cwd().parent / "scripts" / "mobile_server_transfer.py"'
-                '        exports = (completed.get("paths") or {}).get("exports")'
-                '        if not exports: raise RuntimeError("Acquisition has no full ZIP export for server transfer")'
-                '        upload = subprocess.run([sys.executable, str(uploader), "--payload", sys.argv[1], "--exports", str(exports)], capture_output=True, text=True, timeout=86400)'
-                '        if upload.returncode != 0: raise RuntimeError("Server transfer failed; acquired evidence retained for retry")'
-                '        receipt = json.loads(upload.stdout).get("receipt") or {}'
-                '        if not (receipt.get("verified") and receipt.get("server_stored")): raise RuntimeError("Server did not verify evidence")'
-                '        completed["server_transfer"] = receipt'
-                '    _write_progress({"stage":result.stage_reached or "complete", "item":"complete", "bytes_done":_final_bytes, "run_name": result.run_name, "detail":"Evidence secured on server" if result.ok else "Collection failed", "category":"Complete" if result.ok else "Failed"})'
-                '    _write_result({"ok": result.ok, **completed})'
+                '    _write_progress({"stage": result.stage_reached or "complete", "item":"complete", "bytes_done": _final_bytes, "run_name": result.run_name, "detail":"Collection finished", "category":"Complete"})'
+                '    _write_result({"ok": result.ok, **result.as_dict()})'
                 'except Exception as exc:'
                 '    traceback.print_exc()'
                 '    _write_result({"ok": False, "error": str(exc), "errors": [str(exc)], "stage_reached": "failed", "method_decision": {"selected": None, "considered": [], "rejected": {}, "rationale": "Host acquisition failed before method selection completed.", "deeper_available": []}, "limitations": ["Host USB acquisition failed."], "evidence_package": {"run_name": "", "extraction_data": [], "complete": False}, "acquisition_record": {"output_size": 0, "missing_fields": []}, "paths": {}, "chain_of_custody": []})'
                 '    sys.exit(1)'
-                'finally:'
-                '    try: Path(sys.argv[1]).unlink(missing_ok=True)'
-                '    except Exception: pass'
             )
             [System.IO.File]::WriteAllText($tmpPy, ($pyLines -join "`n"), [System.Text.UTF8Encoding]::new($false))
             $script:Busy = $true
@@ -2980,7 +3434,6 @@ catch {
 Start-DrivePresenceWatcher
 Write-HostAdapterCache
 Write-MobileDeviceCaches
-Remove-Item -LiteralPath $script:DeviceCacheFile, $script:AcqDevicesCacheFile -Force -ErrorAction SilentlyContinue
 Start-MobileDeviceRefresh
 
 Add-Type -TypeDefinition @"
@@ -2988,12 +3441,328 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Net;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Win32.SafeHandles;
+// V1.31.9: the phone list is what Windows has plugged in at the moment of the request.
+// Before, /acquisition/devices and /mobile-devices returned a file written by a background job every
+// 10-15 s. When that job stopped writing, the page kept showing phones that were unplugged long ago
+// ("ADB Device" with nothing attached) and never showed a newly plugged iPhone. Now each request reads the
+// present USB devices from Windows (SetupAPI, the same list Device Manager shows: no USB traffic, no
+// pnputil, no WMI, a few milliseconds) and classifies them here. The background file is used only if
+// this read fails.
+public class AetherisUsbNode {
+  public string Id = "";
+  public string Desc = "";
+  public string Mfg = "";
+  public string Ids = "";
+  public bool Started = true;
+  public int Problem = 0;
+}
+
+public class AetherisPhone {
+  public string Key = "";
+  public string Os = "";
+  public string Connection = "";
+  public string Adapter = "";
+  public string Status = "";
+  public string Id = "";
+  public string Name = "";
+  public string InstanceId = "";
+  public string State = "";
+  public string Guidance = "";
+  public string DeviceClass = "";
+  public string Capability = "";
+  public bool LiveAcquire = true;
+}
+
+public static class AetherisUsbLive {
+  [StructLayout(LayoutKind.Sequential)]
+  struct SP_DEVINFO_DATA { public int cbSize; public Guid ClassGuid; public int DevInst; public IntPtr Reserved; }
+  [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  static extern IntPtr SetupDiGetClassDevsW(IntPtr classGuid, string enumerator, IntPtr hwndParent, int flags);
+  [DllImport("setupapi.dll", SetLastError = true)]
+  static extern bool SetupDiEnumDeviceInfo(IntPtr deviceInfoSet, int memberIndex, ref SP_DEVINFO_DATA deviceInfoData);
+  [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  static extern bool SetupDiGetDeviceInstanceIdW(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, StringBuilder id, int size, out int required);
+  [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  static extern bool SetupDiGetDeviceRegistryPropertyW(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, int property, out int regType, byte[] buffer, int size, out int required);
+  [DllImport("setupapi.dll", SetLastError = true)]
+  static extern bool SetupDiDestroyDeviceInfoList(IntPtr deviceInfoSet);
+  [DllImport("cfgmgr32.dll")]
+  static extern int CM_Get_DevNode_Status(out int status, out int problem, int devInst, int flags);
+
+  const int DIGCF_PRESENT = 0x2;
+  const int DIGCF_ALLCLASSES = 0x4;
+  const int SPDRP_DEVICEDESC = 0x0;
+  const int SPDRP_HARDWAREID = 0x1;
+  const int SPDRP_COMPATIBLEIDS = 0x2;
+  const int SPDRP_MFG = 0xB;
+  const int SPDRP_FRIENDLYNAME = 0xC;
+  const int DN_STARTED = 0x8;
+  const int DN_HAS_PROBLEM = 0x400;
+
+  /// Where the present USB devices come from (tests replace it).
+  public static Func<List<AetherisUsbNode>> Source = ScanSetupApi;
+  public static int CacheMilliseconds = 1500;
+  static readonly object Gate = new object();
+  static List<AetherisPhone> _last;
+  static DateTime _lastAt = DateTime.MinValue;
+  static string _lastError = "";
+  public static string LastError { get { return _lastError; } }
+
+  public static List<AetherisPhone> Phones(out bool ok) {
+    lock (Gate) {
+      if (_last != null && (DateTime.UtcNow - _lastAt).TotalMilliseconds < CacheMilliseconds) { ok = true; return _last; }
+      try {
+        List<AetherisPhone> phones = Classify(Source());
+        _last = phones;
+        _lastAt = DateTime.UtcNow;
+        _lastError = "";
+        ok = true;
+        return phones;
+      } catch (Exception ex) {
+        _lastError = ex.Message;
+        _last = null;
+        ok = false;
+        return new List<AetherisPhone>();
+      }
+    }
+  }
+
+  public static void Reset() { lock (Gate) { _last = null; _lastAt = DateTime.MinValue; } }
+
+  static string Prop(IntPtr set, ref SP_DEVINFO_DATA data, int property) {
+    int regType;
+    int required;
+    byte[] buffer = new byte[2048];
+    if (!SetupDiGetDeviceRegistryPropertyW(set, ref data, property, out regType, buffer, buffer.Length, out required)) {
+      if (required <= buffer.Length || required > 65536) return "";
+      buffer = new byte[required];
+      if (!SetupDiGetDeviceRegistryPropertyW(set, ref data, property, out regType, buffer, buffer.Length, out required)) return "";
+    }
+    string text = Encoding.Unicode.GetString(buffer, 0, Math.Min(required, buffer.Length));
+    return string.Join(" ", text.Split(new char[] { '\0' }, StringSplitOptions.RemoveEmptyEntries)).Trim();
+  }
+
+  public static List<AetherisUsbNode> ScanSetupApi() {
+    List<AetherisUsbNode> nodes = new List<AetherisUsbNode>();
+    IntPtr set = SetupDiGetClassDevsW(IntPtr.Zero, "USB", IntPtr.Zero, DIGCF_PRESENT | DIGCF_ALLCLASSES);
+    if (set == IntPtr.Zero || set == new IntPtr(-1)) throw new InvalidOperationException("SetupDiGetClassDevs failed: " + Marshal.GetLastWin32Error());
+    try {
+      for (int i = 0; i < 4096; i++) {
+        SP_DEVINFO_DATA data = new SP_DEVINFO_DATA();
+        data.cbSize = Marshal.SizeOf(typeof(SP_DEVINFO_DATA));
+        if (!SetupDiEnumDeviceInfo(set, i, ref data)) break;
+        StringBuilder id = new StringBuilder(512);
+        int required;
+        if (!SetupDiGetDeviceInstanceIdW(set, ref data, id, id.Capacity, out required)) continue;
+        string instance = id.ToString();
+        if (instance.IndexOf("VID_", StringComparison.OrdinalIgnoreCase) < 0) continue;
+        AetherisUsbNode node = new AetherisUsbNode();
+        node.Id = instance;
+        string friendly = Prop(set, ref data, SPDRP_FRIENDLYNAME);
+        node.Desc = friendly.Length > 0 ? friendly : Prop(set, ref data, SPDRP_DEVICEDESC);
+        node.Mfg = Prop(set, ref data, SPDRP_MFG);
+        node.Ids = Prop(set, ref data, SPDRP_HARDWAREID) + " " + Prop(set, ref data, SPDRP_COMPATIBLEIDS);
+        int status;
+        int problem;
+        if (CM_Get_DevNode_Status(out status, out problem, data.DevInst, 0) == 0) {
+          node.Started = (status & DN_STARTED) != 0;
+          node.Problem = (status & DN_HAS_PROBLEM) != 0 ? Math.Max(problem, 1) : 0;
+        }
+        nodes.Add(node);
+      }
+    } finally {
+      SetupDiDestroyDeviceInfoList(set);
+    }
+    return nodes;
+  }
+
+  // Same rules as Get-AndroidUsbStates in host-drive-helper.ps1 (V1.31.7).
+  static readonly Regex IdRe = new Regex(@"^USB\\VID_([0-9A-F]{4})&PID_([0-9A-F]{4})(&MI_[0-9A-F]{2})?\\(.+)\z", RegexOptions.IgnoreCase);
+  static readonly string[] PhoneVendors = new string[] { "18D1", "2717", "2A70", "22D9", "2D95", "22B8", "339B", "2A45", "2E04", "29A9", "2B4C" };
+  static readonly string[] MaybeVendors = new string[] { "04E8", "0FCE", "1004", "0B05", "0E8D", "05C6", "12D1", "19D2", "0BB4" };
+  static readonly Regex PhoneWords = new Regex("android|phone|galaxy|pixel|redmi|xiaomi|poco|oneplus|oppo|vivo|realme|iqoo|moto|nokia|honor|huawei|nothing|infinix|tecno|itel|xperia|mobile", RegexOptions.IgnoreCase);
+  static readonly Regex NotPhoneWords = new Regex("modem|network|broadband|mobile connect|card reader|keyboard|mouse|headset|webcam|printer|bluetooth|mass storage|ssd|flash drive", RegexOptions.IgnoreCase);
+  static readonly Regex GenericDesc = new Regex(@"^(USB Composite Device|USB Device|WinUsb Device|ADB Interface|ADB Device|Android ADB Interface|Android Composite ADB Interface|MTP USB Device|USB Input Device|Generic USB Hub|USB Mass Storage Device)\z", RegexOptions.IgnoreCase);
+  static readonly Regex FallbackDesc = new Regex(@"(Composite Device|ADB Interface|Modem)\z", RegexOptions.IgnoreCase);
+  static readonly Regex AdbRe = new Regex("SubClass_42&Prot_01|MS_COMP_ADB", RegexOptions.IgnoreCase);
+  static readonly Regex MsMtpRe = new Regex("MS_COMP_MTP", RegexOptions.IgnoreCase);
+  static readonly Regex PtpRe = new Regex("Class_06&SubClass_01&Prot_01", RegexOptions.IgnoreCase);
+  static readonly Regex AppleNameRe = new Regex("iPhone|iPad|iPod", RegexOptions.IgnoreCase);
+
+  public const string ChargingOnlyGuidance = "Connected for charging only. Unlock the phone, open the USB notification on it and choose File transfer (for a deeper collection also turn on USB debugging and tap Allow), then Rescan.";
+  public const string DriverMissingGuidance = "Windows has no working driver for this phone's USB interface (Device Manager shows it with a warning). On the phone choose USB: File transfer, which needs no extra driver, or install the phone maker's USB driver, then Rescan.";
+
+  class Group {
+    public string Vid = "";
+    public string Pid = "";
+    public string Serial = "";
+    public string Instance = "";
+    public string Desc = "";
+    public string MtpDesc = "";
+    public string FallbackDesc = "";
+    public string AppleName = "";
+    public bool Phone;
+    public bool AdbOk;
+    public bool AdbBad;
+    public bool MtpOk;
+    public bool MtpBad;
+    public bool MsMtp;
+  }
+
+  static bool Contains(string[] list, string value) { return Array.IndexOf(list, value) >= 0; }
+
+  public static List<AetherisPhone> Classify(List<AetherisUsbNode> nodes) {
+    Dictionary<string, Group> groups = new Dictionary<string, Group>(StringComparer.OrdinalIgnoreCase);
+    List<string> order = new List<string>();
+    foreach (AetherisUsbNode node in nodes ?? new List<AetherisUsbNode>()) {
+      Match m = IdRe.Match(node.Id ?? "");
+      if (!m.Success) continue;
+      string vid = m.Groups[1].Value.ToUpperInvariant();
+      string pid = m.Groups[2].Value.ToUpperInvariant();
+      bool iface = m.Groups[3].Success;
+      string tail = m.Groups[4].Value;
+      string key = vid + "|" + pid;
+      Group g;
+      if (!groups.TryGetValue(key, out g)) { g = new Group(); g.Vid = vid; g.Pid = pid; groups[key] = g; order.Add(key); }
+      string ids = node.Ids ?? "";
+      string desc = (node.Desc ?? "").Trim();
+      bool started = node.Started && node.Problem == 0;
+      bool isAdb = AdbRe.IsMatch(ids);
+      bool msMtp = MsMtpRe.IsMatch(ids);
+      bool isMtp = msMtp || PtpRe.IsMatch(ids);
+      if (isAdb) { if (started) g.AdbOk = true; else g.AdbBad = true; }
+      if (isMtp) { if (started) g.MtpOk = true; else g.MtpBad = true; }
+      if (msMtp) g.MsMtp = true;
+      if (!iface && tail.IndexOf('&') < 0) { g.Serial = tail; g.Instance = node.Id; }
+      if (g.Instance.Length == 0) g.Instance = node.Id;
+      if (vid == "05AC") {
+        if (g.AppleName.Length == 0 && AppleNameRe.IsMatch(desc)) g.AppleName = desc;
+        continue;
+      }
+      string words = desc + " " + (node.Mfg ?? "");
+      if (isAdb || Contains(PhoneVendors, vid) ||
+          ((Contains(MaybeVendors, vid) || isMtp) && PhoneWords.IsMatch(words) && !NotPhoneWords.IsMatch(words))) g.Phone = true;
+      if (desc.Length > 0 && !GenericDesc.IsMatch(desc)) {
+        if (isMtp && g.MtpDesc.Length == 0) g.MtpDesc = desc;
+        if (FallbackDesc.IsMatch(desc)) { if (g.FallbackDesc.Length == 0) g.FallbackDesc = desc; }
+        else if (g.Desc.Length == 0) g.Desc = desc;
+      }
+    }
+
+    List<AetherisPhone> phones = new List<AetherisPhone>();
+    foreach (string key in order) {
+      Group g = groups[key];
+      AetherisPhone p = new AetherisPhone();
+      p.Key = key;
+      p.InstanceId = g.Instance;
+      if (g.Vid == "05AC") {
+        int pid = Convert.ToInt32(g.Pid, 16);
+        // iPhone / iPad / iPod in normal mode use product IDs 0x1290-0x12FF; other Apple USB devices
+        // (keyboards, adapters, displays) do not, and are not listed.
+        if (!(pid >= 0x1290 && pid <= 0x12FF) && g.AppleName.Length == 0) continue;
+        p.Os = "ios";
+        p.Connection = "usb";
+        p.Adapter = "ios_lockdown";
+        p.Status = "usb";
+        p.Id = g.Instance;
+        p.Name = g.AppleName.Length > 0 ? g.AppleName : "Apple iPhone";
+        p.DeviceClass = "USB";
+        p.Capability = "SUPPORTED_DIRECT_LOGICAL";
+        p.Guidance = "Unlock the iPhone and tap Trust when asked, then Identify.";
+        phones.Add(p);
+        continue;
+      }
+      if (!g.Phone && !(g.MtpOk && g.MsMtp)) continue;
+      p.Os = "android";
+      if (g.AdbOk) {
+        p.Connection = "adb";
+        p.Adapter = "android_adb";
+        p.Status = "adb";
+        p.Id = g.Serial.Length > 0 ? g.Serial : g.Instance;
+        p.Name = g.MtpDesc.Length > 0 ? g.MtpDesc : (g.Desc.Length > 0 ? g.Desc : "Android phone");
+        p.DeviceClass = "ADB";
+        p.Capability = "SUPPORTED_DIRECT_LOGICAL";
+        p.Guidance = "USB debugging is on. Use Identify, then Start extraction.";
+      } else if (g.MtpOk) {
+        p.Connection = "mtp";
+        p.Adapter = "android_mtp";
+        p.Status = "wpd";
+        p.Id = g.Instance;
+        p.Name = g.MtpDesc.Length > 0 ? g.MtpDesc : (g.Desc.Length > 0 ? g.Desc : (g.FallbackDesc.Length > 0 ? g.FallbackDesc : "Android phone (File transfer)"));
+        p.DeviceClass = "WPD";
+        p.Capability = "SUPPORTED_DIRECT_LOGICAL";
+        p.Guidance = "Connected phone detected (File transfer). Use Start extraction.";
+      } else {
+        p.Connection = "usb";
+        p.Adapter = "android_usb";
+        p.State = (g.AdbBad || g.MtpBad) ? "driver_missing" : "charging_only";
+        p.Status = p.State;
+        p.Id = g.Serial.Length > 0 ? g.Serial : g.Instance;
+        p.Name = g.Desc.Length > 0 ? g.Desc : (g.FallbackDesc.Length > 0 ? g.FallbackDesc : "Android phone");
+        p.DeviceClass = "USB";
+        p.Capability = "NEEDS_ACTION";
+        p.Guidance = p.State == "driver_missing" ? DriverMissingGuidance : ChargingOnlyGuidance;
+        p.LiveAcquire = false;
+      }
+      phones.Add(p);
+    }
+    return phones;
+  }
+
+  static string Esc(string s) {
+    if (s == null) return "";
+    StringBuilder sb = new StringBuilder(s.Length + 8);
+    foreach (char c in s) {
+      if (c == '\\') sb.Append("\\\\");
+      else if (c == '"') sb.Append("\\\"");
+      else if (c < (char)0x20) sb.Append("\\u").Append(((int)c).ToString("x4"));
+      else sb.Append(c);
+    }
+    return sb.ToString();
+  }
+
+  static string Now() { return DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture); }
+
+  public static string AcquisitionJson(List<AetherisPhone> phones) {
+    List<string> rows = new List<string>();
+    foreach (AetherisPhone p in phones) {
+      rows.Add("{\"adapter\":\"" + Esc(p.Adapter) + "\",\"device_id\":\"" + Esc(p.Id) + "\",\"label\":\"" + Esc(p.Name) +
+        "\",\"status\":\"" + Esc(p.Status) + "\",\"os_family\":\"" + Esc(p.Os) + "\",\"instance_id\":\"" + Esc(p.InstanceId) +
+        "\",\"connection\":\"" + Esc(p.Connection) + "\",\"guidance\":\"" + Esc(p.Guidance) + "\",\"state\":\"" + Esc(p.State) + "\"}");
+    }
+    return "{\"ok\":true,\"devices\":[" + string.Join(",", rows.ToArray()) + "],\"warnings\":[],\"count\":" + rows.Count +
+      ",\"scanned_utc\":\"" + Now() + "\",\"source\":\"live\",\"note\":\"\"}";
+  }
+
+  public static string MobileJson(List<AetherisPhone> phones) {
+    string rows = MobileRowsJson(phones);
+    return "{\"ok\":true,\"mobile_devices\":" + rows + ",\"count\":" + phones.Count +
+      ",\"scanned_utc\":\"" + Now() + "\",\"source\":\"live\"}";
+  }
+
+  public static string MobileRowsJson(List<AetherisPhone> phones) {
+    List<string> rows = new List<string>();
+    foreach (AetherisPhone p in phones) {
+      rows.Add("{\"id\":\"" + Esc(p.Id) + "\",\"name\":\"" + Esc(p.Name) + "\",\"device_class\":\"" + Esc(p.DeviceClass) +
+        "\",\"connection\":\"" + Esc(p.Connection) + "\",\"os_hint\":\"" + Esc(p.Os) + "\",\"instance_id\":\"" + Esc(p.InstanceId) +
+        "\",\"has_drive_letter\":false,\"live_acquire\":" + (p.LiveAcquire ? "true" : "false") +
+        ",\"capability_label\":\"" + Esc(p.Capability) + "\",\"guidance\":\"" + Esc(p.Guidance) + "\",\"state\":\"" + Esc(p.State) +
+        "\",\"ios_backup_roots\":[]}");
+    }
+    return "[" + string.Join(",", rows.ToArray()) + "]";
+  }
+}
+
 public class AetherisHelperDispatcher {
   public readonly BlockingCollection<HttpListenerContext> Queue = new BlockingCollection<HttpListenerContext>();
   HttpListener _listener;
@@ -3006,6 +3775,8 @@ public class AetherisHelperDispatcher {
   public string RootPath = "";
   public string NativeMtpJobScript = "";
   public string NativeIosJobScript = "";
+  public string StreamUploadScript = "";
+  public string KitConfigPath = "";
   public string JobsDir = "";
   public string ExpectedToken = "";
   public string RefreshStatusFile = "";
@@ -3023,6 +3794,10 @@ public class AetherisHelperDispatcher {
     _thread.IsBackground = true;
     _thread.Name = "aetheris-helper-accept";
     _thread.Start();
+    Thread streams = new Thread(StreamWatchLoop);
+    streams.IsBackground = true;
+    streams.Name = "aetheris-stream-watch";
+    streams.Start();
   }
   void AcceptLoop() {
     while (!_stop && _listener != null && _listener.IsListening) {
@@ -3038,16 +3813,22 @@ public class AetherisHelperDispatcher {
         if (method == "OPTIONS") WriteCors(ctx);
         else if (path == "" || path == "/" || path == "/health") WriteHealth(ctx);
         else if (method == "POST" && path == "/acquisition/preview") WriteNativePreview(ctx);
+        else if (method == "POST" && path.StartsWith("/acquisition/import/", StringComparison.Ordinal)) {
+          HttpListenerContext importCtx = ctx;
+          string importPath = path;
+          ThreadPool.QueueUserWorkItem(delegate(object state) { AetherisImport.Handle(importCtx, importPath); });
+        }
         else if (method == "POST" && path == "/acquisition/run" &&
                  query.IndexOf("native=", StringComparison.OrdinalIgnoreCase) >= 0) WriteNativeUsbRun(ctx, query);
         else if (method == "POST" && path == "/acquisition/cancel") WriteCancelUsb(ctx);
         else if (method == "GET" && path == "/acquisition/jobs") WriteJobList(ctx);
+        else if (method == "GET" && path.StartsWith("/acquisition/stream/", StringComparison.Ordinal)) WriteStreamStatus(ctx, path);
         else if (method == "GET" && (path == "/acquisition/job" || path.StartsWith("/acquisition/job/"))) {
           if (!WriteJobStatus(ctx, path, query)) Queue.Add(ctx);
         }
         else if (method == "GET" && path == "/acquisition/adapters") WriteCached(ctx, AdaptersJsonPath, DefaultAdaptersJson);
-        else if (method == "GET" && path == "/acquisition/devices") WriteFreshDevices(ctx);
-        else if (method == "GET" && (path == "/mobile-devices" || path == "/mobile_devices")) WriteMobileDevices(ctx);
+        else if (method == "GET" && path == "/acquisition/devices") WriteLiveDevices(ctx, query);
+        else if (method == "GET" && (path == "/mobile-devices" || path == "/mobile_devices")) WriteLiveMobile(ctx, query);
         else if (method == "GET" && path == "/drives") WriteDrives(ctx);
         else if (method == "GET" && (path == "/refresh-drive-mounts" || path == "/refresh-drive-mounts/status")) WriteRefreshStatus(ctx);
         else if (method == "POST" && path == "/refresh-drive-mounts") StartRefreshMount(ctx);
@@ -3109,8 +3890,35 @@ public class AetherisHelperDispatcher {
   void WriteBytes(HttpListenerContext ctx, string json) {
     WriteJson(ctx, 200, json);
   }
+  // V1.31.8: the page asks here whether the Client Evidence Agent (port 9877) is running, instead of
+  // calling 127.0.0.1:9877 itself: each refused browser call shows up as a red console error.
+  public int ClientAgentPort = 9877;
+  readonly object _agentLock = new object();
+  DateTime _agentCheckedUtc = DateTime.MinValue;
+  bool _agentUp;
+  bool ClientAgentListening() {
+    lock (_agentLock) {
+      if ((DateTime.UtcNow - _agentCheckedUtc).TotalSeconds < 3) return _agentUp;
+    }
+    bool up = false;
+    try {
+      using (System.Net.Sockets.TcpClient c = new System.Net.Sockets.TcpClient()) {
+        IAsyncResult ar = c.BeginConnect("127.0.0.1", ClientAgentPort, null, null);
+        if (ar.AsyncWaitHandle.WaitOne(250) && c.Connected) { c.EndConnect(ar); up = true; }
+      }
+    } catch { up = false; }
+    lock (_agentLock) { _agentUp = up; _agentCheckedUtc = DateTime.UtcNow; }
+    return up;
+  }
   void WriteHealth(HttpListenerContext ctx) {
-    WriteBytes(ctx, HealthJson ?? "{\"ok\":true}");
+    string json = HealthJson ?? "{\"ok\":true}";
+    try {
+      int end = json.LastIndexOf('}');
+      if (end > 0) json = json.Substring(0, end) + ",\"client_agent_running\":" + (ClientAgentListening() ? "true" : "false") +
+        ",\"client_stream\":" + (!string.IsNullOrEmpty(StreamUploadScript) && File.Exists(StreamUploadScript) ? "true" : "false") +
+        ",\"stream_ready\":" + (KitServer().Length > 0 ? "true" : "false") + "}";
+    } catch {}
+    WriteBytes(ctx, json);
   }
   void WriteCached(HttpListenerContext ctx, string path, string fallback) {
     string json = fallback;
@@ -3216,14 +4024,20 @@ public class AetherisHelperDispatcher {
       volumes.Add(row);
       letters.Add("\"" + letter + "\"");
     }
+    // V1.31.13: the phones in this answer are read live too (they were the background file, which could
+    // still list a phone unplugged long ago); the file is used only when Windows cannot be asked.
     string mobile = "[]";
-    try {
-      if (!string.IsNullOrEmpty(mobileJsonPath) && File.Exists(mobileJsonPath) &&
-          (DateTime.UtcNow - File.GetLastWriteTimeUtc(mobileJsonPath)).TotalSeconds <= 15) {
-        string raw = File.ReadAllText(mobileJsonPath).Trim();
-        if (raw.StartsWith("[")) mobile = raw;
-      }
-    } catch {}
+    bool liveOk = false;
+    List<AetherisPhone> livePhones = AetherisUsbLive.Phones(out liveOk);
+    if (liveOk) mobile = AetherisUsbLive.MobileRowsJson(livePhones);
+    else {
+      try {
+        if (!string.IsNullOrEmpty(mobileJsonPath) && File.Exists(mobileJsonPath)) {
+          string raw = File.ReadAllText(mobileJsonPath).Trim();
+          if (raw.StartsWith("[")) mobile = raw;
+        }
+      } catch {}
+    }
     return "{\"ok\":true,\"source\":\"helper_fast\",\"drives\":[" + string.Join(",", letters.ToArray()) +
       "],\"volumes\":[" + string.Join(",", volumes.ToArray()) + "],\"count\":" + volumes.Count +
       ",\"mobile_devices\":" + mobile + ",\"mobile_count\":" + CountTopLevelObjects(mobile) +
@@ -3239,22 +4053,26 @@ public class AetherisHelperDispatcher {
     catch (Exception ex) { json = "{\"ok\":false,\"error\":\"" + JsonEsc(ex.Message) + "\"}"; }
     WriteBytes(ctx, json);
   }
-  bool FreshUsbCache(string path) {
-    try { return !string.IsNullOrEmpty(path) && File.Exists(path) &&
-      (DateTime.UtcNow - File.GetLastWriteTimeUtc(path)).TotalSeconds <= 15; }
-    catch { return false; }
+  // V1.31.9: phones present now (AetherisUsbLive). ?cached=1 returns the background job's file instead,
+  // which is also the fallback when Windows cannot be asked.
+  void WriteLiveDevices(HttpListenerContext ctx, string query) {
+    bool ok = false;
+    List<AetherisPhone> phones = null;
+    if ((query ?? "").IndexOf("cached=1", StringComparison.OrdinalIgnoreCase) < 0) phones = AetherisUsbLive.Phones(out ok);
+    if (!ok) { WriteCached(ctx, DevicesJsonPath, DefaultDevicesJson); return; }
+    WriteBytes(ctx, AetherisUsbLive.AcquisitionJson(phones));
   }
-  void WriteFreshDevices(HttpListenerContext ctx) {
-    if (!FreshUsbCache(DevicesJsonPath)) {
-      WriteBytes(ctx, "{\"ok\":true,\"devices\":[],\"warnings\":[\"Live device scan unavailable; USB list cleared\"],\"count\":0}");
-      return;
-    }
-    WriteCached(ctx, DevicesJsonPath, DefaultDevicesJson);
+  void WriteLiveMobile(HttpListenerContext ctx, string query) {
+    bool ok = false;
+    List<AetherisPhone> phones = null;
+    if ((query ?? "").IndexOf("cached=1", StringComparison.OrdinalIgnoreCase) < 0) phones = AetherisUsbLive.Phones(out ok);
+    if (!ok) { WriteMobileDevices(ctx); return; }
+    WriteBytes(ctx, AetherisUsbLive.MobileJson(phones));
   }
   void WriteMobileDevices(HttpListenerContext ctx) {
     string json = "{\"ok\":true,\"mobile_devices\":[],\"count\":0}";
     try {
-      if (FreshUsbCache(MobileJsonPath)) {
+      if (!string.IsNullOrEmpty(MobileJsonPath) && File.Exists(MobileJsonPath)) {
         string raw = File.ReadAllText(MobileJsonPath);
         if (!string.IsNullOrWhiteSpace(raw)) {
           string trimmed = raw.Trim();
@@ -3513,11 +4331,13 @@ public class AetherisHelperDispatcher {
     } catch {}
     return false;
   }
+  // This C# sits in an expandable PowerShell here-string: every PowerShell variable in the
+  // command text below must be written `$ so it reaches powershell.exe instead of being emptied here.
   void KillMatchingAcquireProcesses() {
     try {
       ProcessStartInfo psi = new ProcessStartInfo();
       psi.FileName = "powershell.exe";
-      psi.Arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -Command \"Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine -notmatch 'host-drive-helper' -and (($_.Name -match 'python' -and $_.CommandLine -match 'acq_run_|ios_usbmux_backup|native_ios_job|native_mtp_job|host-mobile-acquire') -or ($_.Name -match 'powershell|pwsh' -and $_.CommandLine -match 'native_ios_job|native_mtp_job|host-mobile-acquire')) } | ForEach-Object { & taskkill.exe /PID $_.ProcessId /T /F 2>$null }\"";
+      psi.Arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -Command \"Get-CimInstance Win32_Process | Where-Object { `$_.CommandLine -and `$_.CommandLine -notmatch 'host-drive-helper' -and ((`$_.Name -match 'python' -and `$_.CommandLine -match 'acq_run_|ios_usbmux_backup|native_ios_job|native_mtp_job|host-mobile-acquire') -or (`$_.Name -match 'powershell|pwsh' -and `$_.CommandLine -match 'native_ios_job|native_mtp_job|host-mobile-acquire')) } | ForEach-Object { & taskkill.exe /PID `$_.ProcessId /T /F 2>`$null }\"";
       psi.UseShellExecute = false;
       psi.CreateNoWindow = true;
       Process p = Process.Start(psi);
@@ -3577,7 +4397,7 @@ public class AetherisHelperDispatcher {
         try {
           ProcessStartInfo psi = new ProcessStartInfo();
           psi.FileName = "powershell.exe";
-          psi.Arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -Command \"Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine -match [regex]::Escape('" + jobId.Replace("'", "") + "') -and $_.CommandLine -notmatch 'host-drive-helper' } | ForEach-Object { & taskkill.exe /PID $_.ProcessId /T /F 2>$null }\"";
+          psi.Arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -Command \"Get-CimInstance Win32_Process | Where-Object { `$_.CommandLine -and `$_.CommandLine -match [regex]::Escape('" + jobId.Replace("'", "") + "') -and `$_.CommandLine -notmatch 'host-drive-helper' } | ForEach-Object { & taskkill.exe /PID `$_.ProcessId /T /F 2>`$null }\"";
           psi.UseShellExecute = false;
           psi.CreateNoWindow = true;
           Process p = Process.Start(psi);
@@ -3824,6 +4644,104 @@ public class AetherisHelperDispatcher {
       return false;
     }
   }
+  // ---- V1.31.14: collection on this computer sent to the forensic server while it runs ----
+  // The destination is NOT taken from the caller (this port answers any web page): it is the server this
+  // computer was set up for with the setup file (client-kit.json). The page only supplies the session id
+  // and its one-off upload token, which that server issued for this case.
+  static readonly Regex StreamSessionRe = new Regex("^[0-9a-f]{20}\\z");
+  static readonly Regex StreamTokenRe = new Regex("^[A-Za-z0-9_-]{20,128}\\z");
+  static readonly Regex StreamServiceRe = new Regex("^[a-z-]{0,40}\\z");
+  static readonly Regex KitOriginRe = new Regex("^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?\\z");
+  readonly Dictionary<string, DateTime> _streamStarts = new Dictionary<string, DateTime>();
+  public string KitServer() {
+    try {
+      if (string.IsNullOrEmpty(KitConfigPath) || !File.Exists(KitConfigPath)) return "";
+      string server = JsonStr(File.ReadAllText(KitConfigPath), "server").Trim().TrimEnd('/');
+      return KitOriginRe.IsMatch(server) ? server : "";
+    } catch { return ""; }
+  }
+  string StreamProblem(string session, string token, string service, out string server) {
+    server = "";
+    if (!StreamSessionRe.IsMatch(session ?? "") || !StreamTokenRe.IsMatch(token ?? "") || !StreamServiceRe.IsMatch(service ?? "")) {
+      return "{\"ok\":false,\"error\":\"stream_bad_request\",\"detail\":\"The upload session from the server is not valid.\"}";
+    }
+    if (string.IsNullOrEmpty(StreamUploadScript) || !File.Exists(StreamUploadScript)) {
+      return "{\"ok\":false,\"error\":\"stream_unavailable\",\"detail\":\"This computer has no Polaron uploader yet (scripts\\\\polaron-stream-upload.ps1). Run the Polaron setup file from the server again.\"}";
+    }
+    server = KitServer();
+    if (string.IsNullOrEmpty(server)) {
+      return "{\"ok\":false,\"error\":\"stream_not_configured\",\"detail\":\"This computer was not set up with the Polaron setup file, so it does not know which server to send the image to. Download the setup file from Polaron (Set up this computer) and run it once.\"}";
+    }
+    return null;
+  }
+  public static bool StreamUploaderAlive(string stamp) {
+    try {
+      Mutex m;
+      if (Mutex.TryOpenExisting("Local\\PolaronStreamUpload_" + stamp, out m)) { m.Dispose(); return true; }
+    } catch (UnauthorizedAccessException) { return true; }
+    catch {}
+    return false;
+  }
+  bool StartStreamUploader(string stamp, string streamFile) {
+    try {
+      if (string.IsNullOrEmpty(StreamUploadScript) || !File.Exists(StreamUploadScript)) return false;
+      lock (_streamStarts) _streamStarts[stamp] = DateTime.UtcNow;
+      ProcessStartInfo psi = new ProcessStartInfo();
+      psi.FileName = "powershell.exe";
+      psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + StreamUploadScript +
+        "\" -StreamFile \"" + streamFile + "\"";
+      psi.WorkingDirectory = string.IsNullOrEmpty(RootPath) ? Path.GetTempPath() : RootPath;
+      psi.UseShellExecute = false;
+      psi.CreateNoWindow = true;
+      Process p = Process.Start(psi);
+      return p != null;
+    } catch { return false; }
+  }
+  // Restarts the uploader of an unfinished stream (computer restarted, uploader stopped). The uploader
+  // resumes from what the server already holds; it writes <job>.stream.done when it has nothing left to do.
+  void StreamWatchLoop() {
+    while (!_stop) {
+      try { ResumeStreams(); } catch {}
+      for (int i = 0; i < 30 && !_stop; i++) Thread.Sleep(1000);
+    }
+  }
+  void ResumeStreams() {
+    if (string.IsNullOrEmpty(JobsDir) || !Directory.Exists(JobsDir)) return;
+    foreach (string f in Directory.GetFiles(JobsDir, "*.stream.json")) {
+      string name = Path.GetFileName(f);
+      string stamp = name.Substring(0, name.Length - ".stream.json".Length);
+      if (!Regex.IsMatch(stamp, "^[0-9a-f]{32}\\z")) continue;
+      if (File.Exists(Path.Combine(JobsDir, stamp + ".stream.done"))) continue;
+      if ((DateTime.UtcNow - File.GetLastWriteTimeUtc(f)).TotalDays > 14) continue;
+      if (StreamUploaderAlive(stamp)) continue;
+      DateTime last;
+      lock (_streamStarts) { if (!_streamStarts.TryGetValue(stamp, out last)) last = DateTime.MinValue; }
+      if ((DateTime.UtcNow - last).TotalSeconds < 120) continue;
+      StartStreamUploader(stamp, f);
+    }
+  }
+  void WriteStreamStatus(HttpListenerContext ctx, string path) {
+    string id = path.Substring(path.LastIndexOf('/') + 1);
+    if (!Regex.IsMatch(id, "^[0-9a-f]{32}\\z") || string.IsNullOrEmpty(JobsDir)) {
+      WriteJson(ctx, 404, "{\"ok\":false,\"error\":\"unknown_job\"}");
+      return;
+    }
+    string file = Path.Combine(JobsDir, id + ".stream.status.json");
+    string json = "{\"ok\":true,\"state\":\"starting\",\"detail\":\"Starting the upload to the forensic server\"}";
+    try {
+      if (File.Exists(file)) {
+        string raw = File.ReadAllText(file);
+        if (!string.IsNullOrWhiteSpace(raw) && raw.TrimStart().StartsWith("{")) json = raw;
+      } else if (!File.Exists(Path.Combine(JobsDir, id + ".stream.json"))) {
+        json = "{\"ok\":false,\"error\":\"no_stream\",\"detail\":\"This collection is not sent to the server.\"}";
+      }
+    } catch {}
+    try {
+      int end = json.LastIndexOf('}');
+      if (end > 0) json = json.Substring(0, end) + ",\"uploader_running\":" + (StreamUploaderAlive(id) ? "true" : "false") + "}";
+    } catch {}
+    WriteBytes(ctx, json);
+  }
   void WriteNativeUsbRun(HttpListenerContext ctx, string query) {
     try {
       string body = "";
@@ -3851,6 +4769,20 @@ public class AetherisHelperDispatcher {
       if (string.IsNullOrEmpty(progressFile))
         progressFile = Path.Combine(tmp, "acq_progress_" + stamp + ".json");
       string caseId = JsonStr(body, "case_id");
+      // V1.31.14: the page asks that this collection goes to the forensic server while it runs.
+      string streamSession = JsonStr(body, "stream_session");
+      string streamToken = JsonStr(body, "stream_token");
+      string streamServer = "";
+      bool streaming = !string.IsNullOrEmpty(streamSession) || !string.IsNullOrEmpty(streamToken);
+      if (streaming) {
+        string problem = StreamProblem(streamSession, streamToken, JsonStr(body, "stream_service"), out streamServer);
+        if (problem != null) {
+          WriteJson(ctx, 409, problem);
+          return;
+        }
+        // The upload token never goes into the collector's payload file (it stays in the stream file).
+        body = body.Replace("\"" + streamToken + "\"", "\"\"");
+      }
       if (body.IndexOf("\"progress_file\"", StringComparison.OrdinalIgnoreCase) < 0 && body.TrimEnd().EndsWith("}")) {
         string trimmed = body.TrimEnd();
         body = trimmed.Substring(0, trimmed.Length - 1) + ",\"progress_file\":\"" + JsonEscape(progressFile) + "\"}";
@@ -3888,12 +4820,32 @@ public class AetherisHelperDispatcher {
         try { proc.BeginOutputReadLine(); } catch {}
         try { proc.BeginErrorReadLine(); } catch {}
       }
+      string metaFile = Path.Combine(JobsDir, stamp + ".json");
       string meta = "{\"pid\":" + pid + ",\"result_file\":\"" + JsonEscape(resultFile) +
         "\",\"progress_file\":\"" + JsonEscape(progressFile) + "\",\"err_file\":\"" + JsonEscape(errFile) +
-        "\",\"status\":\"running\",\"case_id\":\"" + JsonEscape(caseId) + "\"}";
-      File.WriteAllText(Path.Combine(JobsDir, stamp + ".json"), meta, new UTF8Encoding(false));
+        "\",\"status\":\"running\",\"case_id\":\"" + JsonEscape(caseId) + "\"" +
+        (streaming ? ",\"stream_session\":\"" + JsonEscape(streamSession) + "\"" : "") + "}";
+      File.WriteAllText(metaFile, meta, new UTF8Encoding(false));
+      string streamJson = "";
+      if (streaming) {
+        string streamFile = Path.Combine(JobsDir, stamp + ".stream.json");
+        string stream = "{\"job_id\":\"" + stamp + "\",\"session_id\":\"" + JsonEscape(streamSession) +
+          "\",\"token\":\"" + JsonEscape(streamToken) + "\",\"server\":\"" + JsonEscape(streamServer) +
+          "\",\"service\":\"" + JsonEscape(JsonStr(body, "stream_service")) +
+          "\",\"keep_local\":" + (JsonStr(body, "stream_keep_local") == "1" ? "true" : "false") +
+          ",\"scope\":\"" + (JsonStr(body, "stream_scope") == "packages" ? "packages" : "full") +
+          "\",\"platform\":\"" + (ios ? "ios" : "android") +
+          "\",\"pid\":" + pid + ",\"payload_file\":\"" + JsonEscape(payloadFile) +
+          "\",\"result_file\":\"" + JsonEscape(resultFile) + "\",\"progress_file\":\"" + JsonEscape(progressFile) +
+          "\",\"meta_file\":\"" + JsonEscape(metaFile) + "\",\"root\":\"" + JsonEscape(RootPath) +
+          "\",\"created_utc\":\"" + DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture) + "\"}";
+        File.WriteAllText(streamFile, stream, new UTF8Encoding(false));
+        bool started = StartStreamUploader(stamp, streamFile);
+        streamJson = ",\"stream\":{\"session_id\":\"" + JsonEscape(streamSession) + "\",\"uploader\":" + (started ? "true" : "false") +
+          ",\"keep_local\":" + (JsonStr(body, "stream_keep_local") == "1" ? "true" : "false") + "}";
+      }
       string json = "{\"ok\":true,\"async\":true,\"job_id\":\"" + stamp +
-        "\",\"status\":\"running\",\"busy\":true,\"via\":\"" + via + "\"}";
+        "\",\"status\":\"running\",\"busy\":true,\"via\":\"" + via + "\"" + streamJson + "}";
       byte[] bytes = Encoding.UTF8.GetBytes(json);
       HttpListenerResponse res = ctx.Response;
       res.StatusCode = 202;
@@ -3916,18 +4868,17 @@ public class AetherisHelperDispatcher {
       }
       string adapter = JsonStr(body, "adapter");
       string deviceId = JsonStr(body, "device_id");
-      if ((adapter != "android_adb" && adapter != "android_mtp" && adapter != "ios_lockdown") ||
-          string.IsNullOrEmpty(deviceId) || !FreshUsbCache(DevicesJsonPath) ||
-          File.ReadAllText(DevicesJsonPath).IndexOf(JsonEscape(deviceId), StringComparison.OrdinalIgnoreCase) < 0) {
-        WriteJson(ctx, 404, "{\"ok\":false,\"error\":\"Device is not present in the live USB inventory\"}");
-        return;
-      }
       string label = JsonStr(body, "label");
       if (string.IsNullOrEmpty(label)) label = JsonStr(body, "device_name");
       if (string.IsNullOrEmpty(label)) label = deviceId;
       string os = "android";
       if (adapter.IndexOf("ios", StringComparison.OrdinalIgnoreCase) >= 0) os = "ios";
-      // OS identity is assigned by the verified transport adapter, not a friendly label.
+      if (label.IndexOf("iPhone", StringComparison.OrdinalIgnoreCase) >= 0 ||
+          label.IndexOf("iPad", StringComparison.OrdinalIgnoreCase) >= 0 ||
+          label.IndexOf("Apple", StringComparison.OrdinalIgnoreCase) >= 0) os = "ios";
+      else if (label.IndexOf("Android", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               label.IndexOf("Samsung", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               label.IndexOf("Galaxy", StringComparison.OrdinalIgnoreCase) >= 0) os = "android";
       bool logicalOnly = adapter.IndexOf("mtp", StringComparison.OrdinalIgnoreCase) >= 0;
       string methods = os == "ios" ? "[\"backup\",\"advanced_logical\",\"logical\"]" : "[\"logical\",\"advanced_logical\",\"backup\",\"file_system\",\"full_file_system\"]";
       string manufacturer = os == "ios" ? "Apple" : (label.IndexOf("Galaxy", StringComparison.OrdinalIgnoreCase) >= 0 || label.IndexOf("Samsung", StringComparison.OrdinalIgnoreCase) >= 0 ? "Samsung" : "");
@@ -3941,7 +4892,7 @@ public class AetherisHelperDispatcher {
         (os == "ios" ? JsonEscape(deviceId) : "") +
         "\",\"os_family\":\"" + os + "\",\"os_version\":\"\",\"security_patch_level\":\"\",\"build_id\":\"\",\"lock_state\":\"" + lockState + "\",\"encryption_state\":\"unknown\",\"connection_mode\":\"" +
         mode + "\",\"usb_debugging_authorized\":" + (adapter == "android_adb" ? "true" : "false") +
-        ",\"pairing_trusted\":false" +
+        ",\"pairing_trusted\":" + (os == "ios" ? "true" : "false") +
         ",\"developer_mode\":false,\"rooted_or_jailbroken\":null,\"battery_percent\":null,\"network_isolated\":null,\"sim_present\":null,\"iccid\":\"\",\"imsi\":\"\",\"sd_card_present\":null,\"sd_card_identifier\":\"\",\"tool_version\":\"aetheris-acquire/host-helper\",\"license_entitlements\":[],\"required_cable\":\"USB data cable\",\"unknown_fields\":[],\"observations\":[\"Detected on the examiner Windows host over USB (no extra adapter).\",\"" +
         obs2 + "\"]},\"capability\":{\"capability_label\":\"SUPPORTED_DIRECT_LOGICAL\",\"supported_methods\":" + methods +
         ",\"blocked_methods\":{},\"warnings\":[],\"preparation_steps\":[\"Keep the phone unlocked and the data cable seated.\",\"" +
@@ -3957,7 +4908,7 @@ public class AetherisHelperDispatcher {
       res.OutputStream.Close();
     } catch {
       try {
-        byte[] bytes = Encoding.UTF8.GetBytes("{\"ok\":false,\"error\":\"Live device profile unavailable\"}");
+        byte[] bytes = Encoding.UTF8.GetBytes("{\"ok\":true,\"device_profile\":{\"os_family\":\"android\",\"model\":\"Android phone\",\"device_label\":\"Android phone\",\"serial\":\"\",\"connection_mode\":\"mtp\",\"required_cable\":\"USB data cable\",\"observations\":[\"Detected on the examiner Windows host over USB (no extra adapter).\"]},\"capability\":{\"capability_label\":\"SUPPORTED_DIRECT_LOGICAL\",\"supported_methods\":[\"logical\",\"advanced_logical\",\"backup\",\"file_system\",\"full_file_system\"],\"blocked_methods\":{},\"warnings\":[],\"preparation_steps\":[\"Keep the phone unlocked and the data cable seated.\"]},\"preparation_steps\":[\"Keep the phone unlocked and the data cable seated.\"],\"method_profiles\":{}}");
         HttpListenerResponse res = ctx.Response;
         res.StatusCode = 200;
         res.ContentType = "application/json; charset=utf-8";
@@ -4048,8 +4999,477 @@ public class AetherisHelperDispatcher {
     try { if (_listener != null) _listener.Stop(); } catch {}
   }
 }
+// V1.27.0 client mobile imaging: the forensic server's copy of an image that was
+// created on a client PC. The API container streams each file from the client's
+// read-only share in chunks; this writer stores it under the server evidence root
+// "as usual" (<root>\evidence\cases\<CASE>\...), verifies SHA-256 on disk before
+// the file gets its final name, and never overwrites an existing evidence file.
+// Server-to-server only: requests from a web page (Origin header) are refused.
+public static class AetherisImport {
+  public static string RootPath = "";
+  public static string CasesRootOverride = "";
+  public static string ExpectedToken = "";
+  public const string PartSuffix = ".polaron-part";
+  public const long MaxChunkBytes = 67108864L;
+  static readonly string[] RunFolders = new string[] { "02_Original_Extraction", "03_Working_Copy", "05_Exports", "06_Reports", "07_Logs", "08_Hashes" };
+  static readonly string[] CaseFolders = new string[] { "01_Authority", "02_Original_Extraction", "03_Working_Copy", "04_PA_Case", "05_Exports", "06_Reports", "07_Logs", "08_Hashes", "09_Review", "10_Disclosure" };
+  static readonly Regex CaseIdRe = new Regex("^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\\z");
+  static readonly object[] Stripes = MakeStripes(64);
+
+  const uint GENERIC_READ = 0x80000000;
+  const uint GENERIC_WRITE = 0x40000000;
+  const uint FILE_READ_ATTRIBUTES = 0x80;
+  const uint FILE_WRITE_ATTRIBUTES = 0x100;
+  const uint SHARE_READ = 1;
+  const uint SHARE_WRITE = 2;
+  const uint SHARE_DELETE = 4;
+  const uint CREATE_ALWAYS = 2;
+  const uint OPEN_EXISTING = 3;
+  const uint ATTR_READONLY = 0x1;
+  const uint ATTR_DIRECTORY = 0x10;
+  const uint ATTR_NORMAL = 0x80;
+  const uint INVALID_ATTRS = 0xFFFFFFFF;
+  const uint FLAG_BACKUP_SEMANTICS = 0x02000000;
+  const uint MOVEFILE_WRITE_THROUGH = 0x8;
+
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  static extern bool CreateDirectoryW(string path, IntPtr sa);
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  static extern bool MoveFileExW(string from, string to, uint flags);
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  static extern bool DeleteFileW(string path);
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  static extern uint GetFileAttributesW(string path);
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  static extern bool SetFileAttributesW(string path, uint attrs);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  static extern bool SetFileTime(SafeFileHandle h, IntPtr creation, IntPtr lastAccess, ref long lastWrite);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  static extern bool GetFileSizeEx(SafeFileHandle h, out long size);
+
+  static object[] MakeStripes(int n) {
+    object[] s = new object[n];
+    for (int i = 0; i < n; i++) s[i] = new object();
+    return s;
+  }
+  static object LockFor(string full) {
+    return Stripes[(full.ToLowerInvariant().GetHashCode() & 0x7fffffff) % Stripes.Length];
+  }
+
+  public static string CasesRoot(string caseRoot) {
+    string raw = (caseRoot ?? "").Trim().Replace('\\', '/').TrimEnd('/');
+    string evidenceRoot = Path.Combine(RootPath, "evidence");
+    if (raw.Length == 0 || raw == "/evidence/cases") {
+      string root = string.IsNullOrEmpty(CasesRootOverride) ? Path.Combine(evidenceRoot, "cases") : CasesRootOverride;
+      return Path.GetFullPath(root).TrimEnd('\\');
+    }
+    if (raw.StartsWith("/evidence/", StringComparison.Ordinal)) {
+      string current = evidenceRoot;
+      foreach (string seg in raw.Substring("/evidence/".Length).Split('/')) {
+        if (!SafeSegment(seg)) throw new ArgumentException("Unsafe case_root segment: " + seg);
+        current = Path.Combine(current, seg);
+      }
+      return Path.GetFullPath(current).TrimEnd('\\');
+    }
+    throw new ArgumentException("Imports are written only under the forensic server evidence root (/evidence/cases).");
+  }
+
+  static bool SafeSegment(string seg) {
+    if (string.IsNullOrEmpty(seg) || seg == "." || seg == ".." || seg.Length > 255) return false;
+    foreach (char c in seg) {
+      if (c < (char)0x20 || c == '<' || c == '>' || c == ':' || c == '"' || c == '|' || c == '?' || c == '*' || c == '\\' || c == '/') return false;
+    }
+    return !seg.EndsWith(PartSuffix, StringComparison.OrdinalIgnoreCase);
+  }
+
+  static string[] RelSegments(string rel) {
+    string norm = (rel ?? "").Replace('\\', '/');
+    if (norm.Length == 0 || norm.StartsWith("/")) throw new ArgumentException("rel must be a relative path");
+    string[] segs = norm.Split('/');
+    foreach (string s in segs) {
+      if (!SafeSegment(s)) throw new ArgumentException("Unsafe path segment in " + rel);
+    }
+    if (Array.IndexOf(RunFolders, segs[0]) < 0) {
+      throw new ArgumentException("rel must start with 02_Original_Extraction, 03_Working_Copy, 05_Exports, 06_Reports, 07_Logs or 08_Hashes");
+    }
+    if (segs.Length < 3) throw new ArgumentException("rel must name a file inside a run folder");
+    return segs;
+  }
+
+  // Long-path form (\\?\) so deep phone trees beyond MAX_PATH are stored intact.
+  static string Lp(string full) {
+    if (full.StartsWith("\\\\?\\")) return full;
+    if (full.StartsWith("\\\\")) return "\\\\?\\UNC\\" + full.Substring(2);
+    return "\\\\?\\" + full;
+  }
+
+  static string CaseDir(string caseRoot, string caseId) {
+    if (string.IsNullOrEmpty(caseId) || !CaseIdRe.IsMatch(caseId) || caseId.Trim('.').Length == 0) {
+      throw new ArgumentException("Invalid case folder name");
+    }
+    return CasesRoot(caseRoot) + "\\" + caseId;
+  }
+
+  static string FullPath(string caseDir, string[] segs) {
+    return caseDir + "\\" + string.Join("\\", segs);
+  }
+
+  static void EnsureParentDirs(string caseDir, string[] segs) {
+    Directory.CreateDirectory(caseDir);
+    string current = caseDir;
+    for (int i = 0; i < segs.Length - 1; i++) {
+      current = current + "\\" + segs[i];
+      if (!CreateDirectoryW(Lp(current), IntPtr.Zero)) {
+        int err = Marshal.GetLastWin32Error();
+        uint a = GetFileAttributesW(Lp(current));
+        if (err != 183 || a == INVALID_ATTRS || (a & ATTR_DIRECTORY) == 0) {
+          throw new IOException("Could not create folder " + current + " (Win32 error " + err + ")");
+        }
+      }
+    }
+  }
+
+  static long FileSize(string full) {
+    uint a = GetFileAttributesW(Lp(full));
+    if (a == INVALID_ATTRS) return -1;
+    if ((a & ATTR_DIRECTORY) != 0) return -2;
+    using (SafeFileHandle h = CreateFileW(Lp(full), FILE_READ_ATTRIBUTES, SHARE_READ | SHARE_WRITE | SHARE_DELETE, IntPtr.Zero, OPEN_EXISTING, FLAG_BACKUP_SEMANTICS, IntPtr.Zero)) {
+      if (h.IsInvalid) return -1;
+      long size;
+      if (!GetFileSizeEx(h, out size)) return -1;
+      return size;
+    }
+  }
+
+  static string Hex(byte[] bytes) {
+    return BitConverter.ToString(bytes).Replace("-", "").ToLowerInvariant();
+  }
+
+  static string Sha256Of(string full) {
+    SafeFileHandle h = CreateFileW(Lp(full), GENERIC_READ, SHARE_READ, IntPtr.Zero, OPEN_EXISTING, ATTR_NORMAL, IntPtr.Zero);
+    if (h.IsInvalid) {
+      int err = Marshal.GetLastWin32Error();
+      h.Dispose();
+      throw new IOException("Could not open " + full + " (Win32 error " + err + ")");
+    }
+    using (FileStream fs = new FileStream(h, FileAccess.Read, 1 << 20))
+    using (SHA256 sha = SHA256.Create()) {
+      return Hex(sha.ComputeHash(fs));
+    }
+  }
+
+  static void SetMtime(string full, long mtimeMs) {
+    using (SafeFileHandle h = CreateFileW(Lp(full), FILE_WRITE_ATTRIBUTES, SHARE_READ | SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, ATTR_NORMAL, IntPtr.Zero)) {
+      if (h.IsInvalid) return;
+      long ft = mtimeMs * 10000L + 116444736000000000L;
+      SetFileTime(h, IntPtr.Zero, IntPtr.Zero, ref ft);
+    }
+  }
+
+  static string Esc(string s) {
+    if (s == null) return "";
+    StringBuilder sb = new StringBuilder(s.Length + 8);
+    foreach (char c in s) {
+      if (c == '\\') sb.Append("\\\\");
+      else if (c == '"') sb.Append("\\\"");
+      else if (c < (char)0x20) sb.Append("\\u").Append(((int)c).ToString("x4"));
+      else sb.Append(c);
+    }
+    return sb.ToString();
+  }
+
+  static string Err(string code, string message) {
+    return "{\"ok\":false,\"error\":\"" + Esc(code) + "\",\"detail\":\"" + Esc(message) + "\"}";
+  }
+
+  static void Json(HttpListenerContext ctx, int status, string json) {
+    try {
+      byte[] bytes = Encoding.UTF8.GetBytes(json ?? "{}");
+      HttpListenerResponse res = ctx.Response;
+      res.StatusCode = status;
+      res.ContentType = "application/json; charset=utf-8";
+      res.ContentLength64 = bytes.Length;
+      res.OutputStream.Write(bytes, 0, bytes.Length);
+      res.OutputStream.Close();
+    } catch {}
+  }
+
+  static void Drain(HttpListenerContext ctx) {
+    try {
+      byte[] buf = new byte[65536];
+      Stream input = ctx.Request.InputStream;
+      long total = 0;
+      int n;
+      while ((n = input.Read(buf, 0, buf.Length)) > 0) {
+        total += n;
+        if (total > MaxChunkBytes) break;
+      }
+    } catch {}
+  }
+
+  static string ReadText(HttpListenerContext ctx) {
+    using (MemoryStream ms = new MemoryStream()) {
+      byte[] buf = new byte[65536];
+      Stream input = ctx.Request.InputStream;
+      int n;
+      while ((n = input.Read(buf, 0, buf.Length)) > 0) {
+        ms.Write(buf, 0, n);
+        if (ms.Length > MaxChunkBytes) throw new ArgumentException("Request body too large");
+      }
+      return Encoding.UTF8.GetString(ms.ToArray());
+    }
+  }
+
+  static long HeaderLong(HttpListenerContext ctx, string name, long fallback) {
+    string raw = ctx.Request.Headers[name];
+    long value;
+    if (string.IsNullOrEmpty(raw)) return fallback;
+    if (!long.TryParse(raw.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out value)) {
+      throw new ArgumentException("Header " + name + " is not a number");
+    }
+    return value;
+  }
+
+  static string HeaderRel(HttpListenerContext ctx) {
+    string raw = (ctx.Request.Headers["X-Import-Rel"] ?? "").Trim();
+    if (raw.Length == 0) throw new ArgumentException("X-Import-Rel is required");
+    string b64 = raw.Replace('-', '+').Replace('_', '/');
+    while (b64.Length % 4 != 0) b64 += "=";
+    try { return Encoding.UTF8.GetString(Convert.FromBase64String(b64)); }
+    catch (FormatException) { throw new ArgumentException("X-Import-Rel must be base64url"); }
+  }
+
+  static string[] Lines(string body) {
+    List<string> outLines = new List<string>();
+    foreach (string line in body.Split('\n')) {
+      string l = line.TrimEnd('\r');
+      if (l.Length > 0) outLines.Add(l);
+    }
+    return outLines.ToArray();
+  }
+
+  public static void Handle(HttpListenerContext ctx, string path) {
+    try {
+      if (!string.IsNullOrEmpty(ExpectedToken) && ctx.Request.Headers["X-Host-Helper-Token"] != ExpectedToken) {
+        Drain(ctx);
+        Json(ctx, 401, Err("unauthorized", "Missing or wrong X-Host-Helper-Token"));
+        return;
+      }
+      if (!string.IsNullOrEmpty(ctx.Request.Headers["Origin"])) {
+        Drain(ctx);
+        Json(ctx, 403, Err("browser_forbidden", "Evidence import is called by the forensic server only."));
+        return;
+      }
+      string caseDir = CaseDir(ctx.Request.Headers["X-Import-Case-Root"] ?? "", ctx.Request.Headers["X-Import-Case-Id"] ?? "");
+      if (path == "/acquisition/import/prepare") Prepare(ctx, caseDir);
+      else if (path == "/acquisition/import/chunk") Chunk(ctx, caseDir);
+      else if (path == "/acquisition/import/commit") Commit(ctx, caseDir);
+      else if (path == "/acquisition/import/seal") Seal(ctx, caseDir);
+      else if (path == "/acquisition/import/abort") Abort(ctx, caseDir);
+      else if (path == "/acquisition/import/discard") Discard(ctx, caseDir);
+      else { Drain(ctx); Json(ctx, 404, Err("not_found", "Unknown import endpoint")); }
+    } catch (ArgumentException ex) {
+      Drain(ctx);
+      Json(ctx, 400, Err("bad_request", ex.Message));
+    } catch (Exception ex) {
+      Drain(ctx);
+      Json(ctx, 500, Err("import_failed", ex.Message));
+    }
+  }
+
+  // Body: one "<size>TAB<rel>" line per file. Creates the case skeleton and reports
+  // which files are already on the server (same size = verified by an earlier commit)
+  // and which paths hold a different file (never overwritten).
+  static void Prepare(HttpListenerContext ctx, string caseDir) {
+    string body = ReadText(ctx);
+    Directory.CreateDirectory(caseDir);
+    foreach (string f in CaseFolders) Directory.CreateDirectory(Path.Combine(caseDir, f));
+    StringBuilder existing = new StringBuilder();
+    StringBuilder conflicts = new StringBuilder();
+    int nExisting = 0;
+    int nConflicts = 0;
+    foreach (string line in Lines(body)) {
+      int tab = line.IndexOf('\t');
+      if (tab <= 0) throw new ArgumentException("prepare lines are <size>TAB<rel>");
+      long size = long.Parse(line.Substring(0, tab), NumberStyles.Integer, CultureInfo.InvariantCulture);
+      string rel = line.Substring(tab + 1);
+      long have = FileSize(FullPath(caseDir, RelSegments(rel)));
+      if (have == -1) continue;
+      if (have == size) {
+        if (nExisting++ > 0) existing.Append(',');
+        existing.Append('"').Append(Esc(rel)).Append('"');
+      } else {
+        if (nConflicts++ > 0) conflicts.Append(',');
+        conflicts.Append("{\"rel\":\"").Append(Esc(rel)).Append("\",\"size\":").Append(have).Append('}');
+      }
+    }
+    Json(ctx, 200, "{\"ok\":true,\"case_dir\":\"" + Esc(caseDir) + "\",\"existing\":[" + existing.ToString() +
+      "],\"conflicts\":[" + conflicts.ToString() + "]}");
+  }
+
+  static void Chunk(HttpListenerContext ctx, string caseDir) {
+    string[] segs = RelSegments(HeaderRel(ctx));
+    long offset = HeaderLong(ctx, "X-Import-Offset", 0);
+    long declared = ctx.Request.ContentLength64;
+    if (offset < 0 || declared < 0 || declared > MaxChunkBytes) {
+      Drain(ctx);
+      Json(ctx, 413, Err("bad_chunk", "Chunks need a Content-Length of at most 64 MiB and a non-negative offset"));
+      return;
+    }
+    string full = FullPath(caseDir, segs);
+    lock (LockFor(full)) {
+      long finalSize = FileSize(full);
+      if (finalSize >= 0) {
+        Drain(ctx);
+        Json(ctx, 409, "{\"ok\":false,\"error\":\"exists\",\"size\":" + finalSize + "}");
+        return;
+      }
+      EnsureParentDirs(caseDir, segs);
+      string part = full + PartSuffix;
+      SafeFileHandle h = CreateFileW(Lp(part), GENERIC_WRITE, SHARE_READ, IntPtr.Zero, offset == 0 ? CREATE_ALWAYS : OPEN_EXISTING, ATTR_NORMAL, IntPtr.Zero);
+      if (h.IsInvalid) {
+        int err = Marshal.GetLastWin32Error();
+        h.Dispose();
+        Drain(ctx);
+        if (err == 2) Json(ctx, 409, "{\"ok\":false,\"error\":\"offset_mismatch\",\"size\":0}");
+        else Json(ctx, 500, Err("open_failed", "Could not open " + part + " (Win32 error " + err + ")"));
+        return;
+      }
+      long written = 0;
+      using (FileStream fs = new FileStream(h, FileAccess.Write, 1 << 20)) {
+        long current = fs.Length;
+        if (current != offset) {
+          Drain(ctx);
+          Json(ctx, 409, "{\"ok\":false,\"error\":\"offset_mismatch\",\"size\":" + current + "}");
+          return;
+        }
+        fs.Seek(offset, SeekOrigin.Begin);
+        byte[] buf = new byte[1 << 20];
+        Stream input = ctx.Request.InputStream;
+        int n;
+        while ((n = input.Read(buf, 0, buf.Length)) > 0) {
+          written += n;
+          if (written > MaxChunkBytes) throw new IOException("Chunk is larger than 64 MiB");
+          fs.Write(buf, 0, n);
+        }
+        fs.Flush();
+        if (declared > 0 && written != declared) {
+          fs.SetLength(offset);
+          Json(ctx, 400, Err("short_body", "The chunk ended early; send it again"));
+          return;
+        }
+      }
+      Json(ctx, 200, "{\"ok\":true,\"size\":" + (offset + written) + "}");
+    }
+  }
+
+  // Verifies the uploaded part on disk (size + SHA-256) and only then gives it its final
+  // name, so every final file under the case folder is a verified copy.
+  static void Commit(HttpListenerContext ctx, string caseDir) {
+    string rel = HeaderRel(ctx);
+    string[] segs = RelSegments(rel);
+    long size = HeaderLong(ctx, "X-Import-Size", -1);
+    long mtimeMs = HeaderLong(ctx, "X-Import-Mtime-Ms", 0);
+    string expected = (ctx.Request.Headers["X-Import-Sha256"] ?? "").Trim().ToLowerInvariant();
+    Drain(ctx);
+    if (size < 0 || expected.Length != 64) throw new ArgumentException("commit needs X-Import-Size and X-Import-Sha256");
+    string full = FullPath(caseDir, segs);
+    string part = full + PartSuffix;
+    lock (LockFor(full)) {
+      long have = FileSize(full);
+      if (have >= 0) {
+        string existingSha = Sha256Of(full);
+        DeleteFileW(Lp(part));
+        if (have == size && existingSha == expected) {
+          Json(ctx, 200, "{\"ok\":true,\"exists\":true,\"sha256\":\"" + existingSha + "\",\"path\":\"" + Esc(full) + "\"}");
+        } else {
+          Json(ctx, 409, "{\"ok\":false,\"error\":\"conflict\",\"detail\":\"A different file already exists at this path on the forensic server. It was not overwritten.\",\"size\":" + have + ",\"sha256\":\"" + existingSha + "\"}");
+        }
+        return;
+      }
+      long partSize = FileSize(part);
+      if (partSize < 0) {
+        Json(ctx, 409, Err("no_part", "Nothing was uploaded for this file"));
+        return;
+      }
+      if (partSize != size) {
+        DeleteFileW(Lp(part));
+        Json(ctx, 422, "{\"ok\":false,\"error\":\"size_mismatch\",\"size\":" + partSize + "}");
+        return;
+      }
+      string actual = Sha256Of(part);
+      if (actual != expected) {
+        DeleteFileW(Lp(part));
+        Json(ctx, 422, "{\"ok\":false,\"error\":\"hash_mismatch\",\"sha256\":\"" + actual + "\"}");
+        return;
+      }
+      if (mtimeMs > 0) SetMtime(part, mtimeMs);
+      if (!MoveFileExW(Lp(part), Lp(full), MOVEFILE_WRITE_THROUGH)) {
+        int err = Marshal.GetLastWin32Error();
+        throw new IOException("Could not finalise " + full + " (Win32 error " + err + ")");
+      }
+      Json(ctx, 200, "{\"ok\":true,\"exists\":false,\"sha256\":\"" + actual + "\",\"path\":\"" + Esc(full) + "\"}");
+    }
+  }
+
+  // Body: one rel per line. Marks the imported original extraction read-only (section 12).
+  static void Seal(HttpListenerContext ctx, string caseDir) {
+    int sealedCount = 0;
+    int failed = 0;
+    foreach (string rel in Lines(ReadText(ctx))) {
+      string[] segs = RelSegments(rel);
+      if (segs[0] != "02_Original_Extraction") continue;
+      string lp = Lp(FullPath(caseDir, segs));
+      uint a = GetFileAttributesW(lp);
+      if (a == INVALID_ATTRS || (a & ATTR_DIRECTORY) != 0) { failed++; continue; }
+      if (SetFileAttributesW(lp, (a & ~ATTR_NORMAL) | ATTR_READONLY)) sealedCount++;
+      else failed++;
+    }
+    Json(ctx, 200, "{\"ok\":true,\"sealed\":" + sealedCount + ",\"failed\":" + failed + "}");
+  }
+
+  // Body: one rel per line. Removes unverified parts left by a cancelled or failed copy.
+  // V1.31.14 body: one "<sha256>TAB<rel>" line per file. Removes a final file that a streamed upload
+  // created and must send again (it changed on the examiner computer). Only while the file is not
+  // read-only (sealed evidence is never touched) and only when its SHA-256 is still the stated one.
+  static void Discard(HttpListenerContext ctx, string caseDir) {
+    int removed = 0;
+    int kept = 0;
+    foreach (string line in Lines(ReadText(ctx))) {
+      int tab = line.IndexOf('\t');
+      if (tab != 64) throw new ArgumentException("discard lines are <sha256>TAB<rel>");
+      string sha = line.Substring(0, 64).ToLowerInvariant();
+      string full = FullPath(caseDir, RelSegments(line.Substring(65)));
+      lock (LockFor(full)) {
+        uint a = GetFileAttributesW(Lp(full));
+        if (a == INVALID_ATTRS || (a & ATTR_DIRECTORY) != 0) continue;
+        if ((a & ATTR_READONLY) != 0 || Sha256Of(full) != sha) { kept++; continue; }
+        if (DeleteFileW(Lp(full))) removed++;
+        else kept++;
+      }
+    }
+    Json(ctx, 200, "{\"ok\":" + (kept == 0 ? "true" : "false") + ",\"removed\":" + removed + ",\"kept\":" + kept +
+      (kept == 0 ? "" : ",\"error\":\"" + kept + " file(s) are sealed or changed on the server and were kept\"") + "}");
+  }
+
+  static void Abort(HttpListenerContext ctx, string caseDir) {
+    int removed = 0;
+    foreach (string rel in Lines(ReadText(ctx))) {
+      string full = FullPath(caseDir, RelSegments(rel));
+      lock (LockFor(full)) {
+        if (DeleteFileW(Lp(full + PartSuffix))) removed++;
+      }
+    }
+    Json(ctx, 200, "{\"ok\":true,\"removed\":" + removed + "}");
+  }
+}
 "@
 
+[AetherisImport]::RootPath = [string]$root
+[AetherisImport]::ExpectedToken = [string]$expectedToken
+[AetherisImport]::CasesRootOverride = [string]$script:ImportCasesRootOverride
 $dispatcher = New-Object AetherisHelperDispatcher
 $dispatcher.HealthJson = (@{
     ok                  = $true
@@ -4065,6 +5485,10 @@ $dispatcher.HealthJson = (@{
     started_utc         = $script:HelperStartedUtc
     malware_triage      = $true
     malware_remediate   = $true
+    computer_name       = $script:HelperComputerName
+    client_import       = $true
+    client_import_discard = $true
+    import_case_root    = $script:ImportCasesRoot
 } | ConvertTo-Json -Compress)
 $dispatcher.AdaptersJsonPath = $script:AdaptersCacheFile
 $dispatcher.DevicesJsonPath = $script:AcqDevicesCacheFile
@@ -4072,6 +5496,9 @@ $dispatcher.MobileJsonPath = $script:DeviceCacheFile
 $dispatcher.RootPath = $root
 $dispatcher.NativeMtpJobScript = Join-Path $root "scripts\native_mtp_job.ps1"
 $dispatcher.NativeIosJobScript = Join-Path $root "scripts\native_ios_job.ps1"
+# V1.31.14: collections on this computer go to the server it was set up for (client-kit.json).
+$dispatcher.StreamUploadScript = Join-Path $root "scripts\polaron-stream-upload.ps1"
+$dispatcher.KitConfigPath = Join-Path $(if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { [IO.Path]::GetTempPath() }) "Aetheris\client-kit.json"
 $dispatcher.JobsDir = Join-Path $env:TEMP "aetheris_acq_jobs"
 $dispatcher.ExpectedToken = [string]$expectedToken
 $dispatcher.RefreshStatusFile = $script:RefreshStatusFile
@@ -4087,7 +5514,7 @@ Write-Host "Press Ctrl+C to stop."
 try {
     while ($listener.IsListening) {
         $context = $dispatcher.Dequeue(500)
-        if ($null -eq $context) { continue }
+        if ($null -eq $context) { Test-MobileDeviceRefresh; continue }
         try {
             Handle-Request -Context $context
         }

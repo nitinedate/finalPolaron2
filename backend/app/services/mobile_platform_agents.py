@@ -32,7 +32,8 @@ OWNED_STAGES = (
 )
 
 _IOS_ADAPTERS = frozenset({"ios_lockdown", "ios", "ios_backup"})
-_ANDROID_ADAPTERS = frozenset({"android_adb", "android_mtp", "android", "android_backup"})
+# android_usb: helper 5.62+ lists an Android phone on the cable that is not usable yet (charging only / no driver).
+_ANDROID_ADAPTERS = frozenset({"android_adb", "android_mtp", "android", "android_backup", "android_usb"})
 
 _IOS_NAME_HINTS = (
     "iphone",

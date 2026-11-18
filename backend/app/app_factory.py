@@ -218,6 +218,7 @@ def _mount_forensic(app: FastAPI) -> None:
         catalog_reconciliation,
         cases,
         client_evidence,
+        client_kit,
         encyclopedia,
         extract_review,
         hostdrive,
@@ -234,6 +235,7 @@ def _mount_forensic(app: FastAPI) -> None:
     app.include_router(catalog_reconciliation.router)
     app.include_router(agents.router)
     app.include_router(hostdrive.router)
+    app.include_router(client_kit.router)
     app.include_router(encyclopedia.router)
     app.include_router(report.router)
     app.include_router(retrieval.router)
@@ -247,13 +249,25 @@ def _mount_mobile_extract(app: FastAPI) -> None:
     # image-evidence/catalog/agent routers. Shared report/retrieval modules are
     # stateless libraries behind the platform service boundary; service guards
     # and physically separate stores prevent cross-platform job access.
-    from app.routers import acquisition, artifacts, cases, client_evidence, extract_review, hostdrive, jobs, report, retrieval
+    from app.routers import (
+        acquisition,
+        artifacts,
+        cases,
+        client_evidence,
+        client_kit,
+        extract_review,
+        hostdrive,
+        jobs,
+        report,
+        retrieval,
+    )
 
     app.include_router(jobs.router)
     app.include_router(client_evidence.router)
     app.include_router(client_evidence.agent_router)
     app.include_router(extract_review.router)
     app.include_router(hostdrive.router)
+    app.include_router(client_kit.router)
     app.include_router(acquisition.router)
     app.include_router(artifacts.router)
     app.include_router(cases.router)

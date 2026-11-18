@@ -9,6 +9,23 @@ Endpoint flow mirrors the examiner's screen sequence:
     POST /api/acquisition/verify            §12   re-verify a stored extraction
     GET  /api/acquisition/methods           §6    method reference for the UI
 
+    V1.27.0 — phone attached to a client PC (image created there in C:\\evidence):
+    GET  /api/acquisition/client-import/capabilities   server helper identity / support
+    POST /api/acquisition/client-import                 copy the run from the client share
+    GET  /api/acquisition/client-import/{id}            copy progress + server-path result
+    POST /api/acquisition/client-import/{id}/cancel
+
+    V1.31.14 — the collection on a client PC is sent to the server while it runs:
+    POST /api/acquisition/client-stream                 upload session for the client helper
+    PUT  /api/acquisition/client-stream/{id}/chunk      (client helper, session token) file bytes
+    POST /api/acquisition/client-stream/{id}/commit     SHA-256 verified on the server disk
+    POST /api/acquisition/client-stream/{id}/files      many small files in one request
+    POST /api/acquisition/client-stream/{id}/discard    resend a file that changed on the client
+    GET  /api/acquisition/client-stream/{id}/status     what the server already holds (resume)
+    POST /api/acquisition/client-stream/{id}/finish     all files present -> registered run
+    POST /api/acquisition/client-stream/{id}/abort      collection failed on the client
+    (progress and result: GET /api/acquisition/client-import/{id})
+
 `preview` is deliberately separate from `start`: §7 requires the examiner to see
 the resolved capability, the cable/preparation instructions and the coverage
 limitations of each method BEFORE a collection begins. Collapsing the two would
@@ -22,8 +39,8 @@ import json
 import os
 from typing import Any, AsyncIterator
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -128,6 +145,32 @@ class ValidationRecordRequest(BaseModel):
 class VerifyRequest(BaseModel):
     extraction_path: str
     manifest_path: str
+
+
+class ClientImportRequest(BaseModel):
+    """Read-only share of the client case folder, as returned by the Client Evidence Agent."""
+
+    share_id: str = Field(min_length=10, max_length=80, pattern=r"^ce[0-9a-f]{16,64}$")
+    token: str = Field(min_length=24, max_length=256)
+    port: int = Field(default=9877, ge=1, le=65535)
+    addresses: list[str] = Field(default_factory=list, max_length=16)
+    hostname: str = Field(default="", max_length=253)
+    client_root: str = Field(default="", max_length=1024)
+    file_count: int = Field(default=0, ge=0)
+    total_bytes: int = Field(default=0, ge=0)
+    manifest_sha256: str = Field(default="", max_length=64)
+    agent_url: str | None = Field(default=None, max_length=200)
+    relay: bool = False
+    # V1.31.2: the folder was chosen in the browser and this tab serves it (outbound connection only).
+    browser: bool = False
+    skipped: int = Field(default=0, ge=0)
+    agent_version: str = Field(default="", max_length=40)
+    # Which run to copy. Empty run_name = newest sealed run in the folder.
+    case_id: str = Field(default="", max_length=128)
+    run_name: str = Field(default="", max_length=255)
+    # full = whole run (original, working copy, exports, logs, hashes) like a server-side
+    # collection; packages = 05_Exports + logs/hashes only (much less to send off-site).
+    scope: str = Field(default="full", pattern=r"^(full|packages)$")
 
 
 class RemoveRunRequest(BaseModel):
@@ -690,6 +733,113 @@ def remove_run(
     }
 
 
+# ---------------------------------------------------------------------------
+# V1.27.0 — image created on a client PC, copied to the forensic server
+# ---------------------------------------------------------------------------
+
+def _client_import_error(exc: Exception) -> HTTPException:
+    message = str(exc)
+    if "could not reach" in message or "Timed out" in message:
+        status, code = 502, "client_agent_unreachable"
+    elif "HostDrive helper" in message:
+        status, code = 503, "server_helper_unavailable"
+    elif "/dev/fuse" in message or "libfuse" in message or "disabled" in message:
+        status, code = 503, "client_import_unavailable"
+    else:
+        status, code = 400, "client_import_failed"
+    return HTTPException(status_code=status, detail={"error": {"code": code, "message": message}})
+
+
+@router.get("/client-import/capabilities")
+def client_import_capabilities(
+    user: CurrentUser = Depends(require_firm_permission("forensic.job.read")),
+) -> dict[str, Any]:
+    """Whether this server can store client-created images, and which computer its helper runs on.
+
+    The browser compares ``office_helper.computer_name`` with its own local helper's
+    name: equal means the phone is on the forensic server itself (normal flow).
+    """
+    from app.services.client_evidence import enabled as client_evidence_enabled
+    from app.services.mobile_acquire import client_import
+
+    caps = client_import.helper_capabilities()
+    return {
+        "enabled": client_import.enabled() and client_evidence_enabled(),
+        "office_helper": caps,
+        "default_client_case_root": os.environ.get("CLIENT_MOBILE_CASE_ROOT", "C:\\evidence") or "C:\\evidence",
+        "server_case_root": client_import.server_case_root(),
+        "scopes": ["full", "packages"],
+    }
+
+
+@router.post("/client-import")
+def start_client_import(
+    payload: ClientImportRequest,
+    request: Request,
+    user: CurrentUser = Depends(require_firm_permission("forensic.job.create")),
+) -> dict[str, Any]:
+    """Copy a run collected on the examiner's PC into the server case folder ("as usual")."""
+    from app.routers.client_evidence import _request_ip
+    from app.services.client_evidence import ClientEvidenceError
+    from app.services.mobile_acquire import client_import
+
+    try:
+        return client_import.start_import(
+            share_id=payload.share_id,
+            token=payload.token,
+            port=payload.port,
+            addresses=payload.addresses,
+            hostname=payload.hostname,
+            client_root=payload.client_root,
+            file_count=payload.file_count,
+            total_bytes=payload.total_bytes,
+            manifest_sha256=payload.manifest_sha256,
+            agent_url=payload.agent_url,
+            relay_supported=payload.relay,
+            browser_share=payload.browser,
+            skipped=payload.skipped,
+            agent_version=payload.agent_version,
+            case_id=payload.case_id,
+            run_name=payload.run_name,
+            scope=payload.scope,
+            request_ip=_request_ip(request),
+            user_email=str(getattr(user, "email", "") or ""),
+            platform=_required_mobile_platform(),
+        )
+    except ClientEvidenceError as exc:
+        raise _client_import_error(exc)
+
+
+@router.get("/client-import/{import_id}")
+def get_client_import(
+    import_id: str,
+    user: CurrentUser = Depends(require_firm_permission("forensic.job.read")),
+) -> dict[str, Any]:
+    from app.services.mobile_acquire import client_import
+
+    state = client_import.load_state(import_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Copy not found (it may have expired).")
+    return client_import.public_state(state)
+
+
+@router.post("/client-import/{import_id}/cancel")
+def cancel_client_import(
+    import_id: str,
+    user: CurrentUser = Depends(require_firm_permission("forensic.job.create")),
+) -> dict[str, Any]:
+    from app.services.mobile_acquire import client_import
+
+    accepted = client_import.request_cancel(import_id)
+    return {
+        "accepted": accepted,
+        "message": (
+            "Stopping the copy. Files already verified on the server are kept."
+            if accepted else "This copy is not running."
+        ),
+    }
+
+
 @router.get("/runs/{run_id}/stream")
 async def stream_run(
     run_id: str,
@@ -883,124 +1033,202 @@ def verify_extraction(
 
 
 # ---------------------------------------------------------------------------
-# Private agent-to-server evidence transfer.  Never expose source paths/files to
-# browser code, and never accept a generic user bearer token as an upload key.
+# V1.31.14 — collection on a client PC streamed to the forensic server
 # ---------------------------------------------------------------------------
 
-class TransferTicketRequest(BaseModel):
-    platform: str
-    case_id: str
-    evidence_id: str
+class ClientStreamRequest(BaseModel):
+    case_id: str = Field(min_length=1, max_length=128)
+    scope: str = Field(default="full", pattern=r"^(full|packages)$")
+    keep_local: bool = False
+    client_host: str = Field(default="", max_length=120)
 
 
-class TransferCompleteRequest(BaseModel):
-    part_count: int = Field(ge=1, le=131072)
-    size_bytes: int = Field(ge=1)
-    sha256: str = Field(min_length=64, max_length=64)
+def _stream_error(exc: Exception) -> JSONResponse:
+    from app.services.mobile_acquire.client_stream import StreamError
+
+    if isinstance(exc, StreamError):
+        return JSONResponse({"ok": False, "error": exc.code, "detail": exc.message, **exc.extra}, status_code=exc.status)
+    return JSONResponse({"ok": False, "error": "stream_failed", "detail": str(exc)[:500]}, status_code=500)
 
 
-def _transfer_service_platform() -> str:
-    platform = _required_mobile_platform()
-    if platform not in ("android", "ios"):
-        raise HTTPException(status_code=403, detail="Private evidence transfer requires an isolated Android or iOS backend")
-    return platform
+def _stream_token(request: Request) -> str:
+    from app.services.mobile_acquire.client_stream import TOKEN_HEADER
+
+    return (request.headers.get(TOKEN_HEADER) or "").strip()
 
 
-def _transfer_claims(auth: str, transfer_id: str, tenant_header: str | None) -> dict[str, Any]:
-    from app.services.mobile_acquire.secure_transfer import MobileEvidenceTransfer, TransferError
+@router.post("/client-stream")
+def create_client_stream(
+    payload: ClientStreamRequest,
+    user: CurrentUser = Depends(require_firm_permission("forensic.job.create")),
+):
+    """Upload session for a collection that runs on the examiner's PC; the page hands it to the helper there."""
+    from app.service_identity import current_service
+    from app.services.mobile_acquire import client_stream
 
-    if not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="A scoped evidence transfer ticket is required")
     try:
-        claims = MobileEvidenceTransfer().verify_ticket(
-            auth[7:].strip(), service_platform=_transfer_service_platform()
+        return client_stream.create_session(
+            case_id=payload.case_id,
+            scope=payload.scope,
+            keep_local=payload.keep_local,
+            client_host=payload.client_host,
+            examiner=str(getattr(user, "email", "") or ""),
+            platform=_required_mobile_platform(),
+            service=str(current_service()),
         )
-        if transfer_id != claims["tid"]:
-            raise TransferError("Ticket and transfer identifier do not match")
-        if (tenant_header or "").strip().lower() != claims["tenant"]:
-            raise TransferError("Ticket and tenant do not match")
-        return claims
-    except TransferError as exc:
-        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except Exception as exc:
+        return _stream_error(exc)
 
 
-@router.post("/transfer/ticket")
-def create_transfer_ticket(
-    body: TransferTicketRequest,
-    user: CurrentUser = Depends(require_firm_permission("job:run")),
-) -> dict[str, Any]:
-    """Authenticate the examiner once; grant a scoped 24h transfer capability."""
-    from app.services.mobile_acquire.secure_transfer import MobileEvidenceTransfer, TransferError
+@router.put("/client-stream/{session_id}/chunk")
+async def client_stream_chunk(session_id: str, request: Request):
+    """File bytes from the client helper (session token, not a user sign-in)."""
+    from fastapi.concurrency import run_in_threadpool
 
-    platform = _transfer_service_platform()
-    if body.platform != platform:
-        raise HTTPException(status_code=403, detail="Wrong mobile backend")
+    from app.services.mobile_acquire import client_stream
+
     try:
-        return MobileEvidenceTransfer().ticket(
-            tenant=user.tenant, platform=platform, case_id=body.case_id,
-            evidence_id=body.evidence_id, examiner=user.user_id,
+        declared = int(request.headers.get("content-length") or 0)
+        if declared > client_stream.MAX_CHUNK_BYTES:
+            raise client_stream.StreamError(413, "bad_chunk", "Chunks are at most 64 MiB.")
+        rel = client_stream.decode_rel(request.headers.get("x-stream-rel") or "")
+        offset = int(request.headers.get("x-stream-offset") or 0)
+        data = await request.body()
+        status, body = await run_in_threadpool(
+            client_stream.put_chunk,
+            session_id,
+            _stream_token(request),
+            rel,
+            offset,
+            data,
         )
-    except TransferError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(body, status_code=status)
+    except ValueError:
+        return JSONResponse({"ok": False, "error": "bad_request", "detail": "X-Stream-Offset must be a number"}, status_code=400)
+    except Exception as exc:
+        return _stream_error(exc)
 
 
-@router.put("/transfer/{transfer_id}/chunks/{index}")
-async def upload_transfer_part(
-    transfer_id: str,
-    index: int,
-    request: "Request",
-    authorization: str = Header(default="", alias="Authorization"),
-    x_tenant: str = Header(default="", alias="X-Tenant"),
-    x_chunk_sha256: str = Header(default="", alias="X-Chunk-SHA256"),
-) -> dict[str, Any]:
-    from app.services.mobile_acquire.secure_transfer import CHUNK_BYTES, MobileEvidenceTransfer, TransferError
+@router.post("/client-stream/{session_id}/files")
+async def client_stream_files(session_id: str, request: Request):
+    """Many small files in one request (client helper, session token)."""
+    from fastapi.concurrency import run_in_threadpool
 
-    claims = _transfer_claims(authorization, transfer_id, x_tenant)
-    blob = bytearray()
-    async for block in request.stream():
-        blob.extend(block)
-        if len(blob) > CHUNK_BYTES:
-            raise HTTPException(status_code=413, detail="Mobile transfer chunk exceeds 8 MiB")
+    from app.services.mobile_acquire import client_stream
+
     try:
-        return MobileEvidenceTransfer().put_part(claims, index, bytes(blob), x_chunk_sha256)
-    except TransferError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        declared = int(request.headers.get("content-length") or 0)
+        if declared > client_stream.MAX_BUNDLE_BYTES + 4 * 1024 * 1024:
+            raise client_stream.StreamError(413, "bad_bundle", "Bundles are at most 64 MiB.")
+        body = await request.body()
+        return await run_in_threadpool(client_stream.put_bundle, session_id, _stream_token(request), body)
+    except Exception as exc:
+        return _stream_error(exc)
 
 
-@router.post("/transfer/{transfer_id}/complete")
-def complete_mobile_transfer(
-    transfer_id: str,
-    body: TransferCompleteRequest,
-    authorization: str = Header(default="", alias="Authorization"),
-    x_tenant: str = Header(default="", alias="X-Tenant"),
-) -> dict[str, Any]:
-    from app.services.mobile_acquire.secure_transfer import MobileEvidenceTransfer, TransferError
+class ClientStreamDiscard(BaseModel):
+    rel: str = Field(min_length=3, max_length=4096)
 
-    claims = _transfer_claims(authorization, transfer_id, x_tenant)
+
+@router.post("/client-stream/{session_id}/discard")
+def client_stream_discard(session_id: str, payload: ClientStreamDiscard, request: Request):
+    from app.services.mobile_acquire import client_stream
+
     try:
-        return MobileEvidenceTransfer().complete(
-            claims, part_count=body.part_count,
-            byte_count=body.size_bytes, sha256=body.sha256,
+        return client_stream.discard_file(session_id, _stream_token(request), payload.rel)
+    except Exception as exc:
+        return _stream_error(exc)
+
+
+class ClientStreamCommit(BaseModel):
+    rel: str = Field(min_length=3, max_length=4096)
+    size: int = Field(ge=0)
+    sha256: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
+    mtime_ms: int = Field(default=0, ge=0)
+    total_files: int = Field(default=0, ge=0)
+    total_bytes: int = Field(default=0, ge=0)
+
+
+@router.post("/client-stream/{session_id}/commit")
+def client_stream_commit(session_id: str, payload: ClientStreamCommit, request: Request):
+    from app.services.mobile_acquire import client_stream
+
+    try:
+        return client_stream.commit_file(
+            session_id,
+            _stream_token(request),
+            rel=payload.rel,
+            size=payload.size,
+            sha256=payload.sha256,
+            mtime_ms=payload.mtime_ms,
+            total_files=payload.total_files,
+            total_bytes=payload.total_bytes,
         )
-    except TransferError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        return _stream_error(exc)
 
 
-class TransferVerifyRequest(BaseModel):
-    evidence_ref: str
-
-
-@router.post("/transfer/verify")
-def reverify_server_evidence(
-    body: TransferVerifyRequest,
-    user: CurrentUser = Depends(require_firm_permission("job:run")),
-) -> dict[str, Any]:
-    """Recalculate server SHA-256 without disclosing private source paths."""
-    from app.services.mobile_acquire.secure_transfer import MobileEvidenceTransfer, TransferError
+@router.get("/client-stream/{session_id}/status")
+def client_stream_status(session_id: str, request: Request, format: str = Query(default="json", pattern="^(json|tsv)$")):
+    """What the server holds. ``format=tsv``: a status line, then one "<size>TAB<sha256>TAB<rel>" line per file
+    (an iPhone backup has 100 000+ files; Windows PowerShell 5.1 reads that faster than JSON)."""
+    from app.services.mobile_acquire import client_stream
 
     try:
-        return MobileEvidenceTransfer().verify_sealed(
-            body.evidence_ref, tenant=user.tenant, platform=_transfer_service_platform()
+        out = client_stream.session_status(session_id, _stream_token(request))
+    except Exception as exc:
+        return _stream_error(exc)
+    if format != "tsv":
+        return out
+    head = "\t".join(["#status", str(out["status"] or ""), out["run_name"], out["server_case_dir"]])
+    lines = [head] + [f"{size}\t{sha}\t{rel}" for rel, (size, sha) in out["files"].items()]
+    return Response(content=("\n".join(lines) + "\n").encode("utf-8"), media_type="text/plain; charset=utf-8")
+
+
+class ClientStreamFile(BaseModel):
+    rel: str = Field(min_length=3, max_length=4096)
+    size: int = Field(ge=0)
+    sha256: str = Field(default="", pattern=r"^([0-9a-fA-F]{64})?$")
+
+
+class ClientStreamFinish(BaseModel):
+    run_name: str = Field(min_length=1, max_length=255)
+    files: list[ClientStreamFile] = Field(default_factory=list, max_length=2_000_000)
+    summary: dict[str, Any] | None = None
+    client_host: str = Field(default="", max_length=120)
+    client_case_dir: str = Field(default="", max_length=1024)
+    warnings: list[str] = Field(default_factory=list, max_length=200)
+
+
+@router.post("/client-stream/{session_id}/finish")
+def client_stream_finish(session_id: str, payload: ClientStreamFinish, request: Request):
+    from app.services.mobile_acquire import client_stream
+
+    try:
+        out = client_stream.finish(
+            session_id,
+            _stream_token(request),
+            run_name=payload.run_name,
+            files=[f.model_dump() for f in payload.files],
+            summary=payload.summary,
+            client_host=payload.client_host,
+            client_case_dir=payload.client_case_dir,
+            warnings=payload.warnings,
         )
-    except TransferError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return out if out.get("ok") else JSONResponse(out, status_code=409)
+    except Exception as exc:
+        return _stream_error(exc)
+
+
+class ClientStreamAbort(BaseModel):
+    reason: str = Field(default="", max_length=2000)
+
+
+@router.post("/client-stream/{session_id}/abort")
+def client_stream_abort(session_id: str, payload: ClientStreamAbort, request: Request):
+    from app.services.mobile_acquire import client_stream
+
+    try:
+        return client_stream.abort(session_id, _stream_token(request), payload.reason)
+    except Exception as exc:
+        return _stream_error(exc)

@@ -230,6 +230,18 @@ def test_result_file_reports_nonlegacy_runtime_path(bootstrap, monkeypatch, tmp_
 
 def test_powershell_uses_installer_result_for_executable():
     manager = (ROOT / 'scripts/ensure_host_surya.ps1').read_text()
-    assert '--result-file $resultFile' in manager
+    assert "'--result-file', $resultFile" in manager
     assert '$server = [string]$resolved.server' in manager
     assert "Join-Path $cache 'llama.cpp\\llama-server.exe'" not in manager
+
+
+def test_app_control_block_runs_surya_in_docker():
+    """V1.31.10: Windows App Control blocking llama-server.exe switches to the llama.cpp Docker image."""
+    manager = (ROOT / 'scripts/ensure_host_surya.ps1').read_text()
+    assert 'function Test-AppControlBlock' in manager
+    assert "Save-Runtime -Runtime 'docker'" in manager
+    assert 'ghcr.io/ggml-org/llama.cpp:server-cuda' in manager and "'ghcr.io/ggml-org/llama.cpp:server'" in manager
+    assert "$bootstrapArgs += '--model-only'" in manager
+    startup = (ROOT / 'script_docker/start_docker.ps1').read_text()
+    assert 'Polaron starts WITHOUT OCR' in startup
+    assert "throw \"Host SuryaOCR provisioning failed; preserving running forensic services. $suryaError\"" in startup

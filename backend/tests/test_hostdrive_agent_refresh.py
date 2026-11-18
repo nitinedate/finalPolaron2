@@ -171,6 +171,11 @@ def test_proxy_drives_includes_office_mobile_devices(monkeypatch):
     assert data["mobile_devices"][0]["attach_host"] == "office_server"
 
 
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 def test_proxy_mobile_devices_fetches_helper(monkeypatch):
     monkeypatch.setattr(
         hda,
@@ -190,6 +195,7 @@ def test_proxy_mobile_devices_fetches_helper(monkeypatch):
                 {"id": "ANDROID1", "name": "Pixel 8", "os_hint": "android"},
             ],
             "ios_backup_roots": [],
+            "scanned_utc": _now_iso(),  # V1.31.13: helper 5.64+ lists say when they were read
         }
 
     monkeypatch.setattr(hda, "_http_json", fake_http_json)
@@ -218,6 +224,7 @@ def test_proxy_acquisition_devices_tags_office_host(monkeypatch):
                 {"adapter": "ios_lockdown", "device_id": "UDID1", "os_family": "ios", "label": "iPhone"},
             ],
             "warnings": [],
+            "scanned_utc": _now_iso(),
         }
 
     monkeypatch.setattr(hda, "_http_json", fake_http_json)

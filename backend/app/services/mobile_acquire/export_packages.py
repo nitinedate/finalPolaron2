@@ -538,6 +538,7 @@ def _add_tree(
     progress_total_bytes: int = 0,
     reserve_bytes: int = 0,
     follow_junctions: bool = False,
+    label: str = "",
 ) -> tuple[int, int]:
     count = 0
     written = 0
@@ -554,21 +555,33 @@ def _add_tree(
             count += 1
             written += size
             if progress and (written - last_emit >= 64 * 1024 * 1024 or count % 500 == 0):
-                done = progress_base_bytes + written
-                phase_pct = round((done / progress_total_bytes) * 100, 1) if progress_total_bytes else None
-                overall = round(90 + min(9.5, (phase_pct or 0) * 0.095), 1) if phase_pct is not None else 90
-                progress({
-                    "stage": "seal", "item": rel, "category": "Packaging",
-                    "phase": "export_zip", "phase_progress_pct": phase_pct,
-                    "progress_pct": overall, "export_bytes_done": done,
-                    "export_bytes_total": progress_total_bytes, "export_files_done": count,
-                })
+                _emit_zip_progress(progress, rel, count, progress_base_bytes + written, progress_total_bytes, label)
                 last_emit = written
         except ExportVolumeFullError:
             raise
         except OSError:
             continue
+    if progress and count and written != last_emit:
+        # End of this part, so the next part (or the hash/sidecars) starts from the true figure.
+        _emit_zip_progress(progress, "", count, progress_base_bytes + written, progress_total_bytes, label)
     return count, written
+
+
+def _emit_zip_progress(progress: ProgressCb, rel: str, count: int, done: int, total: int, label: str) -> None:
+    phase_pct = round((done / total) * 100, 1) if total else None
+    overall = round(90 + min(9.5, (phase_pct or 0) * 0.095), 1) if phase_pct is not None else 90
+    event: dict[str, Any] = {
+        "stage": "seal", "category": "Packaging",
+        "phase": "export_zip", "phase_progress_pct": phase_pct,
+        "progress_pct": overall, "export_bytes_done": done,
+        "export_bytes_total": total, "export_files_done": count,
+    }
+    if rel:
+        event["item"] = rel
+    if label:
+        event["detail"] = f"Packaging the evidence ZIP - {label}: {done / 1024**3:.1f} of {(total or done) / 1024**3:.1f} GB"
+    if progress:
+        progress(event)
 
 
 def _file_index(original: Path, limit: int | None = None) -> list[dict[str, Any]]:
@@ -772,19 +785,25 @@ def _write_main_zip(
                     continue
         if hashes and hashes.is_dir():
             _add_tree(zf, hashes, "08_Hashes", compress=True)
+        packed_bytes = 0
         if include_payload and not shard_catalog:
-            _add_tree(
+            _count, packed_bytes = _add_tree(
                 zf, original, "02_Original_Extraction", compress=compress_payload,
                 progress=progress, progress_total_bytes=payload_bytes, reserve_bytes=reserve_bytes,
-                follow_junctions=True,
+                follow_junctions=True, label="backup and media files",
             )
         if include_payload and readable is not None and readable.is_dir():
             # Human-readable DBs/media (WhatsApp, SMS, camera roll…) ride inside the
             # same ZIP so the package is self-contained — no readable_artifacts
             # folder is left beside it in 05_Exports.
+            # V1.31.5: this part is counted in payload_bytes, so it reports progress too.
+            # Without it the bar stopped where the backup part ended (about 95% for an
+            # iPhone) for as long as the readable copies took to write.
             _add_tree(
                 zf, readable, "readable_artifacts", compress=compress_payload,
+                progress=progress, progress_base_bytes=packed_bytes, progress_total_bytes=payload_bytes,
                 reserve_bytes=reserve_bytes, follow_junctions=True,
+                label="readable copies (WhatsApp, messages, photos)",
             )
 
 

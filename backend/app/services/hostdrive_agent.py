@@ -8,6 +8,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 log = logging.getLogger("hostdrive_agent")
 
@@ -30,9 +31,35 @@ def _helper_bases() -> list[str]:
     return out
 
 
+# Names under which a container reaches the Windows host that runs Docker Desktop.
+_DOCKER_HOST_NAMES = frozenset({"host.docker.internal", "gateway.docker.internal", "192.168.65.254"})
+
+
+def docker_host_header(url: str) -> str | None:
+    """Host header for a helper reached through the Docker host name (V1.31.3).
+
+    ensure-host-drive-helper.ps1 falls back to listening on http://127.0.0.1:9876/ when the
+    http://+:9876/ reservation cannot be made. Windows' HTTP server then rejects every request whose
+    Host is not 127.0.0.1:9876 ("Bad Request - Invalid Hostname"), so from the containers the helper
+    looked offline and drives attached after startup were never listed. host.docker.internal *is*
+    that Windows host, so the request names it by the helper's own loopback address. A helper bound
+    to + accepts any Host, so this is harmless there.
+    """
+    try:
+        parts = urlsplit(url)
+        if (parts.hostname or "").lower() in _DOCKER_HOST_NAMES:
+            return f"127.0.0.1:{parts.port or 80}"
+    except ValueError:
+        return None
+    return None
+
+
 def _http_json(url: str, *, method: str = "GET", timeout: float = 3.0, body: bytes | None = None) -> dict[str, Any]:
     req = urllib.request.Request(url, data=body, method=method)
     req.add_header("Accept", "application/json")
+    host_header = docker_host_header(url)
+    if host_header:
+        req.add_header("Host", host_header)
     if body is not None:
         req.add_header("Content-Type", "application/json")
     token = os.environ.get("HOST_DRIVE_HELPER_TOKEN") or ""
@@ -64,6 +91,9 @@ def probe_helper() -> dict[str, Any]:
                 drives = {"ok": False, "error": str(exc)[:200]}
             letters = drives.get("drives") if isinstance(drives, dict) else None
             mobiles = drives.get("mobile_devices") if isinstance(drives, dict) else None
+            # V1.31.13: before helper 5.65 the phones in /drives came from a file that could be out of date.
+            if not _helper_at_least(health, "5.65"):
+                mobiles = []
             return {
                 "ok": True,
                 "agent": "hostdrive_agent",
@@ -92,11 +122,31 @@ def probe_helper() -> dict[str, Any]:
         "drives": [],
         "drive_count": 0,
         "message": "HostDrive agent / helper offline on the examiner PC",
+        "error": _explain_helper_errors(errors),
         "errors": errors[:5],
         "start_hint": (
             "powershell -ExecutionPolicy Bypass -File scripts\\ensure-host-drive-helper.ps1"
         ),
     }
+
+
+def _explain_helper_errors(errors: list[str]) -> str:
+    """One plain sentence for why the helper could not be reached from this container."""
+    text = " | ".join(errors)
+    low = text.lower()
+    if "invalid hostname" in low or "http error 400" in low:
+        return ("The workstation helper is running but only accepts requests addressed to 127.0.0.1 "
+                "(its http://+:9876/ reservation is missing).")
+    if "http error 401" in low or "unauthorized" in low:
+        return "The workstation helper requires HOST_DRIVE_HELPER_TOKEN, and the token in .env does not match."
+    if "refused" in low:
+        return "Nothing listens on port 9876 on the forensic server: the workstation helper is not running."
+    if "timed out" in low or "timeout" in low:
+        return ("The workstation helper did not answer in time (Windows Firewall may block port 9876 from "
+                "Docker, or the helper is busy).")
+    if "name or service not known" in low or "nodename nor servname" in low or "temporary failure in name resolution" in low:
+        return "This container cannot resolve host.docker.internal (set HOST_DRIVE_HELPER_URL in .env)."
+    return (errors[0] if errors else "The workstation helper did not answer.")[:300]
 
 
 def lookup_exact_path(path: str) -> dict[str, Any] | None:
@@ -331,6 +381,10 @@ def proxy_drives() -> dict[str, Any]:
             or ("Office HostDrive online" if helper.get("ok") else "Listing Docker-mounted office letters")
         ),
         "start_hint": helper.get("start_hint"),
+        # V1.31.3: the list is live (Windows' own drive table through the helper) or frozen at startup.
+        "live": bool(helper.get("ok")) and not partial,
+        "helper_error": None if helper.get("ok") else helper.get("error"),
+        "helper_errors": [] if helper.get("ok") else list(helper.get("errors") or [])[:5],
     }
 
 
@@ -340,25 +394,48 @@ def _tag_office_mobile(row: dict[str, Any]) -> dict[str, Any]:
     return tagged
 
 
+def _helper_at_least(health: Any, version: str) -> bool:
+    raw = str((health or {}).get("helper_version") or "") if isinstance(health, dict) else ""
+    try:
+        have = [int(x) for x in raw.split(".")]
+        need = [int(x) for x in version.split(".")]
+    except ValueError:
+        return False
+    width = max(len(have), len(need))
+    return have + [0] * (width - len(have)) >= need + [0] * (width - len(need))
+
+
 def proxy_mobile_devices() -> dict[str, Any]:
     """Phones attached to the office forensic host — same helper path as disks."""
+    from app.services.mobile_acquire.host_bridge import helper_list_staleness
+
     helper = probe_helper()
     devices: list[dict[str, Any]] = []
     ios_backup_roots: list[str] = []
+    warnings: list[str] = []
     if helper.get("ok") and helper.get("helper_url"):
         try:
             data = _http_json(f"{helper['helper_url']}/mobile-devices", timeout=8.0)
-            raw = data.get("mobile_devices") if isinstance(data, dict) else None
-            devices = [_tag_office_mobile(row) for row in (raw or []) if isinstance(row, dict)]
-            ios_backup_roots = [str(p) for p in (data.get("ios_backup_roots") or [])] if isinstance(data, dict) else []
+            if isinstance(data, dict) and not data.get("scanned_utc"):
+                # Helper older than 5.64: the list is a file; judge it by the device list's read time.
+                try:
+                    acq = _http_json(f"{helper['helper_url']}/acquisition/devices?cached=1", timeout=8.0)
+                    data = {**data, "scanned_utc": (acq or {}).get("scanned_utc") if isinstance(acq, dict) else None}
+                except Exception:
+                    data = {**data, "scanned_utc": None}
+            stale = helper_list_staleness(data)
+            if stale:
+                warnings.append(stale)
+            else:
+                raw = data.get("mobile_devices") if isinstance(data, dict) else None
+                devices = [_tag_office_mobile(row) for row in (raw or []) if isinstance(row, dict)]
+                ios_backup_roots = [str(p) for p in (data.get("ios_backup_roots") or [])] if isinstance(data, dict) else []
         except Exception as exc:
+            # V1.31.13: no fallback to the phone list the helper reported when it started (it may be long gone).
             log.debug("proxy mobile-devices failed: %s", exc)
-            devices = [
-                _tag_office_mobile(row)
-                for row in (helper.get("mobile_devices") or [])
-                if isinstance(row, dict)
-            ]
+            warnings.append(f"Office host phone list could not be read: {exc}")
     return {
+        "warnings": warnings,
         "ok": True,
         "source": "office_host" if helper.get("ok") else "offline",
         "helper_online": bool(helper.get("ok")),
@@ -404,7 +481,10 @@ def proxy_acquisition_devices() -> dict[str, Any]:
             "warnings": [f"Office host device scan failed: {exc}"],
             "count": 0,
         }
-    devices = [
+    from app.services.mobile_acquire.host_bridge import helper_list_staleness
+
+    stale = helper_list_staleness(data)
+    devices = [] if stale else [
         {**dict(row), "attach_host": "office_server"}
         for row in (data.get("devices") or [])
         if isinstance(row, dict)
@@ -415,9 +495,12 @@ def proxy_acquisition_devices() -> dict[str, Any]:
         "helper_online": True,
         "helper_url": helper.get("helper_url"),
         "devices": devices,
-        "warnings": list(data.get("warnings") or []),
+        "warnings": list(data.get("warnings") or []) + ([stale] if stale else []),
         "count": len(devices),
         "attach_host": "office_server",
+        "scanned_utc": data.get("scanned_utc"),
+        "list_source": data.get("source"),
+        "stale": bool(stale),
     }
 
 
@@ -457,14 +540,25 @@ def _list_windows_path_in_docker(win_path: str) -> dict[str, Any] | None:
     try:
         target = p.parent if p.is_file() else p
         entries: list[dict[str, Any]] = []
-        for entry in sorted(target.iterdir(), key=lambda item: (item.is_symlink() or not item.is_dir(), item.name.lower())):
-            entries.append(_listed_entry(entry))
+        omitted: list[dict[str, Any]] = []
+        children = sorted(target.iterdir(), key=lambda item: item.name.lower())
+        for entry in children:
+            try:
+                entries.append(_listed_entry(entry))
+            except OSError as exc:
+                omitted.append({
+                    "name": entry.name,
+                    "reason": "access_denied" if isinstance(exc, PermissionError) else "unavailable",
+                    "detail": "Windows denied access" if isinstance(exc, PermissionError) else str(exc),
+                })
+        entries.sort(key=lambda item: (item.get("kind") != "dir", str(item.get("name") or "").lower()))
         display = container_to_workstation_path(target)
         return {
             "ok": True,
             "path": display,
             "count": len(entries),
             "entries": entries,
+            "omitted": omitted,
             "source": "docker",
         }
     except OSError:

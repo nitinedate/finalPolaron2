@@ -22,6 +22,7 @@ import {
   type EvidenceLocation,
 } from "./ClientEvidenceBrowser";
 import { clientRelayTarget, createClientShare, revokeClientShare, type ClientShare } from "../../lib/clientEvidenceAgent";
+import { createBrowserShare, markBrowserShareRegistered, stopBrowserShare } from "../../lib/browserEvidenceShare";
 import { forensicApi } from "../../lib/forensicApi";
 import { jobUploadSession } from "../../lib/jobUploadSession";
 import {
@@ -561,7 +562,10 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
   }>({ open: false, message: "", segmentCount: 0 });
 
   const lastHostDrivesRef = useRef("");
-  const lastAutoRemountRef = useRef("");
+  const lastDriveLettersRef = useRef<string[] | null>(null);
+  const driveWatchLiveRef = useRef(false);
+  const currentDriveRef = useRef("");
+  const [driveWatch, setDriveWatch] = useState<{ live: boolean; error: string | null } | null>(null);
   const lastDriveMountErrorRef = useRef<string | null>(null);
   const syncInFlightRef = useRef(false);
   const pendingResolveRef = useRef<{
@@ -770,43 +774,59 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
     [waitForBrowse]
   );
 
+  // V1.31.3: the forensic server's drive list follows Windows live. Each poll compares the letters the
+  // workstation helper reports with the previous poll: new drives appear, removed drives disappear (the
+  // examiner is taken back to This PC if the open drive was removed). When the containers cannot reach
+  // the helper, the list is frozen at the drives Docker mounted at startup, and the panel says why.
   const syncDriveMountsIfNeeded = useCallback(async () => {
-    if (syncInFlightRef.current || remounting || disabled) return false;
-    const host = await listHostDriveLetters();
-    if (!host?.drives?.length) return false;
-    const hostKey = (host.volumes?.length
-      ? host.volumes.map((v) => `${String(v.letter || "").toUpperCase()}:${v.mounted === false ? "0" : "1"}`).join(",")
-      : host.drives.join(","));
-
-    const snapshot = await fetchBrowse({ drive: "", path: "" });
-    const mounted = new Set(
-      snapshot.entries
-        .filter((e) => e.kind === "drive" && e.mounted !== false)
-        .map((e) => (e.drive_key ?? e.name.replace(/:$/, "")).toLowerCase())
-    );
-    const missing = host.drives.filter(
-      (letter) => !mounted.has(letter.replace(":", "").toLowerCase())
-    );
-    lastHostDrivesRef.current = hostKey;
-    if (!missing.length) {
-      lastAutoRemountRef.current = "";
-      return false;
-    }
-    // Show the new letter immediately. Docker is mounted for that folder when
-    // extraction starts, not by rebuilding every drive in the background.
-    if (lastAutoRemountRef.current === hostKey) return false;
-    lastAutoRemountRef.current = hostKey;
+    if (syncInFlightRef.current || remountingRef.current || disabled) return false;
     syncInFlightRef.current = true;
     try {
-      toastRef.current.info(
-        `New drive ${missing.join(", ")} detected. Select its folder — extraction reads that drive in place.`
-      );
-      await loadBrowse({ drive: "", path: "", silent: true });
-      return true;
+      const host = await listHostDriveLetters(6_000);
+      const watch = host
+        ? {
+            live: host.live !== false && host.helper_online !== false && !host.partial,
+            error: host.helper_error ?? (host.partial ? host.message ?? null : null),
+          }
+        : null;
+      driveWatchLiveRef.current = Boolean(watch?.live);
+      setDriveWatch(watch);
+      if (!host?.drives?.length) return false;
+      const letters = host.drives.map((l) => l.replace(":", "").toUpperCase());
+      const hostKey = host.volumes?.length
+        ? host.volumes
+            .map((v) => `${String(v.letter || "").toUpperCase()}:${v.mounted === false ? "0" : "1"}:${v.ready === false ? "0" : "1"}`)
+            .join(",")
+        : letters.join(",");
+      const previousKey = lastHostDrivesRef.current;
+      const previous = lastDriveLettersRef.current;
+      lastHostDrivesRef.current = hostKey;
+      lastDriveLettersRef.current = letters;
+      if (!previous || previousKey === hostKey) return false;
+      const added = letters.filter((l) => !previous.includes(l));
+      const removed = previous.filter((l) => !letters.includes(l));
+      const open = currentDriveRef.current.replace(":", "").toUpperCase();
+      if (open && removed.includes(open)) {
+        toastRef.current.error(`Drive ${open}: was removed from the forensic server. Showing This PC.`);
+        setCurrentDrive("");
+        await loadBrowse({ drive: "", path: "", silent: true });
+      } else if (!open) {
+        await loadBrowse({ drive: "", path: "", silent: true, keepSelection: true });
+      }
+      if (added.length) {
+        toastRef.current.info(
+          `New drive ${added.map((l) => `${l}:`).join(", ")} on the forensic server. Open it and select the evidence folder — extraction reads that drive in place.`
+        );
+      }
+      const quietlyRemoved = removed.filter((l) => l !== open);
+      if (quietlyRemoved.length) {
+        toastRef.current.info(`Drive ${quietlyRemoved.map((l) => `${l}:`).join(", ")} removed from the forensic server.`);
+      }
+      return added.length > 0 || removed.length > 0;
     } finally {
       syncInFlightRef.current = false;
     }
-  }, [disabled, fetchBrowse, loadBrowse, remounting]);
+  }, [disabled, loadBrowse]);
 
   const prepareForFolderSelect = useCallback(async (opts?: { force?: boolean }) => {
     const health = await ensureHostDriveHelper(
@@ -928,20 +948,28 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
   }, [jobId]);
 
   useEffect(() => {
-    if (disabled || isLiveMobileSource) return;
+    if (disabled || isLiveMobileSource || clientMode) return;
     let cancelled = false;
+    let timer: number | undefined;
     const pollExternalDrives = async () => {
       if (cancelled) return;
       // listHostDriveLetters() checks the office/server API before localhost, so
       // remote examiner browsers can detect a newly attached server HDD too.
-      await syncDriveMountsIfNeeded();
+      // V1.31.3: every 5 s while the list is live (and the tab is visible), every 30 s while it is not.
+      if (document.visibilityState !== "hidden") await syncDriveMountsIfNeeded();
+      if (!cancelled) timer = window.setTimeout(() => void pollExternalDrives(), driveWatchLiveRef.current ? 5_000 : 30_000);
     };
-    const id = window.setInterval(() => void pollExternalDrives(), 30_000);
+    const id = window.setTimeout(() => void pollExternalDrives(), 5_000);
     return () => {
       cancelled = true;
-      window.clearInterval(id);
+      window.clearTimeout(id);
+      if (timer) window.clearTimeout(timer);
     };
-  }, [disabled, syncDriveMountsIfNeeded, isLiveMobileSource]);
+  }, [disabled, syncDriveMountsIfNeeded, isLiveMobileSource, clientMode]);
+
+  useEffect(() => {
+    currentDriveRef.current = currentDrive || "";
+  }, [currentDrive]);
 
   const scrollToBrowser = useCallback(() => {
     browserRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -1427,6 +1455,8 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
    * "This computer": publish each folder through the local Client Evidence
    * Agent, let the forensic server connect to it and mount it read-only, then
    * run the same List folder → register → extract flow as a server drive path.
+   * A folder chosen in the browser's own folder window is served by this tab
+   * instead (no agent): same relay protocol, same registration and pipeline.
    */
   async function registerClientFolders(folders: ClientSelectedFolder[]) {
     setClientDialogOpen(false);
@@ -1434,6 +1464,7 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
     const multiple = folders.length > 1;
     for (let index = 0; index < folders.length; index += 1) {
       const folder = folders[index];
+      const viaBrowser = Boolean(folder.browser);
       let share: ClientShare | null = null;
       let connected = false;
       setRegistering(true);
@@ -1450,13 +1481,15 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
             ? `Directory ${index + 1} of ${folders.length}: preparing ${folder.name} on this computer…`
             : `Preparing ${folder.name} on this computer…`
         );
-        share = await createClientShare({
-          path: folder.path,
-          jobId,
-          label: folder.name,
-          relay: clientRelayTarget(jobId),
-        });
-        if (!share.lan_bound && !share.relay_enabled) {
+        share = folder.browser
+          ? await createBrowserShare({ folder: folder.browser, jobId, relay: clientRelayTarget(jobId) })
+          : await createClientShare({
+              path: folder.path,
+              jobId,
+              label: folder.name,
+              relay: clientRelayTarget(jobId),
+            });
+        if (!viaBrowser && !share.lan_bound && !share.relay_enabled) {
           throw new Error(
             "The Client Evidence Agent is listening on this computer only, so the forensic server cannot reach it. Install the latest agent (it connects out to the server) or run the installer again and approve the administrator prompt."
           );
@@ -1480,8 +1513,10 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
           source_type: sourceType === "mobile" ? "mobile" : "disk",
           replace_existing: index === 0,
           relay: Boolean(share.relay_enabled),
+          browser: viaBrowser,
         });
         connected = true;
+        if (viaBrowser) markBrowserShareRegistered(share.share_id);
         // Same in-place boundary as a server drive: no Download Agent / upload UI.
         jobUploadSession.clearInactiveForServerSource(jobId);
         if (share.truncated) {
@@ -1490,9 +1525,11 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
           );
         }
         toastRef.current.success(
-          source.transport === "relay"
-            ? `Forensic server connected to ${source.display_path} through this computer's outbound connection (${source.file_count.toLocaleString()} file(s)). Nothing is copied; speed depends on this computer's upload.`
-            : `Forensic server connected to ${source.display_path} (${source.file_count.toLocaleString()} file(s)). Nothing is copied.`
+          viaBrowser
+            ? `Forensic server connected to ${source.display_path} through this browser tab (${source.file_count.toLocaleString()} file(s)). Keep this tab open until extraction and indexing finish; speed depends on this computer's upload.`
+            : source.transport === "relay"
+              ? `Forensic server connected to ${source.display_path} through this computer's outbound connection (${source.file_count.toLocaleString()} file(s)). Nothing is copied; speed depends on this computer's upload.`
+              : `Forensic server connected to ${source.display_path} (${source.file_count.toLocaleString()} file(s)). Nothing is copied.`
         );
         setManualPath(source.path);
         directoryRegisteredRef.current = false;
@@ -1505,8 +1542,11 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
         }
       } catch (e: unknown) {
         if (!connected) {
-          // The server never accepted this share: withdraw it on the agent too.
-          if (share) void revokeClientShare(share.share_id);
+          // The server never accepted this share: withdraw it on the agent / stop serving it here.
+          if (share) {
+            if (viaBrowser) stopBrowserShare(share.share_id);
+            else void revokeClientShare(share.share_id);
+          }
           const msg = e instanceof Error ? e.message : "Could not connect the folder on this computer";
           onRegisterError?.(msg);
           toastRef.current.error(msg);
@@ -2760,7 +2800,10 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
             ) : null}
           </span>
           <div className="flex flex-wrap items-center gap-2">
-            <span className="text-[10px] font-normal text-emerald-700">Forensic server drives · process in place</span>
+            <span className="text-[10px] font-normal text-emerald-700">
+              Forensic server drives · process in place
+              {driveWatch?.live ? " · new drives appear automatically" : ""}
+            </span>
             <Button
               variant="outline"
               className="h-7 border-brand-200 bg-white px-2 py-0 text-[10px] text-brand-800 hover:bg-brand-50"
@@ -2774,6 +2817,28 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
             </Button>
           </div>
         </div>
+        {driveWatch && !driveWatch.live ? (
+          <div
+            className="flex gap-2 border-b border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-900"
+            data-testid="server-drive-watch-offline"
+          >
+            <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <div className="min-w-0">
+              <p>
+                <strong>Drives connected to the forensic server after Polaron started are not detected.</strong>{" "}
+                Only the drives Docker mounted at startup are listed. New and removed drives come from the
+                workstation helper on the forensic server, which the server cannot reach
+                {driveWatch.error ? `: ${driveWatch.error}` : "."}
+              </p>
+              <p className="mt-1 text-amber-800">
+                On the forensic server, run <code className="rounded bg-white/80 px-1">script_docker\start_docker_prod.cmd</code> as
+                Administrator (it starts the helper and checks this connection), or{" "}
+                <code className="rounded bg-white/80 px-1">scripts\ensure-host-drive-helper.ps1</code>. This list then follows
+                new drives by itself.
+              </p>
+            </div>
+          </div>
+        ) : null}
         <div className="flex flex-wrap items-center gap-1 border-b border-ink-100 px-3 py-2 text-xs text-ink-600">
           <button
             type="button"

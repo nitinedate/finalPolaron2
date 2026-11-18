@@ -457,6 +457,15 @@ class HelperWriter:
         status, body = self._post("/acquisition/import/seal", content="".join(r + "\n" for r in rels).encode("utf-8"), timeout=900.0)
         return body if status == 200 else {"ok": False, "error": body.get("detail") or f"HTTP {status}"}
 
+    def discard(self, items: list[tuple[str, str]]) -> dict[str, Any]:
+        """V1.31.14: remove final files this upload created ("<sha256>TAB<rel>"); the helper deletes a file
+        only while it is not read-only and its SHA-256 still matches, so sealed evidence is never touched."""
+        if not items:
+            return {"ok": True, "removed": 0}
+        body = "".join(f"{sha}\t{rel}\n" for sha, rel in items).encode("utf-8")
+        status, out = self._post("/acquisition/import/discard", content=body, timeout=600.0)
+        return out if status == 200 else {"ok": False, "error": out.get("detail") or out.get("error") or f"HTTP {status}"}
+
     def abort(self, rels: list[str]) -> None:
         if not rels:
             return
