@@ -1,0 +1,33 @@
+Polaron frontend mixed-source revision repair — QA, 18-Nov-2026
+===============================================================
+Input release: Polaron_Mobile_TS_Build_Fix_Complete_20261118.zip
+
+Confirmed divergence:
+ - User's Windows build contains ClientSetupPanel.tsx and clientMobileImport.ts.
+ - Neither file exists in the earlier complete source release.
+ - Their missing imports were not repaired by previous payload typing updates.
+
+Change:
+ - frontend/tsconfig.json switches from indiscriminately including all src files to
+   compiling src/main.tsx and src/vite-env.d.ts (plus the complete import graph).
+ - Strict typechecking remains enabled; active imports are still checked.
+ - scripts/Repair-FrontendSource.ps1 provides backup-first coherent release restore.
+ - No fabricated endpoints and no removal of Android/iOS evidence-transfer code.
+
+Automated tests:
+ - qa/test_frontend_revision_repair.py: 5 tests passed
+ - Real TypeScript source graph includes App.tsx, MobileAcquisitionPage.tsx,
+   hostDriveHelper.ts and main.tsx.
+ - Generated orphaned clientMobileImport.ts and ClientSetupPanel.tsx are excluded
+   when unreferenced; the former is included when imported.
+ - TypeScript AST syntax parse: 167 frontend TS/TSX files, 0 syntax errors.
+
+Important validation limitations:
+ - Full `npm ci` could not complete due registry.npmjs.org DNS failure.
+ - Full `npm run build:unified` and Docker build were NOT verified here.
+ - Actual newer ClientSetupPanel/clientMobileImport source is not accessible, so
+   this patch cannot assert that those components' dependencies are compatible.
+ - The PowerShell reconciliation script has not been executed on Windows here.
+ - First try the non-destructive tsconfig patch and local Docker build.
+ - If the newer files are part of the active app, use a matching full source
+   revision or explicitly restore the older coherent release with backup.
