@@ -1527,6 +1527,8 @@ export interface CustodyLink {
 export interface AcquisitionStartPayload {
   adapter: string;
   device_id: string;
+  /** Human-readable live-device model/label for the acquisition manifest. */
+  device_label?: string;
   case_id: string;
   evidence_id: string;
   legal_authority: string;

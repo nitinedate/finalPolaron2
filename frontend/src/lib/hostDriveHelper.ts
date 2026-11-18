@@ -1,3 +1,4 @@
+import type { AcquisitionStartPayload } from "./types/forensic";
 const HELPER_BASE =
   (import.meta.env.VITE_HOST_DRIVE_HELPER_URL as string | undefined)?.replace(/\/$/, "") ??
   "http://127.0.0.1:9876";
@@ -456,7 +457,7 @@ export async function getHostAcquisitionPreview<T = unknown>(
 }
 
 export async function startHostAcquisitionRun(
-  payload: Record<string, unknown>,
+  payload: AcquisitionStartPayload,
   timeoutMs = 30_000,
 ): Promise<{ ok: boolean; job_id?: string; async?: boolean; error?: string; busy?: boolean } | null> {
   const health = await hostDriveHelperHealth(2_000, { force: true });
