@@ -1,0 +1,18 @@
+Polaron V1.31.6 - cumulative list for POLARON_V1_31_6_UPDATED_FILES.zip (V1.31.0 to V1.31.6)
+
+V1.31.6 (this update; copy onto NITIN and deploy on the server)
+  scripts/host-drive-helper.ps1                    5.61: refresh job reads the registry during a copy or while pnputil
+                                                   is busy (Get-RegistryStartedUsbIds, Get-RegistryUsbLines), ignores
+                                                   leftover copy processes (Get-UsbTransferProcesses), stamps the list
+                                                   (scanned_utc, source, note)
+  scripts/ensure-host-drive-helper.ps1             expects helper 5.61 (restarts an older one)
+  frontend/src/lib/hostDriveHelper.ts              deviceListFreshnessWarnings (old list, registry note)
+  frontend/src/lib/hostDriveHelper.freshness.test.tsx   4 tests (new)
+  frontend/src/pages/forensic/MobileAcquisitionPage.tsx Android-not-detected hint
+  backend/tests/test_mobile_usb_bootstrap_scripts.py    version 5.61; asserts the registry path during a copy
+  tests/device_list_refresh_checks.ps1             14 checks (new)
+  RELEASE_V1_31_6_PHONE_LIST_FOLLOWS_CABLES.md, CHANGED_FILES_V1_31_6.txt
+
+Earlier: CHANGED_FILES_V1_31_5.txt, _V1_31_4, _V1_31_3, _V1_31_2 (V1.31.0 to V1.31.2).
+
+Not in the ZIP: .env (no change needed)

@@ -1536,6 +1536,16 @@ export interface ClientImportState {
   run?: AcquisitionRunDetail | null;
 }
 
+/** V1.31.14: upload session for a collection made on this computer (sent to the server while it runs). */
+export interface ClientStreamSession {
+  session_id: string;
+  /** One-off upload token: handed to this computer's helper only, never stored by the page. */
+  token: string;
+  chunk_bytes: number;
+  service: string;
+  state: ClientImportState;
+}
+
 export interface ClientImportCapabilities {
   enabled: boolean;
   office_helper: {

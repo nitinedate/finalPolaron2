@@ -23,8 +23,8 @@ def test_network_repair_replaces_stale_urlacl_for_current_user():
 def test_helper_refresh_does_not_reset_usb():
     helper = (ROOT / "scripts" / "host-drive-helper.ps1").read_text(encoding="utf-8")
     ensure = (ROOT / "scripts" / "ensure-host-drive-helper.ps1").read_text(encoding="utf-8")
-    assert 'HelperVersion = "5.64"' in helper
-    assert 'ExpectedHelperVersion = "5.64"' in ensure
+    assert 'HelperVersion = "5.66"' in helper
+    assert 'ExpectedHelperVersion = "5.66"' in ensure
     refresh = helper.split("function Start-MobileDeviceRefresh", 1)[1].split("function Write-HostAdapterCache", 1)[0]
     parent = helper.split("function Get-StartedUsbInstanceIds", 1)[1].split("function Test-WpdIdCurrentlyAttached", 1)[0]
     assert "proc.Kill()" not in refresh

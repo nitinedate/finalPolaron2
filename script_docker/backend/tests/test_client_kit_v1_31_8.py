@@ -177,7 +177,7 @@ def test_client_kit_router_is_mounted_for_forensic_and_mobile():
 
 def test_ensure_updates_from_the_server_and_never_restarts_during_a_collection():
     ensure = (ROOT / "scripts" / "ensure-host-drive-helper.ps1").read_text(encoding="utf-8")
-    assert 'ExpectedHelperVersion = "5.64"' in ensure
+    assert 'ExpectedHelperVersion = "5.66"' in ensure
     kit = ensure.index("polaron-client-update.ps1")
     quick = ensure.index("$alreadyCurrent = $false")
     assert kit < quick  # the update check runs before the "already current" early exit
@@ -185,5 +185,5 @@ def test_ensure_updates_from_the_server_and_never_restarts_during_a_collection()
     guard = ensure.index("if (Test-CollectionRunning) {")
     assert guard < ensure.index("    $ForceRestart = $true\n}")
     helper = (ROOT / "scripts" / "host-drive-helper.ps1").read_text(encoding="utf-8")
-    assert 'HelperVersion = "5.64"' in helper
+    assert 'HelperVersion = "5.66"' in helper
     assert '",\\"client_agent_running\\":"' in helper

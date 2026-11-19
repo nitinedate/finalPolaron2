@@ -1,0 +1,34 @@
+Polaron V1.31.0 - choose evidence on "This computer" without installing anything
+
+New
+  frontend/src/lib/browserEvidenceShare.ts                 folder window (showDirectoryPicker / folder input), frozen
+                                                           file list + SHA-256 digest (agent compatible), tab serves
+                                                           the outbound relay (manifest, range, zero/deflate, 409 on
+                                                           change, revoke), reconnect after reload, reload guard
+  frontend/src/lib/browserEvidenceShare.test.tsx           7 tests
+  frontend/src/components/forensic/BrowserShareBanner.tsx  "Serving evidence from this computer" banner
+  backend/tests/test_browser_evidence_share_v1_31.py       4 tests (3 unit + end-to-end through the real relay)
+  backend/tests/browser_share_e2e/driver.mjs               plays the browser tab for the end-to-end test
+  backend/tests/browser_share_e2e/README.md                how to run it
+  RELEASE_V1_31_0_BROWSER_CLIENT_EVIDENCE.md
+  CHANGED_FILES_V1_31_0.txt
+
+Changed
+  frontend/src/components/forensic/ClientEvidenceBrowser.tsx       BrowserFolderChooser first on "This computer";
+                                                                   agent moved under "Optional: ..."; blocked-permission
+                                                                   help; selected list marks browser folders
+  frontend/src/components/forensic/ClientEvidenceBrowser.test.tsx  +5 tests
+  frontend/src/components/forensic/HostEvidencePanel.tsx           registers browser folders (browser: true, relay only)
+  frontend/src/components/forensic/ClientEvidenceSourceCard.tsx    "Served by this browser tab", Reconnect folder
+  frontend/src/components/AppLayout.tsx                            renders BrowserShareBanner (2 lines)
+  frontend/src/lib/clientEvidenceAgent.ts                          "blocked" state from loopback-network permission
+  frontend/src/lib/forensicApi.ts                                  browser / browser_share fields
+  backend/app/schemas/forensic.py                                  ClientSourceBody.browser
+  backend/app/routers/client_evidence.py                           passes browser to attach_client_source
+  backend/app/services/client_evidence/job_source.py               browser_share: relay only, recorded, reported in status
+
+Not changed
+  .env / .env.example (CLIENT_EVIDENCE_RELAY_ENABLED=true is already the default)
+  scripts/client-evidence-agent/* (agent 1.2 unchanged)
+
+Originals: recovery-snapshots/pre-v1.31.0-browser-folder-20261116/

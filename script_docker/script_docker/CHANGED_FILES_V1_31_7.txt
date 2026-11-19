@@ -1,0 +1,26 @@
+Polaron V1.31.7 - cumulative list for POLARON_V1_31_7_UPDATED_FILES.zip (V1.31.0 to V1.31.7)
+
+V1.31.7 (this update; copy onto NITIN and deploy on the server)
+  scripts/host-drive-helper.ps1                    5.62: Get-AndroidUsbStates (startup scan and refresh job):
+                                                   File transfer phones found by their USB interface; charging-only
+                                                   and no-driver phones listed with guidance (adapter android_usb);
+                                                   manufacturer read from the registry
+  scripts/ensure-host-drive-helper.ps1             expects helper 5.62 (restarts an older one)
+  scripts/diagnose-phone-detection.ps1             new, read-only report: %TEMP%\polaron-phone-detection.txt
+  frontend/src/lib/hostDriveHelper.ts              needs-action devices, helper version warning (< 5.62)
+  frontend/src/lib/hostDriveHelper.androidUsb.test.tsx  8 tests (new)
+  frontend/src/lib/types/forensic.ts               DetectedDevice.guidance / state
+  frontend/src/pages/forensic/MobileAcquisitionPage.tsx amber "Action needed" card, toast, no identify
+  backend/app/services/mobile_acquire/host_bridge.py    helper-list fallback maps needs-action phones
+  backend/app/services/mobile_platform_agents.py        android_usb is an Android adapter
+  backend/app/malware/router.py                    needs-action phone shown as not ready, with guidance
+  backend/tests/test_mobile_usb_bootstrap_scripts.py    version 5.62
+  backend/tests/test_android_usb_detection_v1_31_7.py   6 tests (new)
+  tests/device_list_refresh_checks.ps1             29 checks (15 new)
+  tests/phone_detection_diagnose_checks.ps1        8 checks (new)
+  RELEASE_V1_31_7_ANDROID_DETECTION.md, CHANGED_FILES_V1_31_7.txt
+  recovery-snapshots/pre-v1.31.7-android-detect-20261116/  the V1.31.6 versions of the changed files
+
+Earlier: CHANGED_FILES_V1_31_6.txt, _V1_31_5, _V1_31_4, _V1_31_3, _V1_31_2 (V1.31.0 to V1.31.2).
+
+Not in the ZIP: .env (no change needed)

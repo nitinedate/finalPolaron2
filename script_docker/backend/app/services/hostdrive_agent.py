@@ -91,6 +91,9 @@ def probe_helper() -> dict[str, Any]:
                 drives = {"ok": False, "error": str(exc)[:200]}
             letters = drives.get("drives") if isinstance(drives, dict) else None
             mobiles = drives.get("mobile_devices") if isinstance(drives, dict) else None
+            # V1.31.13: before helper 5.65 the phones in /drives came from a file that could be out of date.
+            if not _helper_at_least(health, "5.65"):
+                mobiles = []
             return {
                 "ok": True,
                 "agent": "hostdrive_agent",
@@ -391,25 +394,48 @@ def _tag_office_mobile(row: dict[str, Any]) -> dict[str, Any]:
     return tagged
 
 
+def _helper_at_least(health: Any, version: str) -> bool:
+    raw = str((health or {}).get("helper_version") or "") if isinstance(health, dict) else ""
+    try:
+        have = [int(x) for x in raw.split(".")]
+        need = [int(x) for x in version.split(".")]
+    except ValueError:
+        return False
+    width = max(len(have), len(need))
+    return have + [0] * (width - len(have)) >= need + [0] * (width - len(need))
+
+
 def proxy_mobile_devices() -> dict[str, Any]:
     """Phones attached to the office forensic host — same helper path as disks."""
+    from app.services.mobile_acquire.host_bridge import helper_list_staleness
+
     helper = probe_helper()
     devices: list[dict[str, Any]] = []
     ios_backup_roots: list[str] = []
+    warnings: list[str] = []
     if helper.get("ok") and helper.get("helper_url"):
         try:
             data = _http_json(f"{helper['helper_url']}/mobile-devices", timeout=8.0)
-            raw = data.get("mobile_devices") if isinstance(data, dict) else None
-            devices = [_tag_office_mobile(row) for row in (raw or []) if isinstance(row, dict)]
-            ios_backup_roots = [str(p) for p in (data.get("ios_backup_roots") or [])] if isinstance(data, dict) else []
+            if isinstance(data, dict) and not data.get("scanned_utc"):
+                # Helper older than 5.64: the list is a file; judge it by the device list's read time.
+                try:
+                    acq = _http_json(f"{helper['helper_url']}/acquisition/devices?cached=1", timeout=8.0)
+                    data = {**data, "scanned_utc": (acq or {}).get("scanned_utc") if isinstance(acq, dict) else None}
+                except Exception:
+                    data = {**data, "scanned_utc": None}
+            stale = helper_list_staleness(data)
+            if stale:
+                warnings.append(stale)
+            else:
+                raw = data.get("mobile_devices") if isinstance(data, dict) else None
+                devices = [_tag_office_mobile(row) for row in (raw or []) if isinstance(row, dict)]
+                ios_backup_roots = [str(p) for p in (data.get("ios_backup_roots") or [])] if isinstance(data, dict) else []
         except Exception as exc:
+            # V1.31.13: no fallback to the phone list the helper reported when it started (it may be long gone).
             log.debug("proxy mobile-devices failed: %s", exc)
-            devices = [
-                _tag_office_mobile(row)
-                for row in (helper.get("mobile_devices") or [])
-                if isinstance(row, dict)
-            ]
+            warnings.append(f"Office host phone list could not be read: {exc}")
     return {
+        "warnings": warnings,
         "ok": True,
         "source": "office_host" if helper.get("ok") else "offline",
         "helper_online": bool(helper.get("ok")),
@@ -455,7 +481,10 @@ def proxy_acquisition_devices() -> dict[str, Any]:
             "warnings": [f"Office host device scan failed: {exc}"],
             "count": 0,
         }
-    devices = [
+    from app.services.mobile_acquire.host_bridge import helper_list_staleness
+
+    stale = helper_list_staleness(data)
+    devices = [] if stale else [
         {**dict(row), "attach_host": "office_server"}
         for row in (data.get("devices") or [])
         if isinstance(row, dict)
@@ -466,9 +495,12 @@ def proxy_acquisition_devices() -> dict[str, Any]:
         "helper_online": True,
         "helper_url": helper.get("helper_url"),
         "devices": devices,
-        "warnings": list(data.get("warnings") or []),
+        "warnings": list(data.get("warnings") or []) + ([stale] if stale else []),
         "count": len(devices),
         "attach_host": "office_server",
+        "scanned_utc": data.get("scanned_utc"),
+        "list_source": data.get("source"),
+        "stale": bool(stale),
     }
 
 

@@ -1,0 +1,17 @@
+Polaron V1.31.3 - cumulative list for POLARON_V1_31_3_UPDATED_FILES.zip (V1.31.0 to V1.31.3)
+
+V1.31.3 (this update)
+  backend/app/services/hostdrive_agent.py                     Host: 127.0.0.1 for the Docker host, helper_error/live in /drives
+  backend/app/services/mobile_acquire/host_bridge.py          same Host header for phone collection calls
+  backend/app/services/mobile_acquire/client_import.py        same Host header for the client import writer
+  backend/tests/test_server_drive_hotplug_v1_31_3.py          6 tests (new)
+  frontend/src/lib/hostDriveHelper.ts                         live / helper_error fields
+  frontend/src/components/forensic/HostEvidencePanel.tsx      5 s live drive watcher (added/removed), offline note
+  frontend/src/components/forensic/ClientEvidenceBrowser.test.tsx  + 3 tests
+  script_docker/start_docker.ps1                              Test-ContainersReachWorkstationHelper after the helper starts
+  tests/server_drive_hotplug_checks.ps1                       11 launcher checks (new)
+  RELEASE_V1_31_3_SERVER_DRIVE_HOTPLUG.md, CHANGED_FILES_V1_31_3.txt
+
+V1.31.2, V1.31.1, V1.31.0: see CHANGED_FILES_V1_31_2.txt (cumulative up to V1.31.2)
+
+Not in the ZIP: .env (no change needed)

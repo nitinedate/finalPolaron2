@@ -1,0 +1,30 @@
+Polaron V1.31.14 - cumulative list for POLARON_V1_31_14_UPDATED_FILES.zip (V1.31.0 to V1.31.14)
+
+V1.31.14 (this update; deploy on the server and restart its helper; client helpers update themselves to 5.66)
+  backend/app/services/mobile_acquire/client_stream.py   new: upload sessions for collections on client computers
+                                                   (chunks, small-file groups, commit, discard, finish, abort)
+  backend/app/services/mobile_acquire/client_import.py   HelperWriter.discard()
+  backend/app/routers/acquisition.py               /api/acquisition/client-stream (session; token-only upload routes)
+  scripts/polaron-stream-upload.ps1                new: client uploader (sends while the collection runs, resumes,
+                                                   removes the local copy only after the server confirmed it)
+  scripts/host-drive-helper.ps1                    5.66: hands a collection's upload session to the uploader;
+                                                   destination = server of client-kit.json; restarts unfinished
+                                                   uploads; GET /acquisition/stream/<job>; server writer
+                                                   /acquisition/import/discard
+  scripts/ensure-host-drive-helper.ps1             expects helper 5.66
+  frontend/src/lib/clientStream.ts                 new: session, hand-off fields, following, progress line
+  frontend/src/lib/hostDriveHelper.ts              stream refusal is not "busy"; uploader status
+  frontend/src/lib/forensicApi.ts                  createClientStream
+  frontend/src/lib/types/forensic.ts               ClientStreamSession
+  frontend/src/pages/forensic/MobileAcquisitionPage.tsx   client collections are sent while they run; "Keep a copy
+                                                   on this computer"; progress; fallback to the copy
+  backend/tests/test_client_stream_v1_31_14.py     14 tests (new, 5 of them end to end with the uploader)
+  frontend/src/lib/clientStream.v13114.test.tsx    7 tests (new)
+  backend/tests/test_android_usb_detection_v1_31_7.py, test_client_kit_v1_31_8.py, test_live_usb_scan_v1_31_9.py,
+  backend/tests/test_mobile_usb_bootstrap_scripts.py, tests/device_list_refresh_checks.ps1   version 5.66
+  RELEASE_V1_31_14_CLIENT_STREAM_TO_SERVER.md, CHANGED_FILES_V1_31_14.txt
+  recovery-snapshots/pre-v1.31.14-client-stream-20261118/  the V1.31.13 versions of the changed files
+
+Earlier: CHANGED_FILES_V1_31_13.txt ... _V1_31_2.
+
+Not in the ZIP: .env (no change needed)

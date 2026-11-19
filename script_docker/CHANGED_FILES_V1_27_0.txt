@@ -1,0 +1,24 @@
+Polaron V1.27.0 - client mobile imaging (image on the client PC in C:\evidence AND on the forensic server)
+
+New
+  backend/app/services/mobile_acquire/client_import.py
+  backend/tests/test_client_mobile_import_v1_27.py
+  frontend/src/lib/clientMobileImport.ts
+  frontend/src/lib/clientMobileImport.test.tsx
+  RELEASE_V1_27_0_CLIENT_MOBILE_IMAGING.md
+  CHANGED_FILES_V1_27_0.txt
+
+Changed
+  scripts/host-drive-helper.ps1            helper 5.58: /acquisition/import/{prepare,chunk,commit,seal,abort}, computer_name + client_import in /health
+  scripts/ensure-host-drive-helper.ps1     expects helper 5.58 (restarts an older helper)
+  backend/app/routers/acquisition.py       /api/acquisition/client-import (capabilities, start, status, cancel)
+  backend/app/services/mobile_acquire/host_bridge.py     X-Host-Helper-Token sent when HOST_DRIVE_HELPER_TOKEN is set
+  backend/app/services/mobile_acquire/run_registry.py    recovery uses the server copy of client-collected runs; helper case root as a recovery root
+  frontend/src/pages/forensic/MobileAcquisitionPage.tsx  client-site routing, C:\evidence case root, copy-to-server step, "Pull an existing image"
+  frontend/src/lib/forensicApi.ts          acquisitionApi.clientImport* calls
+  frontend/src/lib/hostDriveHelper.ts      getLocalHelperIdentity(), health fields
+  frontend/src/lib/clientEvidenceAgent.ts  clientRelayTargetForService()
+  frontend/src/lib/types/forensic.ts       ClientImport* types, AcquisitionResult.client_import
+  .env.example                             CLIENT_MOBILE_* settings
+
+Originals of every changed file: recovery-snapshots/pre-v1.27.0-client-mobile-imaging-20261115/
