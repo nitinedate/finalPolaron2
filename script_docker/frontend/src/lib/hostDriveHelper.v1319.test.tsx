@@ -36,7 +36,7 @@ describe("V1.31.9: only phones that are plugged in now", () => {
     stubHelper("5.63", { ok: true, devices: [adbRow], scanned_utc: twelveMinutesAgo });
     const r = await getHostAcquisitionDevices(2_000);
     expect(r.devices.filter((d) => d.attach_host === "this_pc")).toEqual([]);
-    expect(r.local_helper).toMatchObject({ version: "5.63", outdated: false, stale: true });
+    expect(r.local_helper).toEqual({ version: "5.63", outdated: false, stale: true });
     expect(r.warnings.some((w) => w.includes("so its phones are not shown"))).toBe(true);
   });
 

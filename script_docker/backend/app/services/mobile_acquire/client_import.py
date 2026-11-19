@@ -431,16 +431,11 @@ class HelperWriter:
             )
         return body
 
-    def chunk(self, rel: str, offset: int, data: bytes, piece: bool = False) -> tuple[int, dict[str, Any]]:
-        headers = {"X-Import-Rel": _b64(rel), "X-Import-Offset": str(offset), "Content-Type": "application/octet-stream"}
-        # X-Import-Piece lets several chunks of one file land at once. Absent, the helper still
-        # requires the next byte of the part (older servers, and this copy path).
-        if piece:
-            headers["X-Import-Piece"] = "1"
+    def chunk(self, rel: str, offset: int, data: bytes) -> tuple[int, dict[str, Any]]:
         return self._post(
             "/acquisition/import/chunk",
             content=data,
-            headers=headers,
+            headers={"X-Import-Rel": _b64(rel), "X-Import-Offset": str(offset), "Content-Type": "application/octet-stream"},
         )
 
     def commit(self, f: ImportFile, sha256: str) -> tuple[int, dict[str, Any]]:
@@ -461,15 +456,6 @@ class HelperWriter:
     def seal(self, rels: list[str]) -> dict[str, Any]:
         status, body = self._post("/acquisition/import/seal", content="".join(r + "\n" for r in rels).encode("utf-8"), timeout=900.0)
         return body if status == 200 else {"ok": False, "error": body.get("detail") or f"HTTP {status}"}
-
-    def discard(self, items: list[tuple[str, str]]) -> dict[str, Any]:
-        """V1.31.14: remove final files this upload created ("<sha256>TAB<rel>"); the helper deletes a file
-        only while it is not read-only and its SHA-256 still matches, so sealed evidence is never touched."""
-        if not items:
-            return {"ok": True, "removed": 0}
-        body = "".join(f"{sha}\t{rel}\n" for sha, rel in items).encode("utf-8")
-        status, out = self._post("/acquisition/import/discard", content=body, timeout=600.0)
-        return out if status == 200 else {"ok": False, "error": out.get("detail") or out.get("error") or f"HTTP {status}"}
 
     def abort(self, rels: list[str]) -> None:
         if not rels:

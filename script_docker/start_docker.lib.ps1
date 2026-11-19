@@ -439,8 +439,11 @@ function Find-EnvSettingForPath {
 
 function Assert-DeploymentComposePaths {
     param([string]$Root, $Config, [switch]$ValidateOnly)
+    # The remote-disk staging bind is an intentionally created runtime directory.
+    # It stores incoming client evidence and is NOT a deployment source file.
+    # Do not create any mount beyond this explicit runtime allowlist.
     $runtimeTargets = @('/app/data', '/app/data/uploads', '/scratch', '/data',
-        '/root/.ollama', '/root/.cache/huggingface', '/evidence')
+        '/root/.ollama', '/root/.cache/huggingface', '/evidence', '/remote-disk-staging')
     $generatedNginx = [System.IO.Path]::GetFullPath((Join-Path $Root 'deployment/windows-ip-https/nginx.gateway.https.conf'))
     foreach ($row in @($Config.services.PSObject.Properties)) {
         $service = $row.Value

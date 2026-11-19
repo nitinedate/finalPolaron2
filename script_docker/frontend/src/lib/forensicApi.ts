@@ -83,7 +83,6 @@ import type {
   ClientImportCapabilities,
   ClientImportStartPayload,
   ClientImportState,
-  ClientStreamSession,
   DetectedDeviceList,
   MethodCoverage,
 } from "./types/forensic";
@@ -338,10 +337,6 @@ export const acquisitionApi = {
   /** Start copying one run from a read-only share of the client case folder. */
   startClientImport: (payload: ClientImportStartPayload) =>
     api.post<ClientImportState>("/api/acquisition/client-import", payload, { timeoutMs: 180_000 }),
-
-  /** V1.31.14: upload session for a collection on this computer; the local helper sends it while it runs. */
-  createClientStream: (payload: { case_id: string; scope?: string; keep_local?: boolean; client_host?: string }) =>
-    api.post<ClientStreamSession>("/api/acquisition/client-stream", payload, { timeoutMs: 60_000 }),
 
   getClientImport: (importId: string) =>
     api.get<ClientImportState>(`/api/acquisition/client-import/${importId}`, undefined, { timeoutMs: 20_000 }),

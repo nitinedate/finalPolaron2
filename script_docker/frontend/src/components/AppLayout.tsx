@@ -119,7 +119,6 @@ const GROUPS: NavGroup[] = [
             { to: "/forensic/artifacts", label: "Artifacts", icon: FolderSearch, requiredPerm: "artifact:read", firmOnly: true },
             { to: "/forensic/reports", label: "Report list", icon: FileText, requiredPerm: "job:read", firmOnly: true },
             { to: "/forensic/evidence-search", label: "Search evidence", icon: Search, requiredPerm: "job:read", firmOnly: true },
-            { to: "/forensic/ocr", label: "OCR", icon: ScanSearch, requiredPerm: "job:run", firmOnly: true },
           ],
         },
       ] as NavGroup[])
@@ -238,7 +237,6 @@ const TITLES: Record<string, string> = {
   "/mobile/malware/models": "Models and Training",
   "/forensic/reports": "Report list",
   "/forensic/evidence-search": "Search evidence",
-  "/forensic/ocr": "OCR — Document Search",
   "/vuln/dashboards": "Vulnerability Dashboards",
   "/vuln/ops": "Vulnerability Operations",
   "/vuln/scanners": "Scanners",

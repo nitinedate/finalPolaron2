@@ -22,7 +22,7 @@ function Get-HelperScriptVersion {
     return $null
 }
 $agent = Join-Path $root "scripts\hostdrive-agent.ps1"
-$ExpectedHelperVersion = "5.66"
+$ExpectedHelperVersion = "5.64"
 
 # V1.31.8: a computer set up with Polaron-Setup-This-Computer.cmd keeps its client files equal to the
 # server's. The updater checks at most every 10 minutes, downloads only files that differ, verifies each

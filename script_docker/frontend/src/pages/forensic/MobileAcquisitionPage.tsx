@@ -24,15 +24,7 @@ import { Badge, Button, Card, Field, Input, Modal, PageHeader, Select, Spinner }
 import { ClientAgentSetup, ClientEvidenceBrowser, type ClientSelectedFolder } from "../../components/forensic/ClientEvidenceBrowser";
 import { ClientSetupPanel, clientSetupState } from "../../components/forensic/ClientSetupPanel";
 import { getClientKitInfo } from "../../lib/clientKit";
-import { deviceMatchesPlatform, noPhoneText } from "../../lib/phonePlatform";
 import { clientAgentStatus, type ClientAgentStatus } from "../../lib/clientEvidenceAgent";
-import {
-  createClientStream,
-  dropClientStream,
-  followClientStream,
-  streamProgressLine,
-  streamStartFields,
-} from "../../lib/clientStream";
 import {
   ClientAgentRequiredError,
   DEFAULT_CLIENT_CASE_ROOT,
@@ -70,8 +62,6 @@ import {
   mobileKindLabel,
   isUsbCollectionBusyError,
   isBrowserOnOfficeHost,
-  getHostStreamStatus,
-  type HostStreamStatus,
   type LocalHelperState,
 } from "../../lib/hostDriveHelper";
 import { UsbCollectionBusyBanner } from "../../components/forensic/StopUsbCollectionButton";
@@ -108,6 +98,25 @@ type AuthorityForm = {
   wa_allow_device_modification: boolean;
   wa_64_digit_key: string;
 };
+
+function deviceMatchesPlatform(osFamily: string | undefined, platform: "android" | "ios" | null): boolean {
+  if (!platform) return true;
+  return String(osFamily || "").toLowerCase().includes(platform);
+}
+
+function otherAcquireLabel(osFamily?: string | null): string {
+  const raw = String(osFamily || "").toLowerCase();
+  if (raw.includes("ios")) return "iOS";
+  if (raw.includes("android")) return "Android";
+  return "the matching";
+}
+
+function otherAcquirePath(osFamily?: string | null): string | null {
+  const raw = String(osFamily || "").toLowerCase();
+  if (raw.includes("ios")) return "/mobile/ios/acquire";
+  if (raw.includes("android")) return "/mobile/android/acquire";
+  return null;
+}
 
 function ownerAgentForFamily(family?: string | null): { id: string; label: string } | null {
   const raw = String(family || "").toLowerCase();
@@ -477,8 +486,6 @@ type LiveRunSnapshot = {
   client_case_root?: string;
   scope?: string;
   import_id?: string;
-  /** V1.31.14: upload session id — the collection is sent to the server while it runs (no token here). */
-  stream_id?: string;
 };
 
 function persistLiveRun(snapshot: LiveRunSnapshot) {
@@ -529,10 +536,9 @@ export function MobileAcquisitionPage() {
   const [step, setStep] = useState<Step>("connect");
   const [adapters, setAdapters] = useState<AcquisitionAdapter[]>([]);
   const [devices, setDevices] = useState<DetectedDevice[]>([]);
+  const [otherDevices, setOtherDevices] = useState<DetectedDevice[]>([]);
   const [detectWarnings, setDetectWarnings] = useState<string[]>([]);
   const [scanning, setScanning] = useState(false);
-  // V1.31.13: when the phone list was last read, for "nothing connected (checked ...)".
-  const [lastScanAt, setLastScanAt] = useState<Date | null>(null);
   // V1.31.8: the Polaron helper on this computer (null = not running) and the version the server has.
   const [localHelper, setLocalHelper] = useState<LocalHelperState | null>(null);
   const [helperOnline, setHelperOnline] = useState<boolean | null>(null);
@@ -588,11 +594,10 @@ export function MobileAcquisitionPage() {
   const formRef = useRef(form);
   const scanInFlightRef = useRef(false);
   const lastDeviceKeyRef = useRef("");
+  const lastOtherDeviceKeyRef = useRef("");
   const runRef = useRef(run);
-  const stepRef = useRef(step);
   formRef.current = form;
   runRef.current = run;
-  stepRef.current = step;
 
   // V1.27.0 — phone attached to this (client) PC: image created here, then copied to the server.
   const [site, setSite] = useState<SiteIdentity | null>(null);
@@ -603,13 +608,6 @@ export function MobileAcquisitionPage() {
   const [clientImportError, setClientImportError] = useState("");
   const [clientCollected, setClientCollected] = useState(false);
   const [clientAgentMissing, setClientAgentMissing] = useState<ClientAgentStatus | null>(null);
-  // V1.31.14: the collection on this computer is sent to the forensic server while it runs.
-  const [keepClientCopy, setKeepClientCopy] = useState(false);
-  const [streamState, setStreamState] = useState<ClientImportState | null>(null);
-  const [streamUploader, setStreamUploader] = useState<HostStreamStatus | null>(null);
-  const [streamActive, setStreamActive] = useState(false);
-  const streamIdRef = useRef("");
-  const streamFailedRef = useRef(false);
   const [pullOpen, setPullOpen] = useState(false);
   const [pulling, setPulling] = useState(false);
   const siteRef = useRef<SiteIdentity | null>(null);
@@ -653,9 +651,7 @@ export function MobileAcquisitionPage() {
                   stage: "complete",
                   category: "Complete",
                   item: "",
-                  detail: streamIdRef.current && !streamFailedRef.current
-                    ? "Collection finished on this computer. Sending its last files to the forensic server."
-                    : "Image created on this computer. What is left: copy it to the forensic server for processing.",
+                  detail: "Image created on this computer. What is left: copy it to the forensic server for processing.",
                   progress_pct: 100,
                   bytes_done: Math.max(Number(rec.output_size || 0), Number(prev.progress?.bytes_done || 0)),
                   files_seen: Math.max(Number(rec.file_count || 0), Number(prev.progress?.files_seen || 0)),
@@ -787,7 +783,7 @@ export function MobileAcquisitionPage() {
           ...prev.progress,
           stage: "import",
           item: "client_import",
-          category: state.transport === "client_stream" ? "Sending to the forensic server" : "Copying to the forensic server",
+          category: "Copying to the forensic server",
           detail: state.detail || "Copying the image to the forensic server",
           bytes_done: done,
           bytes_total: total || null,
@@ -843,35 +839,6 @@ export function MobileAcquisitionPage() {
       };
       const flight = (async (): Promise<boolean> => {
         try {
-          // V1.31.14: the collection was sent to the server while it ran; wait for the server to register it.
-          const live = readLiveRun();
-          const streamId = streamIdRef.current || live?.stream_id || "";
-          if (streamId && !streamFailedRef.current && !opts?.manual) {
-            streamIdRef.current = streamId;
-            setStreamActive(true);
-            setClientCollected(true);
-            setClientImportError("");
-            const state = await followClientStream({
-              sessionId: streamId,
-              jobId: String(live?.run_id || runRef.current?.run_id || ""),
-              onProgress: onImportProgress,
-              onUploader: setStreamUploader,
-            });
-            if (state.status === "completed") {
-              const done = finish(state);
-              if (done !== null) return done;
-            }
-            // The uploader keeps the image on this computer when it could not finish; the copy takes over.
-            streamFailedRef.current = true;
-            setStreamActive(false);
-            clientCopyBlockedRef.current = true;
-            setClientImport(state);
-            setClientImportError(
-              `Sending to the forensic server stopped: ${state.error || state.detail || state.status}. ` +
-                "The image is still on this computer; copy it to the forensic server with the button below.",
-            );
-            return false;
-          }
           const agent = await clientAgentStatus(2_000);
           if (agent.state !== "online") {
             // Without the agent the server cannot read the finished image on this PC.
@@ -1034,33 +1001,6 @@ export function MobileAcquisitionPage() {
     };
   }, []);
 
-  /** V1.31.14: while the collection runs, show what already reached the forensic server. */
-  const liveRunId = run?.run_id || "";
-  useEffect(() => {
-    if (!running || !clientMode || !streamActive) return;
-    const id = streamIdRef.current || readLiveRun()?.stream_id || "";
-    if (!id) return;
-    let active = true;
-    const tick = async () => {
-      try {
-        const st = await acquisitionApi.getClientImport(id);
-        if (active) setStreamState(st);
-      } catch {
-        /* the next tick tries again */
-      }
-      if (/^[0-9a-f]{32}$/.test(liveRunId)) {
-        const up = await getHostStreamStatus(liveRunId);
-        if (active && up) setStreamUploader(up);
-      }
-    };
-    void tick();
-    const timer = window.setInterval(() => void tick(), 4_000);
-    return () => {
-      active = false;
-      window.clearInterval(timer);
-    };
-  }, [running, clientMode, streamActive, liveRunId]);
-
   const ensureSite = useCallback(async (): Promise<SiteIdentity> => {
     if (siteRef.current) return siteRef.current;
     const identity = await resolveSiteIdentity();
@@ -1211,16 +1151,15 @@ export function MobileAcquisitionPage() {
         }
       }
       const allDevices = [...mergedDevices.values()];
-      // V1.31.13: a page lists only its own platform; a phone of the other kind is not shown here at all.
-      const devicesNow = allDevices.filter((device) => deviceMatchesPlatform(device, fixedPlatform));
+      const devicesNow = allDevices.filter((device) => deviceMatchesPlatform(device.os_family, fixedPlatform));
+      const otherNow = fixedPlatform
+        ? allDevices.filter((device) => !deviceMatchesPlatform(device.os_family, fixedPlatform))
+        : [];
       setDevices(devicesNow);
-      setLastScanAt(new Date());
+      setOtherDevices(otherNow);
       setSelected((current) => {
         if (!current) return current;
-        const still = devicesNow.find((d) => d.adapter === current.adapter && d.device_id === current.device_id);
-        if (still) return still;
-        // Unplugged: forget it while choosing a phone; keep it once identification or collection has begun.
-        return stepRef.current === "connect" ? null : current;
+        return devicesNow.find((d) => d.adapter === current.adapter && d.device_id === current.device_id) ?? current;
       });
 
       let warnings = [...(data.warnings ?? []), ...(hostDirect.warnings ?? [])];
@@ -1265,9 +1204,12 @@ export function MobileAcquisitionPage() {
       const readyNow = devicesNow.filter((d) => !deviceNeedsPhoneAction(d));
       const waitingNow = devicesNow.filter((d) => deviceNeedsPhoneAction(d));
       const nextKey = devicesNow.map((d) => `${d.adapter}:${d.device_id}`).sort().join("|");
+      const otherKey = otherNow.map((d) => `${d.adapter}:${d.device_id}`).sort().join("|");
       const appeared = readyNow.length > 0 && nextKey !== lastDeviceKeyRef.current;
       const waitingAppeared = !readyNow.length && waitingNow.length > 0 && nextKey !== lastDeviceKeyRef.current;
+      const otherAppeared = otherNow.length > 0 && otherKey !== lastOtherDeviceKeyRef.current;
       lastDeviceKeyRef.current = nextKey;
+      lastOtherDeviceKeyRef.current = otherKey;
       if (appeared) {
         const kinds = [...new Set(readyNow.map((d) => mobileKindLabel(d.os_family)))].join(", ");
         const first = readyNow[0];
@@ -1280,8 +1222,17 @@ export function MobileAcquisitionPage() {
             first.guidance || "unlock it and choose USB: File transfer, then Rescan."
           }`,
         );
+      } else if ((otherAppeared || !silent) && otherNow.length && !devicesNow.length) {
+        const first = otherNow[0];
+        const kind = mobileKindLabel(first.os_family);
+        const dest = otherAcquireLabel(first.os_family);
+        toast.success(
+          `${first.label || kind} is connected${otherNow.length > 1 ? ` (${otherNow.length} phones)` : ""}. Open ${dest} acquisition to collect it.`,
+        );
       } else if (!silent && !devicesNow.length) {
-        toast.error(noPhoneText(fixedPlatform));
+        toast.error(
+          "No phone detected yet. Plug it in with a data cable on this PC or the office server. Unlock the screen — no extra adapter is required.",
+        );
       }
     } catch (e) {
       if (!silent) toast.error(e instanceof Error ? e.message : "Device scan failed");
@@ -1641,11 +1592,6 @@ export function MobileAcquisitionPage() {
           if (saved.scope === "packages" || saved.scope === "full") {
             importScopeRef.current = saved.scope;
             setImportScope(saved.scope);
-          }
-          if (saved.stream_id) {
-            // V1.31.14: this collection is sent to the server while it runs; show that again.
-            streamIdRef.current = saved.stream_id;
-            setStreamActive(true);
           }
         }
         const allHostJobs = await listHostAcquisitionJobs();
@@ -2083,26 +2029,7 @@ export function MobileAcquisitionPage() {
     setClientImportError("");
     setClientCollected(false);
     setClientAgentMissing(null);
-    streamIdRef.current = "";
-    streamFailedRef.current = false;
-    setStreamActive(false);
-    setStreamState(null);
-    setStreamUploader(null);
-    // V1.31.14: send the collection to the server while it runs (the helper falls back to copy-after if it cannot).
-    let streamSession: Awaited<ReturnType<typeof createClientStream>>["session"] = null;
     if (onClient) {
-      const created = await createClientStream({
-        caseId: form.case_id.trim(),
-        scope: importScope,
-        keepLocal: keepClientCopy,
-        clientHost: siteRef.current?.localComputer || "",
-      });
-      streamSession = created.session;
-      if (!streamSession) {
-        toast.info(`The image is written to ${clientRoot} first and copied to the forensic server afterwards (${created.error}).`);
-      }
-    }
-    const preflightAgent = () => {
       // Pre-flight for the copy step; the collection itself does not need either of these.
       void clientAgentStatus(1_500).then((agent) => {
         if (agent.state !== "online") {
@@ -2112,9 +2039,6 @@ export function MobileAcquisitionPage() {
           );
         }
       });
-    };
-    if (onClient) {
-      if (!streamSession) preflightAgent();
       const helper = siteRef.current?.capabilities?.office_helper;
       if (helper && (!helper.reachable || !helper.client_import)) {
         toast.error(
@@ -2195,31 +2119,7 @@ export function MobileAcquisitionPage() {
     try {
       const startOnHost = async () => {
         await startHostDriveAgentFromBrowser(15_000);
-        if (!streamSession) return startHostAcquisitionRun(startPayload);
-        const session = streamSession;
-        const first = await startHostAcquisitionRun({
-          ...startPayload,
-          ...streamStartFields(session, keepClientCopy, importScope),
-        });
-        if (first?.stream_refused) {
-          // Nothing was started: collect into the folder on this computer and copy afterwards, as before.
-          streamSession = null;
-          void dropClientStream(session.session_id);
-          toast.info(`${first.error} The image is written to ${clientRoot} and copied to the forensic server afterwards.`);
-          preflightAgent();
-          return startHostAcquisitionRun(startPayload);
-        }
-        if (first?.ok && !first.stream) {
-          // Helper older than 5.66 ignored the session: the image is copied after the collection.
-          streamSession = null;
-          void dropClientStream(session.session_id);
-          preflightAgent();
-        }
-        if (first?.ok && streamSession) {
-          streamIdRef.current = session.session_id;
-          setStreamActive(true);
-        }
-        return first;
+        return startHostAcquisitionRun(startPayload);
       };
       if (hostAttached) {
         const host = await startOnHost();
@@ -2231,11 +2131,9 @@ export function MobileAcquisitionPage() {
           );
         }
         toast.info(
-          onClient && streamIdRef.current
-            ? "Collection started on this computer. Every finished file is sent to the forensic server right away and checked there."
-            : onClient
-              ? `Collection started on this computer. The image is written to ${clientRoot} first, then copied to the forensic server.`
-              : "Collection started on this PC — Docker USB bridge is not required.",
+          onClient
+            ? `Collection started on this computer. The image is written to ${clientRoot} first, then copied to the forensic server.`
+            : "Collection started on this PC — Docker USB bridge is not required.",
         );
         persistLiveRun({
           run_id: String(host.job_id),
@@ -2245,7 +2143,6 @@ export function MobileAcquisitionPage() {
           device_id: selected.device_id,
           os_family: selected.os_family,
           ...liveExtras,
-          stream_id: streamIdRef.current || undefined,
         });
         setRun((prev) =>
           ({
@@ -2666,21 +2563,7 @@ export function MobileAcquisitionPage() {
         <p className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-emerald-800">
           <ShieldCheck className="h-4 w-4" /> Forensic server copy
         </p>
-        {where === "collect" && streamActive && (
-          <ol className="mt-1 list-decimal space-y-0.5 pl-5 text-ink-700" data-testid="client-stream-steps">
-            <li>
-              Every finished file of the collection on this computer{site?.localComputer ? ` (${site.localComputer})` : ""} is sent
-              to the forensic server{site?.serverComputer ? ` (${site.serverComputer})` : ""} right away, several files at a time, and several pieces of a large file at once.
-            </li>
-            <li>The server checks each file with SHA-256 on its own disk and never overwrites one.</li>
-            <li>
-              {keepClientCopy || importScope !== "full"
-                ? "A copy stays on this computer, as chosen."
-                : "When the server has every file, the copy on this computer is removed. A receipt stays in the case folder."}
-            </li>
-          </ol>
-        )}
-        {where === "collect" && !streamActive && (
+        {where === "collect" && (
           <ol className="mt-1 list-decimal space-y-0.5 pl-5 text-ink-700">
             <li>
               The image is created on this computer{site?.localComputer ? ` (${site.localComputer})` : ""} in{" "}
@@ -2703,8 +2586,7 @@ export function MobileAcquisitionPage() {
             </div>
             <div className="mt-2 grid gap-x-6 gap-y-1 text-xs text-ink-600 sm:grid-cols-2">
               <span>
-                {st.transport === "client_stream" ? "Sent" : "Copied"}:{" "}
-                <strong className="text-ink-800">{formatImportBytes(st.bytes_done)}</strong> of{" "}
+                Copied: <strong className="text-ink-800">{formatImportBytes(st.bytes_done)}</strong> of{" "}
                 {formatImportBytes(st.total_bytes)}
               </span>
               <span>
@@ -2715,14 +2597,7 @@ export function MobileAcquisitionPage() {
               <span className="break-all">
                 From: <span className="font-mono">{st.client_host} {st.client_case_dir}</span>
               </span>
-              <span>
-                Connection:{" "}
-                {st.transport === "relay"
-                  ? "this computer's outbound connection"
-                  : st.transport === "client_stream"
-                    ? "sent by this computer while collecting"
-                    : "office network"}
-              </span>
+              <span>Connection: {st.transport === "relay" ? "this computer's outbound connection" : "office network"}</span>
               {st.server_case_dir && (
                 <span className="break-all sm:col-span-2">
                   Server case folder: <span className="font-mono">{st.server_case_dir}</span>
@@ -2732,15 +2607,11 @@ export function MobileAcquisitionPage() {
             {importRunning && (
               <div className="mt-2">
                 <Button variant="outline" onClick={() => void stopClientCopy()}>
-                  <StopCircle className="h-4 w-4" /> {st.transport === "client_stream" ? "Stop sending" : "Stop copy"}
+                  <StopCircle className="h-4 w-4" /> Stop copy
                 </Button>
               </div>
             )}
           </>
-        ) : where === "collect" && streamActive && !clientImportError ? (
-          <p className="mt-2 text-ink-700" data-testid="client-stream-progress">
-            {streamProgressLine(streamState, streamUploader)}
-          </p>
         ) : where === "collect" && clientCollected && !clientImportError ? (
           <p className="mt-2 text-ink-700">Collection sealed on this computer. Preparing the copy to the forensic server…</p>
         ) : where === "pull" && pulling ? (
@@ -2924,24 +2795,53 @@ export function MobileAcquisitionPage() {
           </div>
         )}
 
-        {devices.length === 0 ? (
-          <div className="grid gap-1" data-testid="no-phone-connected">
-            <p className="text-sm text-ink-600">{noPhoneText(fixedPlatform)}</p>
-            {lastScanAt ? (
-              <p className="text-xs text-ink-500">
-                Checked {lastScanAt.toLocaleTimeString()}
-                {localHelper && !localHelper.outdated && !localHelper.stale
-                  ? localHelper.live
-                    ? " · this computer's USB devices read live"
-                    : " · this computer's phone list"
-                  : ""}
-                . The list follows the cable: a phone appears here within a few seconds of being plugged in and
-                unlocked, and disappears when it is unplugged.
-              </p>
-            ) : null}
-          </div>
+        {devices.length === 0 && otherDevices.length === 0 ? (
+          <p className="text-sm text-ink-500">
+            Watching for a phone on this PC and the office server. Plug it in with a data cable and
+            unlock the screen — iPhone and Android are classified automatically. No extra adapter is
+            required.
+          </p>
         ) : (
           <div className="grid gap-3">
+            {otherDevices.length > 0 && (
+              <div className="grid gap-2">
+                <p className="text-sm text-ink-600">
+                  {fixedPlatformLabel
+                    ? `A phone is connected, and it is not an ${fixedPlatformLabel} device. Open its own acquisition page so the evidence stays in the right backend.`
+                    : "A phone of another type is connected."}
+                </p>
+                {fixedPlatform === "android" && devices.length === 0 ? (
+                  <p className="text-xs text-ink-500" data-testid="android-not-detected-hint">
+                    No Android phone is detected yet. Unlock it and use a data cable, then on the phone choose USB:
+                    File transfer, or turn on USB debugging and tap Allow. Unplug the other phone if it is not part of
+                    this collection, then Rescan.
+                  </p>
+                ) : null}
+                {otherDevices.map((d) => {
+                  const kind = mobileKindLabel(d.os_family);
+                  const dest = otherAcquirePath(d.os_family);
+                  return (
+                    <button
+                      key={`other:${d.adapter}:${d.device_id}`}
+                      onClick={() => {
+                        if (dest) navigate(dest);
+                      }}
+                      className="flex items-center gap-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-left"
+                    >
+                      <Smartphone className="h-5 w-5 text-amber-700" />
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate font-medium text-ink-800">{d.label || d.device_id}</p>
+                        <p className="text-xs text-ink-500">
+                          {kind} · {mobileAttachHostLabel(d.attach_host)}
+                          {dest ? ` · Open ${otherAcquireLabel(d.os_family)} acquisition` : ""}
+                        </p>
+                      </div>
+                      <Badge tone="amber">{kind}</Badge>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
             {devices.length > 0 && (
           <div className="grid gap-2 sm:grid-cols-2">
             {devices.map((d) => {
@@ -3278,30 +3178,14 @@ export function MobileAcquisitionPage() {
                   />
                 </Field>
                 <Field
-                  label="Send to the forensic server"
-                  hint="Sent while the phone is collected, file by file. Whole run matches a collection made on the server; packages only sends less over a slow link."
+                  label="Copy to the forensic server"
+                  hint="Whole run matches a collection made on the server. Packages only sends less over a slow link."
                 >
                   <Select value={importScope} onChange={(e) => setImportScope(e.target.value as ClientImportScope)}>
                     <option value="full">Whole run (original extraction, working copy, packages, logs, hashes)</option>
                     <option value="packages">Evidence packages, logs and hashes only</option>
                   </Select>
                 </Field>
-                <label className="flex items-start gap-2 text-sm text-ink-700 sm:col-span-2" data-testid="keep-client-copy">
-                  <input
-                    type="checkbox"
-                    className="mt-1"
-                    checked={keepClientCopy || importScope !== "full"}
-                    disabled={importScope !== "full"}
-                    onChange={(e) => setKeepClientCopy(e.target.checked)}
-                  />
-                  <span>
-                    Keep a copy on this computer
-                    <span className="block text-xs text-ink-500">
-                      Off: the image is moved to the forensic server. The copy here is removed only after the server
-                      has checked every file (SHA-256); a receipt stays in the case folder.
-                    </span>
-                  </span>
-                </label>
               </>
             ) : (
               <Field label="Case root" hint="Encrypted case workspace. The run folder is created here.">
@@ -3596,9 +3480,7 @@ export function MobileAcquisitionPage() {
                 <p className="font-semibold text-ink-800">
                   {run.cancel_requested
                     ? "Stopping collection…"
-                    : clientMode && importRunning && clientImport?.transport === "client_stream"
-                      ? "Collected on this computer — sending the last files to the forensic server"
-                      : clientMode && importRunning
+                    : clientMode && importRunning
                       ? "Collected on this computer — copying the image to the forensic server"
                       : clientMode && clientCollected && clientImportError
                         ? "Collected on this computer — the copy to the forensic server did not finish"
@@ -3606,8 +3488,6 @@ export function MobileAcquisitionPage() {
                           ? "Collected on this computer — preparing the server copy"
                           : recovering
                       ? "Checking case folder for a finished collection…"
-                      : running && clientMode && streamActive
-                        ? "Collection in progress — sent to the forensic server as it runs"
                       : running
                         ? "Collection in progress"
                         : "Collection status unknown — recover if the phone backup already finished"}
@@ -3624,7 +3504,7 @@ export function MobileAcquisitionPage() {
                 disabled={recovering || importRunning}
                 onClick={() =>
                   void (clientMode
-                    ? recoverClientCopy(run.case_id || form.case_id || undefined, { manual: !streamActive })
+                    ? recoverClientCopy(run.case_id || form.case_id || undefined, { manual: true })
                     : recoverFromDisk(
                         form.case_root || undefined,
                         run.case_id || form.case_id || undefined,
@@ -3639,7 +3519,7 @@ export function MobileAcquisitionPage() {
                 }
               >
                 {clientMode ? <Laptop className="h-4 w-4" /> : <RefreshCw className="h-4 w-4" />}
-                {clientMode && streamActive ? "Check the server copy" : clientMode ? "Copy to the forensic server" : "Recover from case folder"}
+                {clientMode ? "Copy to the forensic server" : "Recover from case folder"}
               </Button>
               <Button
                 variant="outline"

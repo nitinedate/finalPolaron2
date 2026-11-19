@@ -228,9 +228,6 @@ def _mount_forensic(app: FastAPI) -> None:
         retrieval,
     )
 
-    from app.routers import document_search
-
-    app.include_router(document_search.router)
     app.include_router(jobs.router)
     app.include_router(client_evidence.router)
     app.include_router(client_evidence.agent_router)

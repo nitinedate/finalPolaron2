@@ -227,7 +227,7 @@ try {
     Assert-True (@((Read-Acq).devices).Count -eq 0) 'Nothing plugged in: no phones'
 
     $text = [IO.File]::ReadAllText($helper)
-    Assert-True ($text -match '\$script:HelperVersion = "5\.66"') 'Helper version 5.66'
+    Assert-True ($text -match '\$script:HelperVersion = "5\.64"') 'Helper version 5.64'
     Assert-True ($text -match 'if \(\$null -eq \$context\) \{ Test-MobileDeviceRefresh; continue \}' -and $text -match 'function Test-MobileDeviceRefresh') 'The request loop restarts a stopped background refresh'
     Write-Output "PASS: $script:checks device list refresh checks"
 } finally {
