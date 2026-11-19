@@ -1,0 +1,23 @@
+Polaron V1.30.0 - production HTTPS through the Caddy already running on the server
+
+New
+  tests/caddy_integration_checks.ps1         50 offline checks (Caddy and Docker mocked)
+  backend/tests/test_caddy_https_v1_30.py    4 static checks
+  RELEASE_V1_30_0_CADDY_HTTPS.md
+  CHANGED_FILES_V1_30_0.txt
+
+Changed
+  script_docker/start_docker.ps1      Get-CaddyListenerProcess, Resolve-PublicHttpsProxyMode, Resolve-CaddySetup,
+                                      Publish-CaddySite (validate + reload, restore on failure), Start-CaddyBackedGateway,
+                                      Test-CaddyServedHttps; Caddy mode wired before containers stop
+  script_docker/start_docker.lib.ps1  Get-PublicHttpsProxySetting, Get-CaddyConfigFromCommandLine, ConvertTo-CaddyVersion,
+                                      Get-CaddySiteConfig, Test-CaddyImportPresent, Add-CaddyImportLine
+  script_docker/start_docker_prod.cmd mentions the Caddy mode
+  script_docker/README.md             "Caddy already on this server" section
+  .env.example                        PUBLIC_HTTPS_PROXY, CADDY_EXE, CADDY_CONFIG, PUBLIC_HTTPS_UPSTREAM, CADDY_MANAGE_CONFIG
+  .env                                PUBLIC_HTTPS_PROXY=caddy (not in the ZIP)
+
+Written at launch on the server (outside the project)
+  <Caddyfile folder>\polaron.caddy, one "import polaron*.caddy" line in the Caddyfile, Caddyfile.polaron-backup-<time>
+
+Originals: recovery-snapshots/pre-v1.30.0-caddy-20261115/

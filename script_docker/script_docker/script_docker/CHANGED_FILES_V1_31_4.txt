@@ -1,0 +1,17 @@
+Polaron V1.31.4 - cumulative list for POLARON_V1_31_4_UPDATED_FILES.zip (V1.31.0 to V1.31.4)
+
+V1.31.4 (this update; copy onto the computer that collects the iPhone)
+  scripts/host-mobile-acquire.ps1        stall watchdog in Invoke-IosPymobileBackup (verify on disk, continue or
+                                         resume), Get-IosStallMinutes, Invoke-IosBackupVerify, -Resume plumbing,
+                                         AFC stall limit, bounded waits
+  scripts/native_ios_job.ps1             retries resume (-Resume), stall message
+  scripts/ios_usbmux_backup.py           --verify (Manifest.db + every listed file), --resume (same staging folder)
+  scripts/recover-stalled-ios-backup.ps1 one-off recovery for a collection started before this update (new)
+  backend/tests/test_ios_backup_stall_v1_31_4.py   8 tests (new)
+  tests/ios_backup_stall_checks.ps1      15 checks (new)
+  tests/ios_recover_stalled_checks.ps1   10 checks (new)
+  RELEASE_V1_31_4_IOS_BACKUP_STALL.md, CHANGED_FILES_V1_31_4.txt
+
+V1.31.3: see CHANGED_FILES_V1_31_3.txt. V1.31.0 to V1.31.2: see CHANGED_FILES_V1_31_2.txt.
+
+Not in the ZIP: .env (no change needed)

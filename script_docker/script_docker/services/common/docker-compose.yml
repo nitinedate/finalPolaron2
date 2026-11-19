@@ -1,0 +1,169 @@
+# Reusable common services for Polaron and other applications.
+# Shared PostgreSQL/pgvector, Redis, MinIO, OpenSearch, pgAdmin, MailHog.
+# Provide per-project database credentials, buckets and logical Redis databases.
+#
+#   docker compose -f services/common/docker-compose.yml --project-directory . up -d
+# The launcher creates aetheris-common before this file runs. Declaring it
+# external avoids "network exists but was not created by compose".
+name: aetheris-common
+
+networks:
+  default:
+    name: aetheris-common
+    external: true
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${COMMON_POSTGRES_USER:-forensic}
+      POSTGRES_PASSWORD: ${COMMON_POSTGRES_PASSWORD:-forensic}
+      POSTGRES_DB: ${COMMON_POSTGRES_DB:-forensic}
+    ports:
+      - "127.0.0.1:${COMMON_POSTGRES_PORT:-5434}:5432"
+    shm_size: 1g
+    command:
+      - postgres
+      - -c
+      - shared_buffers=1GB
+      - -c
+      - max_connections=200
+      - -c
+      - work_mem=8MB
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/init/01_extensions.sql:/docker-entrypoint-initdb.d/01_extensions.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB} && psql -U $${POSTGRES_USER} -d $${POSTGRES_DB} -c 'SELECT 1' >/dev/null"]
+      interval: 5s
+      timeout: 8s
+      retries: 20
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+
+  postgres-ensure:
+    image: pgvector/pgvector:pg16
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./docker/postgres/init/02_common_databases.sql:/sql/02_common_databases.sql:ro
+    entrypoint: ["sh", "-ec", "exec psql -h postgres -U $${COMMON_POSTGRES_USER:-forensic} -d $${COMMON_POSTGRES_DB:-forensic} -v ON_ERROR_STOP=1 -f /sql/02_common_databases.sql"]
+    environment:
+      COMMON_POSTGRES_USER: ${COMMON_POSTGRES_USER:-forensic}
+      COMMON_POSTGRES_DB: ${COMMON_POSTGRES_DB:-forensic}
+      PGPASSWORD: ${COMMON_POSTGRES_PASSWORD:-forensic}
+
+  pgadmin:
+    image: dpage/pgadmin4:8
+    restart: on-failure
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@forensic.example.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+      PGADMIN_CONFIG_ALLOW_SPECIAL_EMAIL_DOMAINS: "['local']"
+    ports:
+      - "127.0.0.1:${PGADMIN_PORT:-5052}:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+      - ./docker/pgadmin/servers.json:/pgadmin4/servers.json:ro
+      - ./docker/pgadmin/pgpass:/pgpass:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${COMMON_SMTP_PORT:-1025}:1025"
+      - "127.0.0.1:${COMMON_MAILHOG_UI_PORT:-8025}:8025"
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "127.0.0.1:${REDIS_HOST_PORT:-6380}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  opensearch:
+    image: opensearchproject/opensearch:2
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      plugins.security.disabled: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: ${OPENSEARCH_INITIAL_ADMIN_PASSWORD:-ForensicDev1!Change}
+      OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+    ports:
+      - "127.0.0.1:${COMMON_OPENSEARCH_PORT:-19200}:9200"
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health >/dev/null"]
+      interval: 15s
+      timeout: 10s
+      retries: 15
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+
+  # Optional, one-shot NVIDIA Docker diagnostic (not a CUDA driver container).
+  # The NVIDIA driver/runtime belongs to Windows + Docker Desktop and GPU workers
+  # request the device directly; no persistent GPU sidecar is required.
+  nvidia-gpu-check:
+    image: nvidia/cuda:12.6.3-base-ubuntu24.04
+    profiles: [gpu-check]
+    command: ["nvidia-smi", "-L"]
+    gpus: all
+    restart: "no"
+
+  minio:
+    image: ${COMMON_MINIO_IMAGE:-chainguard/minio:latest}
+    restart: unless-stopped
+    user: "0:0"
+    command: server /data --console-address ":9005"
+    environment:
+      MINIO_ROOT_USER: ${COMMON_MINIO_ROOT_USER:-${MINIO_ACCESS_KEY:-minioadmin}}
+      MINIO_ROOT_PASSWORD: ${COMMON_MINIO_ROOT_PASSWORD:-${MINIO_SECRET_KEY:-minioadmin}}
+    ports:
+      - "127.0.0.1:${COMMON_MINIO_PORT:-9004}:9000"
+      - "127.0.0.1:${COMMON_MINIO_CONSOLE_PORT:-9005}:9005"
+    volumes:
+      # Object storage grows with every disk/mobile job. Keep it on a normal
+      # host folder so DockerDesktop WSL does not absorb it. Point MINIO_DATA_DIR
+      # at a volume with tens of GB free; MinIO refuses writes once the drive
+      # crosses its minimum free-space watermark (XMinioStorageFull).
+      - type: bind
+        source: ${MINIO_DATA_DIR:-./backup/minio}
+        target: /data
+    # The hardened Chainguard image is minimal and cannot be assumed to have
+    # bash/curl/wget. Host startup probes /minio/health/live instead.
+
+volumes:
+  opensearch_data:
+    external: true
+    name: aetheris-forensic_opensearch_data
+  pgdata:
+    external: true
+    name: aetheris-forensic_pgdata
+  pgadmin_data:
+    external: true
+    name: aetheris-forensic_pgadmin_data
+  redis_data:

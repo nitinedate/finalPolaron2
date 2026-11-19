@@ -1,0 +1,14 @@
+Polaron V1.31.5 - cumulative list for POLARON_V1_31_5_UPDATED_FILES.zip (V1.31.0 to V1.31.5)
+
+V1.31.5 (this update)
+  frontend/src/pages/forensic/MobileAcquisitionPage.tsx        finished-on-this-computer state (100%, Complete) when only
+                                                               the server copy is left; packaging labelled Sealing with its
+                                                               real 90-99.5%; "Copy through this browser instead" when the
+                                                               agent is missing
+  backend/app/services/mobile_acquire/export_packages.py       readable copies part of the ZIP reports progress too
+  backend/tests/test_mobile_collection_finish_v1_31_5.py       new test
+  RELEASE_V1_31_5_MOBILE_COLLECTION_FINISH.md, CHANGED_FILES_V1_31_5.txt
+
+V1.31.4: CHANGED_FILES_V1_31_4.txt. V1.31.3: CHANGED_FILES_V1_31_3.txt. V1.31.0 to V1.31.2: CHANGED_FILES_V1_31_2.txt.
+
+Not in the ZIP: .env (no change needed)

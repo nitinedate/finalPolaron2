@@ -37,6 +37,10 @@ export type HostDriveHelperHealth = {
   root?: string;
   /** Helper 5.63+: whether the Client Evidence Agent answers on this computer (port 9877). */
   client_agent_running?: boolean;
+  /** Helper 5.66+: can send a collection to the forensic server while it runs. */
+  client_stream?: boolean;
+  /** Helper 5.66+: this computer was set up with the setup file, so it knows its server. */
+  stream_ready?: boolean;
 };
 
 export type RefreshDriveMountsResult = {
@@ -531,6 +535,9 @@ export type LocalHelperState = {
   outdated: boolean;
   /** V1.31.9: its list is older than DEVICE_LIST_STALE_MS, so its phones are not shown. */
   stale?: boolean;
+  /** V1.31.13: when this computer's list was read, and whether the helper read Windows live (5.64+). */
+  scanned_utc?: string;
+  live?: boolean;
 };
 
 async function fromLocalHelperAcquisitionDevices(timeoutMs: number): Promise<{
@@ -568,7 +575,13 @@ async function fromLocalHelperAcquisitionDevices(timeoutMs: number): Promise<{
         ? [helperVersionWarning(health) as string]
         : [...(data.warnings ?? []), ...deviceListFreshnessWarnings(data)],
       error: data.error,
-      helper: { version: String(health.helper_version || ""), outdated, stale },
+      helper: {
+        version: String(health.helper_version || ""),
+        outdated,
+        stale,
+        scanned_utc: data.scanned_utc,
+        live: (data as { source?: string }).source === "live",
+      },
     };
   } catch (e: unknown) {
     return { ok: false, devices: [], warnings: [], error: e instanceof Error ? e.message : "Host device scan failed" };
@@ -624,10 +637,25 @@ export async function getHostAcquisitionPreview<T = unknown>(
   }
 }
 
+/** V1.31.14: what the helper says about sending the collection to the forensic server. */
+export type HostRunStream = { session_id: string; uploader: boolean; keep_local: boolean };
+
+/** Helper refusals of the upload session (the collection itself was not started). */
+export const STREAM_REFUSALS = new Set(["stream_not_configured", "stream_unavailable", "stream_bad_request"]);
+
 export async function startHostAcquisitionRun(
   payload: Record<string, unknown>,
   timeoutMs = 30_000,
-): Promise<{ ok: boolean; job_id?: string; async?: boolean; error?: string; busy?: boolean } | null> {
+): Promise<{
+  ok: boolean;
+  job_id?: string;
+  async?: boolean;
+  error?: string;
+  busy?: boolean;
+  stream?: HostRunStream;
+  /** V1.31.14: set when the helper refused the upload session; nothing was started. */
+  stream_refused?: string;
+} | null> {
   const health = await hostDriveHelperHealth(2_000, { force: true });
   if (!health?.ok) return null;
   try {
@@ -644,8 +672,13 @@ export async function startHostAcquisitionRun(
       job_id?: string;
       async?: boolean;
       error?: string;
+      detail?: string;
       busy?: boolean;
+      stream?: HostRunStream;
     };
+    if (data?.ok === false && STREAM_REFUSALS.has(String(data.error || ""))) {
+      return { ok: false, stream_refused: String(data.error), error: data.detail || String(data.error) };
+    }
     if (data?.ok === false && (res.status === 409 || data.busy || isUsbCollectionBusyError(data.error))) {
       return {
         ok: false,
@@ -678,6 +711,37 @@ export async function getHostAcquisitionJob(
   } catch {
     // Do not black out polling for long — ZIP seal completion is missed if we skip ticks.
     jobPollOfflineUntilMs = Date.now() + 1_500;
+    return null;
+  }
+}
+
+/** V1.31.14: the uploader on this computer that sends a running collection to the forensic server. */
+export type HostStreamStatus = {
+  ok?: boolean;
+  state?: "starting" | "waiting" | "sending" | "finishing" | "completed" | "kept_local" | "cancelled" | string;
+  detail?: string;
+  error?: string;
+  files_sent?: number;
+  bytes_sent?: number;
+  files_seen?: number;
+  bytes_seen?: number;
+  keep_local?: boolean;
+  deleted_local?: boolean;
+  server_case_dir?: string;
+  uploader_running?: boolean;
+};
+
+export async function getHostStreamStatus(jobId: string, timeoutMs = 6_000): Promise<HostStreamStatus | null> {
+  if (!/^[0-9a-f]{32}$/.test(jobId)) return null;
+  try {
+    const res = await fetch(`${HELPER_BASE}/acquisition/stream/${jobId}`, {
+      method: "GET",
+      headers: helperHeaders(),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as HostStreamStatus;
+  } catch {
     return null;
   }
 }

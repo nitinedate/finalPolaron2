@@ -1,0 +1,26 @@
+Polaron Android/iOS Device Detection + Private Evidence Transfer
+Date: 2026-11-17
+Actual source: Polaron_WhatsApp_Chat_Ingest_Fix_20261114.zip (user Library)
+
+TESTED
+- Android and iOS model probe mocked transport responses; zero devices gives empty lists
+- Unauthorized Android identity remains limited (does not invent a model)
+- HTTPS remote transfer policy and loopback-only HTTP development
+- Transfer ticket signature, scope, expiration, platform, tenant/case controls
+- Chunk duplicate replay, invalid checksum and invalid transfers
+- Server accepts 8 MiB chunked evidence, checks complete ZIP SHA-256
+- End-to-end local HTTP upload (multi-chunk), evidence receipt, server hash and client ZIP deletion
+- React does not render portable image package paths
+- Prior mobile console platform isolation regression suite
+
+RESULT: 27 tests passed, 0 failed (targeted suite).
+Python source compilation: PASS
+TypeScript/TSX parse/transpile check: PASS for 4 touched frontend modules
+Physical Windows ADB/iPhone testing: NOT RUN (no attached USB hardware)
+Full dependency-resolution TypeScript/Vite build: NOT RUN (frontend npm dependencies not provisioned)
+Full product regression: NOT RUN; five existing legacy V24 Compose/host infrastructure checks are failing independently of these changed files.
+
+RERUN:
+cd backend && python -m pytest -q tests/test_mobile_unified_console_v26.py tests/test_mobile_secure_server_transfer_v20261117.py tests/test_mobile_device_probe_and_uploader_v20261117.py
+
+Before production deployment, also test real Android + iPhone + no device scenarios, client network interruption, Android/iOS isolated routing and downstream evidence extraction/RAG using server references.

@@ -269,7 +269,7 @@ $script:HelperComputerName = [string]$env:COMPUTERNAME
 # the same case root server-side collections use. HOST_IMPORT_CASE_ROOT overrides it.
 $script:ImportCasesRootOverride = [string]$env:HOST_IMPORT_CASE_ROOT
 $script:ImportCasesRoot = $(if ($script:ImportCasesRootOverride) { $script:ImportCasesRootOverride } else { Join-Path $root "evidence\cases" })
-$script:HelperVersion = "5.64"  # 5.64 phone lists read live from Windows on each request (no frozen list); 5.63 /health says whether the Client Evidence Agent runs; kept up to date from the server (polaron-client-update.ps1); 5.62 Android phones found by their File transfer interface; charging-only / no-driver phones listed with what to do; 5.61 phone list follows the cables during a copy (registry read) and ignores leftover copy processes; 5.60 do not kill pnputil or re-enumerate USB during a phone copy; 5.59 C# taskkill fallbacks keep `$_ (stop USB collection works)
+$script:HelperVersion = "5.66"  # 5.66 a collection on this computer is sent to the forensic server while it runs (polaron-stream-upload.ps1, destination = the server of the setup file); 5.65 the phones in /drives are live too; 5.64 phone lists read live from Windows on each request (no frozen list); 5.63 /health says whether the Client Evidence Agent runs; kept up to date from the server (polaron-client-update.ps1); 5.62 Android phones found by their File transfer interface; charging-only / no-driver phones listed with what to do; 5.61 phone list follows the cables during a copy (registry read) and ignores leftover copy processes; 5.60 do not kill pnputil or re-enumerate USB during a phone copy; 5.59 C# taskkill fallbacks keep `$_ (stop USB collection works)
 $script:DeviceCacheAt = [datetime]::MinValue
 $script:DeviceCache = @()
 $script:DeviceScanBusy = $false
@@ -3745,6 +3745,12 @@ public static class AetherisUsbLive {
   }
 
   public static string MobileJson(List<AetherisPhone> phones) {
+    string rows = MobileRowsJson(phones);
+    return "{\"ok\":true,\"mobile_devices\":" + rows + ",\"count\":" + phones.Count +
+      ",\"scanned_utc\":\"" + Now() + "\",\"source\":\"live\"}";
+  }
+
+  public static string MobileRowsJson(List<AetherisPhone> phones) {
     List<string> rows = new List<string>();
     foreach (AetherisPhone p in phones) {
       rows.Add("{\"id\":\"" + Esc(p.Id) + "\",\"name\":\"" + Esc(p.Name) + "\",\"device_class\":\"" + Esc(p.DeviceClass) +
@@ -3753,8 +3759,7 @@ public static class AetherisUsbLive {
         ",\"capability_label\":\"" + Esc(p.Capability) + "\",\"guidance\":\"" + Esc(p.Guidance) + "\",\"state\":\"" + Esc(p.State) +
         "\",\"ios_backup_roots\":[]}");
     }
-    return "{\"ok\":true,\"mobile_devices\":[" + string.Join(",", rows.ToArray()) + "],\"count\":" + rows.Count +
-      ",\"scanned_utc\":\"" + Now() + "\",\"source\":\"live\"}";
+    return "[" + string.Join(",", rows.ToArray()) + "]";
   }
 }
 
@@ -3770,6 +3775,8 @@ public class AetherisHelperDispatcher {
   public string RootPath = "";
   public string NativeMtpJobScript = "";
   public string NativeIosJobScript = "";
+  public string StreamUploadScript = "";
+  public string KitConfigPath = "";
   public string JobsDir = "";
   public string ExpectedToken = "";
   public string RefreshStatusFile = "";
@@ -3787,6 +3794,10 @@ public class AetherisHelperDispatcher {
     _thread.IsBackground = true;
     _thread.Name = "aetheris-helper-accept";
     _thread.Start();
+    Thread streams = new Thread(StreamWatchLoop);
+    streams.IsBackground = true;
+    streams.Name = "aetheris-stream-watch";
+    streams.Start();
   }
   void AcceptLoop() {
     while (!_stop && _listener != null && _listener.IsListening) {
@@ -3811,6 +3822,7 @@ public class AetherisHelperDispatcher {
                  query.IndexOf("native=", StringComparison.OrdinalIgnoreCase) >= 0) WriteNativeUsbRun(ctx, query);
         else if (method == "POST" && path == "/acquisition/cancel") WriteCancelUsb(ctx);
         else if (method == "GET" && path == "/acquisition/jobs") WriteJobList(ctx);
+        else if (method == "GET" && path.StartsWith("/acquisition/stream/", StringComparison.Ordinal)) WriteStreamStatus(ctx, path);
         else if (method == "GET" && (path == "/acquisition/job" || path.StartsWith("/acquisition/job/"))) {
           if (!WriteJobStatus(ctx, path, query)) Queue.Add(ctx);
         }
@@ -3902,7 +3914,9 @@ public class AetherisHelperDispatcher {
     string json = HealthJson ?? "{\"ok\":true}";
     try {
       int end = json.LastIndexOf('}');
-      if (end > 0) json = json.Substring(0, end) + ",\"client_agent_running\":" + (ClientAgentListening() ? "true" : "false") + "}";
+      if (end > 0) json = json.Substring(0, end) + ",\"client_agent_running\":" + (ClientAgentListening() ? "true" : "false") +
+        ",\"client_stream\":" + (!string.IsNullOrEmpty(StreamUploadScript) && File.Exists(StreamUploadScript) ? "true" : "false") +
+        ",\"stream_ready\":" + (KitServer().Length > 0 ? "true" : "false") + "}";
     } catch {}
     WriteBytes(ctx, json);
   }
@@ -4010,13 +4024,20 @@ public class AetherisHelperDispatcher {
       volumes.Add(row);
       letters.Add("\"" + letter + "\"");
     }
+    // V1.31.13: the phones in this answer are read live too (they were the background file, which could
+    // still list a phone unplugged long ago); the file is used only when Windows cannot be asked.
     string mobile = "[]";
-    try {
-      if (!string.IsNullOrEmpty(mobileJsonPath) && File.Exists(mobileJsonPath)) {
-        string raw = File.ReadAllText(mobileJsonPath).Trim();
-        if (raw.StartsWith("[")) mobile = raw;
-      }
-    } catch {}
+    bool liveOk = false;
+    List<AetherisPhone> livePhones = AetherisUsbLive.Phones(out liveOk);
+    if (liveOk) mobile = AetherisUsbLive.MobileRowsJson(livePhones);
+    else {
+      try {
+        if (!string.IsNullOrEmpty(mobileJsonPath) && File.Exists(mobileJsonPath)) {
+          string raw = File.ReadAllText(mobileJsonPath).Trim();
+          if (raw.StartsWith("[")) mobile = raw;
+        }
+      } catch {}
+    }
     return "{\"ok\":true,\"source\":\"helper_fast\",\"drives\":[" + string.Join(",", letters.ToArray()) +
       "],\"volumes\":[" + string.Join(",", volumes.ToArray()) + "],\"count\":" + volumes.Count +
       ",\"mobile_devices\":" + mobile + ",\"mobile_count\":" + CountTopLevelObjects(mobile) +
@@ -4623,6 +4644,104 @@ public class AetherisHelperDispatcher {
       return false;
     }
   }
+  // ---- V1.31.14: collection on this computer sent to the forensic server while it runs ----
+  // The destination is NOT taken from the caller (this port answers any web page): it is the server this
+  // computer was set up for with the setup file (client-kit.json). The page only supplies the session id
+  // and its one-off upload token, which that server issued for this case.
+  static readonly Regex StreamSessionRe = new Regex("^[0-9a-f]{20}\\z");
+  static readonly Regex StreamTokenRe = new Regex("^[A-Za-z0-9_-]{20,128}\\z");
+  static readonly Regex StreamServiceRe = new Regex("^[a-z-]{0,40}\\z");
+  static readonly Regex KitOriginRe = new Regex("^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?\\z");
+  readonly Dictionary<string, DateTime> _streamStarts = new Dictionary<string, DateTime>();
+  public string KitServer() {
+    try {
+      if (string.IsNullOrEmpty(KitConfigPath) || !File.Exists(KitConfigPath)) return "";
+      string server = JsonStr(File.ReadAllText(KitConfigPath), "server").Trim().TrimEnd('/');
+      return KitOriginRe.IsMatch(server) ? server : "";
+    } catch { return ""; }
+  }
+  string StreamProblem(string session, string token, string service, out string server) {
+    server = "";
+    if (!StreamSessionRe.IsMatch(session ?? "") || !StreamTokenRe.IsMatch(token ?? "") || !StreamServiceRe.IsMatch(service ?? "")) {
+      return "{\"ok\":false,\"error\":\"stream_bad_request\",\"detail\":\"The upload session from the server is not valid.\"}";
+    }
+    if (string.IsNullOrEmpty(StreamUploadScript) || !File.Exists(StreamUploadScript)) {
+      return "{\"ok\":false,\"error\":\"stream_unavailable\",\"detail\":\"This computer has no Polaron uploader yet (scripts\\\\polaron-stream-upload.ps1). Run the Polaron setup file from the server again.\"}";
+    }
+    server = KitServer();
+    if (string.IsNullOrEmpty(server)) {
+      return "{\"ok\":false,\"error\":\"stream_not_configured\",\"detail\":\"This computer was not set up with the Polaron setup file, so it does not know which server to send the image to. Download the setup file from Polaron (Set up this computer) and run it once.\"}";
+    }
+    return null;
+  }
+  public static bool StreamUploaderAlive(string stamp) {
+    try {
+      Mutex m;
+      if (Mutex.TryOpenExisting("Local\\PolaronStreamUpload_" + stamp, out m)) { m.Dispose(); return true; }
+    } catch (UnauthorizedAccessException) { return true; }
+    catch {}
+    return false;
+  }
+  bool StartStreamUploader(string stamp, string streamFile) {
+    try {
+      if (string.IsNullOrEmpty(StreamUploadScript) || !File.Exists(StreamUploadScript)) return false;
+      lock (_streamStarts) _streamStarts[stamp] = DateTime.UtcNow;
+      ProcessStartInfo psi = new ProcessStartInfo();
+      psi.FileName = "powershell.exe";
+      psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + StreamUploadScript +
+        "\" -StreamFile \"" + streamFile + "\"";
+      psi.WorkingDirectory = string.IsNullOrEmpty(RootPath) ? Path.GetTempPath() : RootPath;
+      psi.UseShellExecute = false;
+      psi.CreateNoWindow = true;
+      Process p = Process.Start(psi);
+      return p != null;
+    } catch { return false; }
+  }
+  // Restarts the uploader of an unfinished stream (computer restarted, uploader stopped). The uploader
+  // resumes from what the server already holds; it writes <job>.stream.done when it has nothing left to do.
+  void StreamWatchLoop() {
+    while (!_stop) {
+      try { ResumeStreams(); } catch {}
+      for (int i = 0; i < 30 && !_stop; i++) Thread.Sleep(1000);
+    }
+  }
+  void ResumeStreams() {
+    if (string.IsNullOrEmpty(JobsDir) || !Directory.Exists(JobsDir)) return;
+    foreach (string f in Directory.GetFiles(JobsDir, "*.stream.json")) {
+      string name = Path.GetFileName(f);
+      string stamp = name.Substring(0, name.Length - ".stream.json".Length);
+      if (!Regex.IsMatch(stamp, "^[0-9a-f]{32}\\z")) continue;
+      if (File.Exists(Path.Combine(JobsDir, stamp + ".stream.done"))) continue;
+      if ((DateTime.UtcNow - File.GetLastWriteTimeUtc(f)).TotalDays > 14) continue;
+      if (StreamUploaderAlive(stamp)) continue;
+      DateTime last;
+      lock (_streamStarts) { if (!_streamStarts.TryGetValue(stamp, out last)) last = DateTime.MinValue; }
+      if ((DateTime.UtcNow - last).TotalSeconds < 120) continue;
+      StartStreamUploader(stamp, f);
+    }
+  }
+  void WriteStreamStatus(HttpListenerContext ctx, string path) {
+    string id = path.Substring(path.LastIndexOf('/') + 1);
+    if (!Regex.IsMatch(id, "^[0-9a-f]{32}\\z") || string.IsNullOrEmpty(JobsDir)) {
+      WriteJson(ctx, 404, "{\"ok\":false,\"error\":\"unknown_job\"}");
+      return;
+    }
+    string file = Path.Combine(JobsDir, id + ".stream.status.json");
+    string json = "{\"ok\":true,\"state\":\"starting\",\"detail\":\"Starting the upload to the forensic server\"}";
+    try {
+      if (File.Exists(file)) {
+        string raw = File.ReadAllText(file);
+        if (!string.IsNullOrWhiteSpace(raw) && raw.TrimStart().StartsWith("{")) json = raw;
+      } else if (!File.Exists(Path.Combine(JobsDir, id + ".stream.json"))) {
+        json = "{\"ok\":false,\"error\":\"no_stream\",\"detail\":\"This collection is not sent to the server.\"}";
+      }
+    } catch {}
+    try {
+      int end = json.LastIndexOf('}');
+      if (end > 0) json = json.Substring(0, end) + ",\"uploader_running\":" + (StreamUploaderAlive(id) ? "true" : "false") + "}";
+    } catch {}
+    WriteBytes(ctx, json);
+  }
   void WriteNativeUsbRun(HttpListenerContext ctx, string query) {
     try {
       string body = "";
@@ -4650,6 +4769,20 @@ public class AetherisHelperDispatcher {
       if (string.IsNullOrEmpty(progressFile))
         progressFile = Path.Combine(tmp, "acq_progress_" + stamp + ".json");
       string caseId = JsonStr(body, "case_id");
+      // V1.31.14: the page asks that this collection goes to the forensic server while it runs.
+      string streamSession = JsonStr(body, "stream_session");
+      string streamToken = JsonStr(body, "stream_token");
+      string streamServer = "";
+      bool streaming = !string.IsNullOrEmpty(streamSession) || !string.IsNullOrEmpty(streamToken);
+      if (streaming) {
+        string problem = StreamProblem(streamSession, streamToken, JsonStr(body, "stream_service"), out streamServer);
+        if (problem != null) {
+          WriteJson(ctx, 409, problem);
+          return;
+        }
+        // The upload token never goes into the collector's payload file (it stays in the stream file).
+        body = body.Replace("\"" + streamToken + "\"", "\"\"");
+      }
       if (body.IndexOf("\"progress_file\"", StringComparison.OrdinalIgnoreCase) < 0 && body.TrimEnd().EndsWith("}")) {
         string trimmed = body.TrimEnd();
         body = trimmed.Substring(0, trimmed.Length - 1) + ",\"progress_file\":\"" + JsonEscape(progressFile) + "\"}";
@@ -4687,12 +4820,32 @@ public class AetherisHelperDispatcher {
         try { proc.BeginOutputReadLine(); } catch {}
         try { proc.BeginErrorReadLine(); } catch {}
       }
+      string metaFile = Path.Combine(JobsDir, stamp + ".json");
       string meta = "{\"pid\":" + pid + ",\"result_file\":\"" + JsonEscape(resultFile) +
         "\",\"progress_file\":\"" + JsonEscape(progressFile) + "\",\"err_file\":\"" + JsonEscape(errFile) +
-        "\",\"status\":\"running\",\"case_id\":\"" + JsonEscape(caseId) + "\"}";
-      File.WriteAllText(Path.Combine(JobsDir, stamp + ".json"), meta, new UTF8Encoding(false));
+        "\",\"status\":\"running\",\"case_id\":\"" + JsonEscape(caseId) + "\"" +
+        (streaming ? ",\"stream_session\":\"" + JsonEscape(streamSession) + "\"" : "") + "}";
+      File.WriteAllText(metaFile, meta, new UTF8Encoding(false));
+      string streamJson = "";
+      if (streaming) {
+        string streamFile = Path.Combine(JobsDir, stamp + ".stream.json");
+        string stream = "{\"job_id\":\"" + stamp + "\",\"session_id\":\"" + JsonEscape(streamSession) +
+          "\",\"token\":\"" + JsonEscape(streamToken) + "\",\"server\":\"" + JsonEscape(streamServer) +
+          "\",\"service\":\"" + JsonEscape(JsonStr(body, "stream_service")) +
+          "\",\"keep_local\":" + (JsonStr(body, "stream_keep_local") == "1" ? "true" : "false") +
+          ",\"scope\":\"" + (JsonStr(body, "stream_scope") == "packages" ? "packages" : "full") +
+          "\",\"platform\":\"" + (ios ? "ios" : "android") +
+          "\",\"pid\":" + pid + ",\"payload_file\":\"" + JsonEscape(payloadFile) +
+          "\",\"result_file\":\"" + JsonEscape(resultFile) + "\",\"progress_file\":\"" + JsonEscape(progressFile) +
+          "\",\"meta_file\":\"" + JsonEscape(metaFile) + "\",\"root\":\"" + JsonEscape(RootPath) +
+          "\",\"created_utc\":\"" + DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture) + "\"}";
+        File.WriteAllText(streamFile, stream, new UTF8Encoding(false));
+        bool started = StartStreamUploader(stamp, streamFile);
+        streamJson = ",\"stream\":{\"session_id\":\"" + JsonEscape(streamSession) + "\",\"uploader\":" + (started ? "true" : "false") +
+          ",\"keep_local\":" + (JsonStr(body, "stream_keep_local") == "1" ? "true" : "false") + "}";
+      }
       string json = "{\"ok\":true,\"async\":true,\"job_id\":\"" + stamp +
-        "\",\"status\":\"running\",\"busy\":true,\"via\":\"" + via + "\"}";
+        "\",\"status\":\"running\",\"busy\":true,\"via\":\"" + via + "\"" + streamJson + "}";
       byte[] bytes = Encoding.UTF8.GetBytes(json);
       HttpListenerResponse res = ctx.Response;
       res.StatusCode = 202;
@@ -4872,6 +5025,7 @@ public static class AetherisImport {
   const uint SHARE_DELETE = 4;
   const uint CREATE_ALWAYS = 2;
   const uint OPEN_EXISTING = 3;
+  const uint OPEN_ALWAYS = 4;
   const uint ATTR_READONLY = 0x1;
   const uint ATTR_DIRECTORY = 0x10;
   const uint ATTR_NORMAL = 0x80;
@@ -5115,6 +5269,7 @@ public static class AetherisImport {
       else if (path == "/acquisition/import/commit") Commit(ctx, caseDir);
       else if (path == "/acquisition/import/seal") Seal(ctx, caseDir);
       else if (path == "/acquisition/import/abort") Abort(ctx, caseDir);
+      else if (path == "/acquisition/import/discard") Discard(ctx, caseDir);
       else { Drain(ctx); Json(ctx, 404, Err("not_found", "Unknown import endpoint")); }
     } catch (ArgumentException ex) {
       Drain(ctx);
@@ -5155,59 +5310,93 @@ public static class AetherisImport {
       "],\"conflicts\":[" + conflicts.ToString() + "]}");
   }
 
+  // The body is read before the per-file lock so several pieces of one file can travel at once.
+  // A short body is refused without touching the part. Piece writes never truncate and never
+  // shrink the part: another piece may already be past this offset. Without X-Import-Piece the
+  // old rule stays: offset 0 replaces the part, any other offset must equal the part's length.
+  static byte[] ReadChunkBody(HttpListenerContext ctx, long declared, out string problem) {
+    problem = null;
+    using (MemoryStream ms = new MemoryStream()) {
+      byte[] buf = new byte[1 << 20];
+      Stream input = ctx.Request.InputStream;
+      int n;
+      long total = 0;
+      while ((n = input.Read(buf, 0, buf.Length)) > 0) {
+        total += n;
+        if (total > MaxChunkBytes) {
+          problem = "large";
+          return null;
+        }
+        ms.Write(buf, 0, n);
+      }
+      if (declared > 0 && total != declared) {
+        problem = "short";
+        return null;
+      }
+      return ms.ToArray();
+    }
+  }
+
   static void Chunk(HttpListenerContext ctx, string caseDir) {
     string[] segs = RelSegments(HeaderRel(ctx));
     long offset = HeaderLong(ctx, "X-Import-Offset", 0);
     long declared = ctx.Request.ContentLength64;
+    bool piece = string.Equals(ctx.Request.Headers["X-Import-Piece"], "1", StringComparison.Ordinal);
     if (offset < 0 || declared < 0 || declared > MaxChunkBytes) {
       Drain(ctx);
       Json(ctx, 413, Err("bad_chunk", "Chunks need a Content-Length of at most 64 MiB and a non-negative offset"));
+      return;
+    }
+    string problem;
+    byte[] payload;
+    try {
+      payload = ReadChunkBody(ctx, declared, out problem);
+    } catch (Exception ex) {
+      Json(ctx, 400, Err("short_body", ex.Message));
+      return;
+    }
+    if (problem == "large") {
+      Json(ctx, 413, Err("bad_chunk", "Chunks need a Content-Length of at most 64 MiB and a non-negative offset"));
+      return;
+    }
+    if (problem == "short" || payload == null) {
+      Json(ctx, 400, Err("short_body", "The chunk ended early; send it again"));
       return;
     }
     string full = FullPath(caseDir, segs);
     lock (LockFor(full)) {
       long finalSize = FileSize(full);
       if (finalSize >= 0) {
-        Drain(ctx);
         Json(ctx, 409, "{\"ok\":false,\"error\":\"exists\",\"size\":" + finalSize + "}");
         return;
       }
       EnsureParentDirs(caseDir, segs);
       string part = full + PartSuffix;
-      SafeFileHandle h = CreateFileW(Lp(part), GENERIC_WRITE, SHARE_READ, IntPtr.Zero, offset == 0 ? CREATE_ALWAYS : OPEN_EXISTING, ATTR_NORMAL, IntPtr.Zero);
+      uint share = piece ? (SHARE_READ | SHARE_WRITE) : SHARE_READ;
+      uint disposition = piece ? OPEN_ALWAYS : (offset == 0 ? CREATE_ALWAYS : OPEN_EXISTING);
+      SafeFileHandle h = CreateFileW(Lp(part), GENERIC_WRITE, share, IntPtr.Zero, disposition, ATTR_NORMAL, IntPtr.Zero);
       if (h.IsInvalid) {
         int err = Marshal.GetLastWin32Error();
         h.Dispose();
-        Drain(ctx);
         if (err == 2) Json(ctx, 409, "{\"ok\":false,\"error\":\"offset_mismatch\",\"size\":0}");
         else Json(ctx, 500, Err("open_failed", "Could not open " + part + " (Win32 error " + err + ")"));
         return;
       }
-      long written = 0;
       using (FileStream fs = new FileStream(h, FileAccess.Write, 1 << 20)) {
-        long current = fs.Length;
-        if (current != offset) {
-          Drain(ctx);
-          Json(ctx, 409, "{\"ok\":false,\"error\":\"offset_mismatch\",\"size\":" + current + "}");
-          return;
+        if (!piece) {
+          long current = fs.Length;
+          if (current != offset) {
+            Json(ctx, 409, "{\"ok\":false,\"error\":\"offset_mismatch\",\"size\":" + current + "}");
+            return;
+          }
+        } else if (offset > fs.Length) {
+          fs.SetLength(offset);
         }
         fs.Seek(offset, SeekOrigin.Begin);
-        byte[] buf = new byte[1 << 20];
-        Stream input = ctx.Request.InputStream;
-        int n;
-        while ((n = input.Read(buf, 0, buf.Length)) > 0) {
-          written += n;
-          if (written > MaxChunkBytes) throw new IOException("Chunk is larger than 64 MiB");
-          fs.Write(buf, 0, n);
-        }
+        if (payload.Length > 0) fs.Write(payload, 0, payload.Length);
         fs.Flush();
-        if (declared > 0 && written != declared) {
-          fs.SetLength(offset);
-          Json(ctx, 400, Err("short_body", "The chunk ended early; send it again"));
-          return;
-        }
       }
-      Json(ctx, 200, "{\"ok\":true,\"size\":" + (offset + written) + "}");
+      Json(ctx, 200, "{\"ok\":true,\"size\":" + (offset + payload.LongLength) + "}");
     }
   }
 
@@ -5277,6 +5466,29 @@ public static class AetherisImport {
   }
 
   // Body: one rel per line. Removes unverified parts left by a cancelled or failed copy.
+  // V1.31.14 body: one "<sha256>TAB<rel>" line per file. Removes a final file that a streamed upload
+  // created and must send again (it changed on the examiner computer). Only while the file is not
+  // read-only (sealed evidence is never touched) and only when its SHA-256 is still the stated one.
+  static void Discard(HttpListenerContext ctx, string caseDir) {
+    int removed = 0;
+    int kept = 0;
+    foreach (string line in Lines(ReadText(ctx))) {
+      int tab = line.IndexOf('\t');
+      if (tab != 64) throw new ArgumentException("discard lines are <sha256>TAB<rel>");
+      string sha = line.Substring(0, 64).ToLowerInvariant();
+      string full = FullPath(caseDir, RelSegments(line.Substring(65)));
+      lock (LockFor(full)) {
+        uint a = GetFileAttributesW(Lp(full));
+        if (a == INVALID_ATTRS || (a & ATTR_DIRECTORY) != 0) continue;
+        if ((a & ATTR_READONLY) != 0 || Sha256Of(full) != sha) { kept++; continue; }
+        if (DeleteFileW(Lp(full))) removed++;
+        else kept++;
+      }
+    }
+    Json(ctx, 200, "{\"ok\":" + (kept == 0 ? "true" : "false") + ",\"removed\":" + removed + ",\"kept\":" + kept +
+      (kept == 0 ? "" : ",\"error\":\"" + kept + " file(s) are sealed or changed on the server and were kept\"") + "}");
+  }
+
   static void Abort(HttpListenerContext ctx, string caseDir) {
     int removed = 0;
     foreach (string rel in Lines(ReadText(ctx))) {
@@ -5310,6 +5522,7 @@ $dispatcher.HealthJson = (@{
     malware_remediate   = $true
     computer_name       = $script:HelperComputerName
     client_import       = $true
+    client_import_discard = $true
     import_case_root    = $script:ImportCasesRoot
 } | ConvertTo-Json -Compress)
 $dispatcher.AdaptersJsonPath = $script:AdaptersCacheFile
@@ -5318,6 +5531,9 @@ $dispatcher.MobileJsonPath = $script:DeviceCacheFile
 $dispatcher.RootPath = $root
 $dispatcher.NativeMtpJobScript = Join-Path $root "scripts\native_mtp_job.ps1"
 $dispatcher.NativeIosJobScript = Join-Path $root "scripts\native_ios_job.ps1"
+# V1.31.14: collections on this computer go to the server it was set up for (client-kit.json).
+$dispatcher.StreamUploadScript = Join-Path $root "scripts\polaron-stream-upload.ps1"
+$dispatcher.KitConfigPath = Join-Path $(if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { [IO.Path]::GetTempPath() }) "Aetheris\client-kit.json"
 $dispatcher.JobsDir = Join-Path $env:TEMP "aetheris_acq_jobs"
 $dispatcher.ExpectedToken = [string]$expectedToken
 $dispatcher.RefreshStatusFile = $script:RefreshStatusFile
