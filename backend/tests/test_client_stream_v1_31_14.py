@@ -48,6 +48,7 @@ class FakeWriter:
         self.cases_root = cases_root
         self.calls: list[str] = []
         self.chunk_rels: list[str] = []
+        self.lock = threading.Lock()
         writer = self
 
         def safe(seg: str) -> bool:
@@ -94,17 +95,28 @@ class FakeWriter:
                         writer.chunk_rels.append(rel)
                         offset = int(self.headers.get("X-Import-Offset") or 0)
                         final = case_dir / rel
-                        if final.exists():
-                            return self._send(409, {"ok": False, "error": "exists", "size": final.stat().st_size})
                         part = Path(str(final) + ".polaron-part")
                         part.parent.mkdir(parents=True, exist_ok=True)
-                        if offset == 0:
-                            part.write_bytes(b"")
-                        elif not part.exists() or part.stat().st_size != offset:
-                            return self._send(409, {"ok": False, "error": "offset_mismatch", "size": part.stat().st_size if part.exists() else 0})
-                        with open(part, "ab") as fh:
-                            fh.write(body)
-                        return self._send(200, {"ok": True, "size": part.stat().st_size})
+                        piece = (self.headers.get("X-Import-Piece") or "") == "1"
+                        with writer.lock:
+                            if final.exists():
+                                return self._send(409, {"ok": False, "error": "exists", "size": final.stat().st_size})
+                            if piece:
+                                # Same rule as the helper: a piece lands at its offset and does not wipe the rest.
+                                data = part.read_bytes() if part.exists() else b""
+                                end = offset + len(body)
+                                if offset > len(data):
+                                    data = data + b"\x00" * (offset - len(data))
+                                data = data[:offset] + body + data[offset + len(body):]
+                                part.write_bytes(data)
+                                return self._send(200, {"ok": True, "size": end})
+                            if offset == 0:
+                                part.write_bytes(b"")
+                            elif not part.exists() or part.stat().st_size != offset:
+                                return self._send(409, {"ok": False, "error": "offset_mismatch", "size": part.stat().st_size if part.exists() else 0})
+                            with open(part, "ab") as fh:
+                                fh.write(body)
+                            return self._send(200, {"ok": True, "size": part.stat().st_size})
                     if self.path == "/acquisition/import/commit":
                         rel = self._rel()
                         size = int(self.headers["X-Import-Size"])
@@ -260,6 +272,17 @@ def test_chunks_commit_and_paths_are_checked(env):
     assert status == 200
     status, body = client_stream.put_chunk(sid, token, rel2, 500, b"b" * 100)
     assert status == 409 and body == {"ok": False, "error": "offset_mismatch", "size": 100}
+    # A piece may arrive out of order. The gap is filled by the earlier piece; the hash is of the whole file.
+    rel3 = f"02_Original_Extraction/{RUN}/wide.bin"
+    tail = b"B" * 1000
+    head = b"A" * 1000
+    status, body = client_stream.put_chunk(sid, token, rel3, 1000, tail, piece=True)
+    assert status == 200, body
+    status, body = client_stream.put_chunk(sid, token, rel3, 0, head, piece=True)
+    assert status == 200, body
+    blob = head + tail
+    done = client_stream.commit_file(sid, token, rel=rel3, size=len(blob), sha256=hashlib.sha256(blob).hexdigest())
+    assert done["ok"] and (env["server"] / "CASE-7" / rel3).read_bytes() == blob
     # A wrong SHA-256 is refused by the server disk check; the client sends the file again.
     with pytest.raises(client_stream.StreamError) as bad_hash:
         client_stream.commit_file(sid, token, rel=rel2, size=100, sha256="0" * 64)

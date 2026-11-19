@@ -2,7 +2,7 @@
  * V1.31.14 — a collection on this computer is sent to the forensic server while it runs.
  *
  * The page asks the server for an upload session and hands it to this computer's helper with the
- * collection. The helper's uploader sends every finished file in chunks; the server checks each file's
+ * collection. The helper's uploader sends several finished files at a time, and several pieces of a large file at once; the server checks each file's
  * SHA-256 on its own disk. When the collection ends, the server registers the run and the copy on this
  * computer is removed (unless the examiner keeps one). The page follows the session like a client copy
  * (GET /api/acquisition/client-import/<id>) and, through the helper, the uploader itself, so a refused

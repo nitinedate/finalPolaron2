@@ -8,8 +8,10 @@
   server issued for this case; the server address is the one this computer was set up for (setup file).
 
   While the collection runs, every finished file of the run (and of the iPhone backup's staging folder) is
-  sent in chunks; when the collection ends, the rest is sent and the server registers the run. The server
-  checks every file's SHA-256 on its own disk before it keeps it and never overwrites a file.
+  sent in chunks, several files at a time. A large file also sends several pieces at once, like a torrent;
+  if the server still wants those pieces in order, that file continues one piece at a time. When the
+  collection ends, the rest is sent and the server registers the run. The server checks every file's
+  SHA-256 on its own disk before it keeps it and never overwrites a file.
 
   Only after the server confirmed the whole run is the copy on this computer removed (unless the examiner
   chose to keep one). A receipt MOVED_TO_SERVER_<run>.json stays in the case folder. When the collection
@@ -24,13 +26,20 @@ param(
     [int]$StableSec = 45,
     [int]$ChunkMB = 8,
     [int]$SmallFileKB = 1024,
-    [int]$GraceSec = 45
+    [int]$GraceSec = 45,
+    # How many files (or small-file bundles) are sent at once, and how many pieces of one large file.
+    [int]$Parallel = 4
 )
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
 try { [Net.ServicePointManager]::Expect100Continue = $false } catch {}
-try { [Net.ServicePointManager]::DefaultConnectionLimit = 8 } catch {}
+$script:Parallel = [Math]::Max(1, [Math]::Min(8, $Parallel))
+$script:LogLock = New-Object System.Object
+$script:InWorker = $false
+$script:ConnLimit = [Math]::Min(16, [Math]::Max(8, $script:Parallel * $script:Parallel))
+try { [Net.ServicePointManager]::DefaultConnectionLimit = $script:ConnLimit } catch {}
+try { [Net.ServicePointManager]::UseNagleAlgorithm = $false } catch {}
 
 $StreamFile = [IO.Path]::GetFullPath($StreamFile)
 $jobsDir = Split-Path -Parent $StreamFile
@@ -66,12 +75,19 @@ $mutableNameRe = '^(?i)(Manifest\.db|Manifest\.plist|Manifest\.mbdb|Status\.plis
 $mutableSuffixRe = '(?i)(-journal|-wal|-shm|\.tmp|\.temp|\.part|\.partial|\.lock|\.crdownload|\.polaron-part|\.log)$'
 
 function Write-Log([string]$Text) {
+    $taken = $false
     try {
+        if ($script:LogLock) {
+            [System.Threading.Monitor]::Enter($script:LogLock)
+            $taken = $true
+        }
         if ((Test-Path -LiteralPath $logFile) -and (Get-Item -LiteralPath $logFile).Length -gt 4MB) {
             Move-Item -LiteralPath $logFile -Destination ($logFile + ".old") -Force
         }
         Add-Content -LiteralPath $logFile -Value ((Get-Date).ToString("yyyy-MM-dd HH:mm:ss") + "  " + $Text) -Encoding ASCII
-    } catch {}
+    } catch {} finally {
+        if ($taken) { [System.Threading.Monitor]::Exit($script:LogLock) }
+    }
 }
 
 # ---------------------------------------------------------------- single instance
@@ -147,6 +163,9 @@ function Invoke-Stream {
             $req.ContentType = $ContentType
             $req.ContentLength = $Count
             $req.AllowWriteStreamBuffering = $false
+            $limit = 8
+            try { $limit = [Math]::Min(16, [Math]::Max(8, [int]$script:Parallel * [int]$script:Parallel)) } catch {}
+            try { $req.ServicePoint.ConnectionLimit = $limit } catch {}
             $rs = $req.GetRequestStream()
             try { $rs.Write($Body, 0, $Count) } finally { $rs.Close() }
         } elseif ($Method -ne "GET") {
@@ -186,16 +205,26 @@ function Test-FatalAnswer($r) {
     $code = Get-ErrorCode $r
     if ($r.status -eq 401 -or $r.status -eq 404 -or $code -eq "cancelled" -or $code -eq "unknown_session" -or $code -eq "unauthorized" -or $code -eq "failed") {
         $why = $(if ($r.json -and $r.json.detail) { [string]$r.json.detail } else { $code })
+        $state = "kept_local"
+        $detail = "The server no longer accepts this upload. The collection stays on this computer; copy it to the server from the Polaron page."
         if ($code -eq "cancelled") {
-            Complete-Stream "cancelled" "Sending to the server was stopped by the examiner. The collection stays on this computer." $why
+            $state = "cancelled"
+            $detail = "Sending to the server was stopped by the examiner. The collection stays on this computer."
         }
-        Complete-Stream "kept_local" "The server no longer accepts this upload. The collection stays on this computer; copy it to the server from the Polaron page." $why
+        # A parallel sender reports this to the main thread. The main thread is the one that exits.
+        if ($script:InWorker) {
+            $script:StreamStop = @{ state = $state; detail = $detail; error = $why }
+            throw "stream-stop"
+        }
+        Complete-Stream $state $detail $why
     }
 }
 
 $script:Backoff = 2
 function Wait-Retry([string]$Why) {
-    Save-Status @{ detail = ("Waiting for the forensic server (" + $Why + "). Retrying in " + $script:Backoff + " s.") }
+    if (-not $script:InWorker) {
+        Save-Status @{ detail = ("Waiting for the forensic server (" + $Why + "). Retrying in " + $script:Backoff + " s.") }
+    }
     Write-Log ("Retry in " + $script:Backoff + " s: " + $Why)
     Start-Sleep -Seconds $script:Backoff
     $script:Backoff = [Math]::Min(60, $script:Backoff * 2)
@@ -439,16 +468,211 @@ function Send-Commit($f, [string]$Sha) {
 }
 
 function Send-LargeFile($f) {
+    # One piece of a large file. Turned into text and run in its own runspace, so it cannot call the
+    # functions of this sender. The bytes it sends are the bytes already hashed here.
+    $pieceScript = {
+param($Server, $SessionId, $Token, $Service, $RelHeader, [int64]$Offset, [byte[]]$Body, [int]$Count, [int]$ConnLimit)
+$status = 0
+$errText = ""
+$text = ""
+try {
+    $uri = $Server + "/api/acquisition/client-stream/" + $SessionId + "/chunk"
+    $req = [Net.HttpWebRequest]::Create($uri)
+    $req.Method = "PUT"
+    $req.Timeout = 300000
+    $req.ReadWriteTimeout = 300000
+    $req.AllowAutoRedirect = $false
+    $req.UserAgent = "PolaronStreamUpload/1.0"
+    $req.Headers.Add("X-Polaron-Stream-Token", [string]$Token)
+    if ($Service) { $req.Headers.Add("X-Aetheris-Service", [string]$Service) }
+    $req.Headers.Add("X-Stream-Rel", [string]$RelHeader)
+    $req.Headers.Add("X-Stream-Offset", [string]$Offset)
+    $req.Headers.Add("X-Stream-Piece", "1")
+    $req.ContentType = "application/octet-stream"
+    $req.ContentLength = [int]$Count
+    $req.AllowWriteStreamBuffering = $false
+    try { $req.ServicePoint.ConnectionLimit = [int]$ConnLimit } catch {}
+    $rs = $req.GetRequestStream()
+    try { $rs.Write($Body, 0, [int]$Count) } finally { $rs.Close() }
+    $resp = $null
+    try { $resp = $req.GetResponse() } catch {
+        $ex = $_.Exception
+        while ($ex -and -not ($ex -is [Net.WebException])) { $ex = $ex.InnerException }
+        if ($ex -and $ex.Response) { $resp = $ex.Response }
+        else { $errText = $_.Exception.Message }
+    }
+    if ($resp) {
+        try {
+            $status = [int]$resp.StatusCode
+            $reader = New-Object IO.StreamReader($resp.GetResponseStream(), [Text.Encoding]::UTF8)
+            $text = $reader.ReadToEnd()
+            $reader.Close()
+        } catch {
+        } finally {
+            try { $resp.Close() } catch {}
+        }
+    }
+} catch {
+    $status = 0
+    $errText = $_.Exception.Message
+}
+Write-Output ("PS:" + $status)
+Write-Output ("PE:" + (($errText + "") -replace '[\r\n]', ' '))
+Write-Output ("PB:" + $text)
+    }
+    $pieceText = $pieceScript.ToString()
+    $script:LastCommit = $null
     $sha = [Security.Cryptography.SHA256]::Create()
     $fs = [IO.File]::Open($f.full, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+    $pool = $null
+    $flight = $null
     try {
         $buf = New-Object byte[] $chunkBytes
         $offset = [int64]0
+        $fileSize = [int64]$f.size
         $relHeader = Get-RelHeader $f.rel
         $existsOnServer = $false
-        while ($offset -lt $f.size) {
+        # hashed = how far TransformBlock has already covered. A piece is hashed when it is read,
+        # before it is acknowledged, so a retry of that range must not hash it again.
+        $prog = @{ readAt = [int64]0; hashed = [int64]0; acked = [int64]0; exists = $false; fallback = $false; changed = $false; error = "" }
+        $window = 1
+        if ([int]$script:Parallel -gt 1 -and $fileSize -gt [int64]$chunkBytes) { $window = [int]$script:Parallel }
+        if ($window -gt 1) {
+            try {
+                $pool = [runspacefactory]::CreateRunspacePool(1, $window)
+                $pool.Open()
+            } catch {
+                $window = 1
+                $pool = $null
+            }
+        }
+        if ($window -gt 1) {
+            $connLimit = 8
+            try { $connLimit = [Math]::Min(16, [Math]::Max(8, [int]$script:Parallel * [int]$script:Parallel)) } catch {}
+            $flight = New-Object System.Collections.Generic.List[object]
+            $ranges = New-Object System.Collections.Generic.List[object]
+            while ($flight.Count -gt 0 -or (([int64]$prog.readAt -lt $fileSize) -and -not $prog.fallback -and -not $prog.exists -and -not $prog.changed -and -not $prog.error)) {
+                while ($flight.Count -lt $window -and ([int64]$prog.readAt -lt $fileSize) -and -not $prog.fallback -and -not $prog.exists -and -not $prog.changed -and -not $prog.error) {
+                    $at = [int64]$prog.readAt
+                    $want = [int][Math]::Min([int64]$chunkBytes, $fileSize - $at)
+                    $piece = New-Object byte[] $want
+                    $fs.Position = $at
+                    $n = 0
+                    while ($n -lt $want) {
+                        $got = $fs.Read($piece, $n, $want - $n)
+                        if ($got -le 0) { break }
+                        $n += $got
+                    }
+                    if ($n -ne $want) { $prog.changed = $true; break }
+                    if ($at -eq [int64]$prog.hashed) {
+                        [void]$sha.TransformBlock($piece, 0, $n, $null, 0)
+                        $prog.hashed = $at + [int64]$n
+                    }
+                    $prog.readAt = $at + [int64]$n
+                    $ps = [powershell]::Create()
+                    $ps.RunspacePool = $pool
+                    [void]$ps.AddScript($pieceText).AddArgument($script:Server).AddArgument($script:SessionId).AddArgument($script:Token).AddArgument([string]$script:Service).AddArgument($relHeader).AddArgument($at).AddArgument($piece).AddArgument($n).AddArgument($connLimit)
+                    $handle = $ps.BeginInvoke()
+                    $flight.Add(@{ ps = $ps; handle = $handle; offset = $at; n = $n; piece = $piece; tries = 0 })
+                }
+                if ($flight.Count -eq 0) { break }
+                $wait = New-Object System.Threading.WaitHandle[] $flight.Count
+                for ($i = 0; $i -lt $flight.Count; $i++) { $wait[$i] = $flight[$i].handle.AsyncWaitHandle }
+                [void][System.Threading.WaitHandle]::WaitAny($wait)
+                for ($i = $flight.Count - 1; $i -ge 0; $i--) {
+                    if (-not $flight[$i].handle.IsCompleted) { continue }
+                    $slot = $flight[$i]
+                    $flight.RemoveAt($i)
+                    $raw = $null
+                    try { $raw = $slot.ps.EndInvoke($slot.handle) } catch { $raw = @("PS:0", ("PE:" + $_.Exception.Message), "PB:") }
+                    try { $slot.ps.Dispose() } catch {}
+                    $status = 0
+                    $errText = ""
+                    $bodyText = ""
+                    foreach ($item in @($raw)) {
+                        $line = [string]$item
+                        if ($line.StartsWith("PS:")) { try { $status = [int]$line.Substring(3) } catch { $status = 0 } }
+                        elseif ($line.StartsWith("PE:")) { $errText = $line.Substring(3) }
+                        elseif ($line.StartsWith("PB:")) { $bodyText = $line.Substring(3) }
+                    }
+                    $json = $null
+                    if ($bodyText -and $bodyText.TrimStart().StartsWith("{")) { try { $json = $bodyText | ConvertFrom-Json } catch {} }
+                    $r = @{ status = $status; json = $json; text = $bodyText; error = $errText }
+                    if ($r.status -eq 200) {
+                        $start = [int64]$slot.offset
+                        $end = $start + [int64]$slot.n
+                        $merged = $false
+                        for ($ri = 0; $ri -lt $ranges.Count; $ri++) {
+                            $rg = $ranges[$ri]
+                            if ($end -lt [int64]$rg.start -or $start -gt [int64]$rg.end) { continue }
+                            if ($start -lt [int64]$rg.start) { $rg.start = $start }
+                            if ($end -gt [int64]$rg.end) { $rg.end = $end }
+                            $merged = $true
+                            break
+                        }
+                        if (-not $merged) { $ranges.Add(@{ start = $start; end = $end }) }
+                        $folded = $true
+                        while ($folded) {
+                            $folded = $false
+                            for ($a = 0; $a -lt $ranges.Count; $a++) {
+                                for ($b = $a + 1; $b -lt $ranges.Count; $b++) {
+                                    $left = $ranges[$a]
+                                    $right = $ranges[$b]
+                                    if ([int64]$right.end -lt [int64]$left.start -or [int64]$right.start -gt [int64]$left.end) { continue }
+                                    if ([int64]$right.start -lt [int64]$left.start) { $left.start = [int64]$right.start }
+                                    if ([int64]$right.end -gt [int64]$left.end) { $left.end = [int64]$right.end }
+                                    $ranges.RemoveAt($b)
+                                    $folded = $true
+                                    break
+                                }
+                                if ($folded) { break }
+                            }
+                        }
+                        $cursor = [int64]0
+                        foreach ($rg in $ranges) {
+                            if ([int64]$rg.start -le $cursor -and [int64]$rg.end -gt $cursor) { $cursor = [int64]$rg.end }
+                        }
+                        $prog.acked = $cursor
+                        Reset-Backoff
+                        if (-not $script:InWorker) {
+                            Save-Status @{ state = "sending"; detail = ("Sending " + $f.name + " (" + [Math]::Round(100.0 * [double]$prog.acked / [Math]::Max(1.0, [double]$fileSize)) + "%)") }
+                        }
+                        continue
+                    }
+                    Test-FatalAnswer $r
+                    $code = Get-ErrorCode $r
+                    if ($r.status -eq 409 -and $code -eq "exists") { $prog.exists = $true; continue }
+                    if ($r.status -eq 409 -and $code -eq "offset_mismatch") { $prog.fallback = $true; continue }
+                    if ($r.status -ge 400 -and $r.status -lt 500 -and $r.status -ne 408 -and $r.status -ne 429) {
+                        $prog.error = "error:" + $code
+                        continue
+                    }
+                    if ($prog.fallback -or $prog.exists -or $prog.changed -or $prog.error) { continue }
+                    $slot.tries = [int]$slot.tries + 1
+                    Wait-Retry $(if ($code) { $code } else { "unreachable" })
+                    $again = [powershell]::Create()
+                    $again.RunspacePool = $pool
+                    [void]$again.AddScript($pieceText).AddArgument($script:Server).AddArgument($script:SessionId).AddArgument($script:Token).AddArgument([string]$script:Service).AddArgument($relHeader).AddArgument([int64]$slot.offset).AddArgument($slot.piece).AddArgument([int]$slot.n).AddArgument($connLimit)
+                    $flight.Add(@{ ps = $again; handle = $again.BeginInvoke(); offset = [int64]$slot.offset; n = [int]$slot.n; piece = $slot.piece; tries = [int]$slot.tries })
+                }
+            }
+            if ($prog.changed) { return "changed" }
+            if ($prog.error) { return [string]$prog.error }
+            if ($prog.exists) {
+                $existsOnServer = $true
+                $offset = $fileSize
+            } elseif ([int64]$prog.acked -ge $fileSize) {
+                $offset = $fileSize
+            } else {
+                $offset = [int64]$prog.acked
+                if ($offset -lt $fileSize) {
+                    Write-Log ("This server keeps " + $f.name + " in order; the rest of that file is sent one piece at a time")
+                }
+            }
+        }
+        while ($offset -lt $fileSize -and -not $existsOnServer) {
             $fs.Position = $offset
-            $want = [int][Math]::Min([int64]$chunkBytes, $f.size - $offset)
+            $want = [int][Math]::Min([int64]$chunkBytes, $fileSize - $offset)
             $n = 0
             while ($n -lt $want) {
                 $got = $fs.Read($buf, $n, $want - $n)
@@ -459,10 +683,19 @@ function Send-LargeFile($f) {
             $r = Invoke-Stream -Method PUT -Path "/chunk" -Body $buf -Count $n -ContentType "application/octet-stream" `
                 -Headers @{ "X-Stream-Rel" = $relHeader; "X-Stream-Offset" = [string]$offset }
             if ($r.status -eq 200) {
-                [void]$sha.TransformBlock($buf, 0, $n, $null, 0)
-                $offset += $n
+                if ($offset -ge [int64]$prog.hashed) {
+                    [void]$sha.TransformBlock($buf, 0, $n, $null, 0)
+                    $prog.hashed = $offset + [int64]$n
+                } elseif (($offset + [int64]$n) -gt [int64]$prog.hashed) {
+                    $skip = [int]([int64]$prog.hashed - $offset)
+                    [void]$sha.TransformBlock($buf, $skip, $n - $skip, $null, 0)
+                    $prog.hashed = $offset + [int64]$n
+                }
+                $offset += [int64]$n
                 Reset-Backoff
-                Save-Status @{ state = "sending"; detail = ("Sending " + $f.name + " (" + [Math]::Round(100.0 * $offset / [Math]::Max(1, $f.size)) + "%)") }
+                if (-not $script:InWorker) {
+                    Save-Status @{ state = "sending"; detail = ("Sending " + $f.name + " (" + [Math]::Round(100.0 * [double]$offset / [Math]::Max(1.0, [double]$fileSize)) + "%)") }
+                }
                 continue
             }
             Test-FatalAnswer $r
@@ -470,19 +703,24 @@ function Send-LargeFile($f) {
             if ($r.status -eq 409 -and $code -eq "exists") { $existsOnServer = $true; break }
             if ($r.status -eq 409 -and $code -eq "offset_mismatch") {
                 $have = [int64]$(if ($r.json -and $r.json.size) { $r.json.size } else { 0 })
-                if ($have -gt $offset -and $have -le $f.size) {
-                    # An earlier attempt already sent up to $have: hash that part here instead of sending it again.
-                    $fs.Position = $offset
-                    while ($offset -lt $have) {
-                        $want = [int][Math]::Min([int64]$chunkBytes, $have - $offset)
-                        $got = $fs.Read($buf, 0, $want)
-                        if ($got -le 0) { return "changed" }
-                        [void]$sha.TransformBlock($buf, 0, $got, $null, 0)
-                        $offset += $got
+                if ($have -gt $offset -and $have -le $fileSize) {
+                    # An earlier attempt already sent up to $have: hash only the part not hashed yet.
+                    if ($have -gt [int64]$prog.hashed) {
+                        $fs.Position = [int64]$prog.hashed
+                        while ([int64]$prog.hashed -lt $have) {
+                            $gap = [int][Math]::Min([int64]$chunkBytes, $have - [int64]$prog.hashed)
+                            $got = $fs.Read($buf, 0, $gap)
+                            if ($got -le 0) { return "changed" }
+                            [void]$sha.TransformBlock($buf, 0, $got, $null, 0)
+                            $prog.hashed = [int64]$prog.hashed + [int64]$got
+                        }
                     }
+                    $offset = $have
                 } else {
-                    $sha.Dispose()
-                    $sha = [Security.Cryptography.SHA256]::Create()
+                    if ([int64]$prog.hashed -eq 0) {
+                        $sha.Dispose()
+                        $sha = [Security.Cryptography.SHA256]::Create()
+                    }
                     $offset = 0
                 }
                 continue
@@ -491,22 +729,36 @@ function Send-LargeFile($f) {
             Wait-Retry $code
         }
         if ($existsOnServer) {
-            $fs.Position = $offset
+            $fs.Position = [int64]$prog.hashed
             while ($true) {
                 $got = $fs.Read($buf, 0, $buf.Length)
                 if ($got -le 0) { break }
                 [void]$sha.TransformBlock($buf, 0, $got, $null, 0)
+                $prog.hashed = [int64]$prog.hashed + [int64]$got
             }
         }
         [void]$sha.TransformFinalBlock((New-Object byte[] 0), 0, 0)
         $hex = (([BitConverter]::ToString($sha.Hash)) -replace '-', '').ToLowerInvariant()
     } finally {
+        if ($flight) {
+            foreach ($slot in @($flight)) {
+                try { $slot.ps.Stop() } catch {}
+                try { $slot.ps.Dispose() } catch {}
+            }
+        }
+        if ($pool) {
+            try { $pool.Close() } catch {}
+            try { $pool.Dispose() } catch {}
+        }
         $fs.Dispose()
         $sha.Dispose()
     }
     if (-not (Test-SameStat $f)) { return "changed" }
     $c = Send-Commit $f $hex
-    if ($c -eq "ok") { Add-Ledger $f.rel $f.size $f.ticks $hex }
+    if ($c -eq "ok") {
+        $script:LastCommit = @{ rel = [string]$f.rel; size = [int64]$f.size; ticks = [int64]$f.ticks; sha = $hex }
+        if (-not $script:InWorker) { Add-Ledger $f.rel $f.size $f.ticks $hex }
+    }
     return $c
 }
 
@@ -540,6 +792,8 @@ function Send-Bundle {
         $code = Get-ErrorCode $r
         if ($r.status -ge 400 -and $r.status -lt 500 -and $r.status -ne 408 -and $r.status -ne 429 -and $code -ne "short_body") {
             Write-Log ("The server refused a group of small files: " + $code)
+            $script:LastBundle = New-Object System.Collections.Generic.List[object]
+            foreach ($it in $items) { $script:LastBundle.Add(@{ rel = [string]$it.f.rel; outcome = "retry"; error = $code }) }
             return
         }
         Wait-Retry $code
@@ -547,13 +801,24 @@ function Send-Bundle {
     Reset-Backoff
     $byRel = @{}
     foreach ($res in @($r.json.results)) { $byRel[[string]$res.rel] = $res }
+    $script:LastBundle = New-Object System.Collections.Generic.List[object]
     foreach ($it in $items) {
         $res = $byRel[$it.f.rel]
-        if ($res -and $res.ok) { Add-Ledger $it.f.rel $it.f.size $it.f.ticks $it.sha }
-        elseif ($res -and $res.error -eq "conflict") { $conflicts[$it.f.rel] = "A different file with this name is already on the server" }
-        else { Write-Log ("Will send again: " + $it.f.rel + " (" + $(if ($res) { $res.error } else { "no answer" }) + ")") }
+        if ($res -and $res.ok) {
+            $script:LastBundle.Add(@{ rel = [string]$it.f.rel; size = [int64]$it.f.size; ticks = [int64]$it.f.ticks; sha = [string]$it.sha; outcome = "ok" })
+            if (-not $script:InWorker) { Add-Ledger $it.f.rel $it.f.size $it.f.ticks $it.sha }
+        } elseif ($res -and $res.error -eq "conflict") {
+            $script:LastBundle.Add(@{ rel = [string]$it.f.rel; outcome = "conflict" })
+            if (-not $script:InWorker) { $conflicts[$it.f.rel] = "A different file with this name is already on the server" }
+        } else {
+            $err = $(if ($res) { [string]$res.error } else { "no answer" })
+            $script:LastBundle.Add(@{ rel = [string]$it.f.rel; outcome = "retry"; error = $err })
+            if (-not $script:InWorker) { Write-Log ("Will send again: " + $it.f.rel + " (" + $err + ")") }
+        }
     }
-    Save-Status @{ state = "sending"; detail = ("" + $uploaded.Count + " file(s) verified on the forensic server") }
+    if (-not $script:InWorker) {
+        Save-Status @{ state = "sending"; detail = ("" + $uploaded.Count + " file(s) verified on the forensic server") }
+    }
 }
 
 function Add-ToBundle($f) {
@@ -575,16 +840,169 @@ function Add-ToBundle($f) {
     $h.Dispose()
     $script:Bundle.Add(@{ f = $f; data = $data; sha = $sha })
     $script:BundleBytes += $f.size
-    if ($script:Bundle.Count -ge 500 -or $script:BundleBytes -ge 16MB) { Send-Bundle }
     return $true
 }
 
+# The sender functions above run inside one runspace per file (or per bundle of small files). Their
+# source is copied into that runspace so each send has its own HTTP calls; the ledger stays on this thread.
+$script:UploadWorkerTail = @'
+$script:InWorker = $true
+$script:Server = [string]$Ctx.Server
+$script:SessionId = [string]$Ctx.SessionId
+$script:Token = [string]$Ctx.Token
+$script:Service = [string]$Ctx.Service
+$script:Backoff = 2
+$script:LogLock = $Ctx.LogLock
+$script:Parallel = [int]$Ctx.Parallel
+$script:SeenFiles = [int]$Ctx.SeenFiles
+$script:SeenBytes = [int64]$Ctx.SeenBytes
+$script:StreamStop = $null
+$script:LastCommit = $null
+$script:LastBundle = New-Object System.Collections.Generic.List[object]
+$script:Bundle = New-Object System.Collections.Generic.List[object]
+$script:BundleBytes = [int64]0
+Set-Variable -Name chunkBytes -Scope Script -Value ([int64]$Ctx.ChunkBytes)
+Set-Variable -Name logFile -Scope Script -Value ([string]$Ctx.LogFile)
+try {
+    if ($Work.kind -eq "bundle") {
+        foreach ($f in @($Work.files)) { [void](Add-ToBundle $f) }
+        Send-Bundle
+        $n = 0
+        if ($script:LastBundle) { $n = $script:LastBundle.Count }
+        $items = New-Object object[] $n
+        for ($i = 0; $i -lt $n; $i++) { $items[$i] = $script:LastBundle[$i] }
+        return @{ kind = "bundle"; items = $items; fatal = $false }
+    }
+    $code = [string](Send-LargeFile $Work.file)
+    return @{ kind = "large"; rel = [string]$Work.file.rel; outcome = $code; commit = $script:LastCommit; fatal = $false }
+} catch {
+    try { Write-Log ("Upload worker failed: " + $_.Exception.Message + " | " + $_.InvocationInfo.PositionMessage.Trim() + " | " + $_.ScriptStackTrace) } catch {}
+    if ($script:StreamStop) { return @{ fatal = $true; stop = $script:StreamStop } }
+    $rel = ""
+    if ($Work.kind -eq "large" -and $Work.file) { $rel = [string]$Work.file.rel }
+    return @{ kind = [string]$Work.kind; rel = $rel; outcome = ("error:" + $_.Exception.Message); fatal = $false; items = @() }
+}
+'@
+
+function Get-UploadWorkerSource {
+    if ($script:UploadWorkerSource) { return $script:UploadWorkerSource }
+    $names = @(
+        "ConvertTo-JsonText", "Invoke-Stream", "Get-ErrorCode", "Test-FatalAnswer", "Wait-Retry", "Reset-Backoff",
+        "Write-Log", "Get-RelHeader", "Save-Status", "Send-Commit", "Test-SameStat", "Send-LargeFile", "Send-Bundle", "Add-ToBundle"
+    )
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append("param(`$Ctx, `$Work)`r`n")
+    foreach ($name in $names) {
+        [void]$sb.Append("function $name {`r`n")
+        [void]$sb.Append((Get-Command $name -CommandType Function).Definition)
+        [void]$sb.Append("`r`n}`r`n")
+    }
+    [void]$sb.Append($script:UploadWorkerTail)
+    $script:UploadWorkerSource = $sb.ToString()
+    return $script:UploadWorkerSource
+}
+
+function Apply-UploadResult($Result) {
+    if (-not $Result) { return 0 }
+    if ($Result.fatal) {
+        foreach ($other in @($script:UploadInFlight)) {
+            try { $other.ps.Stop() } catch {}
+            try { $other.ps.Dispose() } catch {}
+        }
+        $script:UploadInFlight = @()
+        $stop = $Result.stop
+        $state = $(if ($stop -and $stop.state) { [string]$stop.state } else { "kept_local" })
+        $detail = $(if ($stop -and $stop.detail) { [string]$stop.detail } else { "The server no longer accepts this upload. The collection stays on this computer." })
+        $err = $(if ($stop) { [string]$stop.error } else { "" })
+        Complete-Stream $state $detail $err
+    }
+    $n = 0
+    if ($Result.kind -eq "large") {
+        if ($Result.outcome -eq "ok" -and $Result.commit) {
+            $c = $Result.commit
+            Add-Ledger $c.rel $c.size $c.ticks $c.sha
+            $n = 1
+        } elseif ($Result.outcome -eq "conflict") {
+            $conflicts[$Result.rel] = "A different file with this name is already on the server"
+        } elseif ($Result.outcome -eq "changed" -or $Result.outcome -eq "resend") {
+            $stableSince.Remove($Result.rel)
+        } elseif ($Result.outcome) {
+            Write-Log ("Not sent this time: " + $Result.rel + " (" + $Result.outcome + ")")
+        }
+        return $n
+    }
+    if ($Result.kind -eq "bundle") {
+        foreach ($it in @($Result.items)) {
+            if ($it.outcome -eq "ok") {
+                Add-Ledger $it.rel $it.size $it.ticks $it.sha
+                $n++
+            } elseif ($it.outcome -eq "conflict") {
+                $conflicts[$it.rel] = "A different file with this name is already on the server"
+            } elseif ($it.outcome -eq "retry") {
+                Write-Log ("Will send again: " + $it.rel + " (" + $(if ($it.error) { $it.error } else { "no answer" }) + ")")
+            }
+        }
+    }
+    return $n
+}
+
+function Invoke-ParallelUploads($Queue) {
+    if (-not $Queue -or $Queue.Count -eq 0) { return 0 }
+    $source = Get-UploadWorkerSource
+    if (-not $script:UploadPool) {
+        $script:UploadPool = [runspacefactory]::CreateRunspacePool(1, $script:Parallel)
+        $script:UploadPool.Open()
+    }
+    $ctx = @{
+        Server = $script:Server; SessionId = $script:SessionId; Token = $script:Token; Service = $script:Service
+        ChunkBytes = $chunkBytes; LogFile = $logFile; LogLock = $script:LogLock; Parallel = $script:Parallel
+        SeenFiles = $script:SeenFiles; SeenBytes = $script:SeenBytes
+    }
+    $script:UploadInFlight = New-Object System.Collections.Generic.List[object]
+    $next = 0
+    $sent = 0
+    $total = $Queue.Count
+    while ($next -lt $total -or $script:UploadInFlight.Count -gt 0) {
+        while ($script:UploadInFlight.Count -lt $script:Parallel -and $next -lt $total) {
+            $work = $Queue[$next]
+            $next++
+            $ps = [powershell]::Create()
+            $ps.RunspacePool = $script:UploadPool
+            [void]$ps.AddScript($source).AddArgument($ctx).AddArgument($work)
+            $handle = $ps.BeginInvoke()
+            $script:UploadInFlight.Add(@{ ps = $ps; handle = $handle })
+        }
+        if ($script:UploadInFlight.Count -eq 0) { break }
+        $wait = New-Object System.Threading.WaitHandle[] $script:UploadInFlight.Count
+        for ($i = 0; $i -lt $script:UploadInFlight.Count; $i++) { $wait[$i] = $script:UploadInFlight[$i].handle.AsyncWaitHandle }
+        [void][System.Threading.WaitHandle]::WaitAny($wait)
+        for ($i = $script:UploadInFlight.Count - 1; $i -ge 0; $i--) {
+            if (-not $script:UploadInFlight[$i].handle.IsCompleted) { continue }
+            $slot = $script:UploadInFlight[$i]
+            $script:UploadInFlight.RemoveAt($i)
+            $out = $null
+            try { $out = $slot.ps.EndInvoke($slot.handle) } catch { Write-Log ("Upload task failed: " + $_.Exception.Message) }
+            try { $slot.ps.Dispose() } catch {}
+            $result = $null
+            foreach ($item in @($out)) {
+                if ($item -and ($item.fatal -or $item.kind)) { $result = $item }
+            }
+            if ($result) { $sent += Apply-UploadResult $result }
+        }
+        Save-Status @{ state = "sending"; files_sent = $uploaded.Count; detail = ("" + $uploaded.Count + " file(s) verified on the forensic server") }
+    }
+    $script:UploadInFlight = @()
+    return $sent
+}
+
 # Sends what is ready. While the collection runs, only files that have not changed for $StableSec and that
-# the collector does not rewrite; once it has ended, everything.
+# the collector does not rewrite; once it has ended, everything. Ready files are sent $Parallel at a time.
 function Send-Ready([bool]$Running) {
     $files = Get-LocalFiles $Running
     $now = [DateTime]::UtcNow
-    $sent = 0
+    $queue = New-Object System.Collections.Generic.List[object]
+    $bundle = New-Object System.Collections.Generic.List[object]
+    $bundleBytes = [int64]0
     foreach ($rel in @($files.Keys)) {
         $f = $files[$rel]
         if ($conflicts.ContainsKey($rel)) { continue }
@@ -616,18 +1034,28 @@ function Send-Ready([bool]$Running) {
             }
             if (-not (Remove-ServerCopy $rel)) { $conflicts[$rel] = "A different file with this name is already on the server"; continue }
         }
+        $item = @{ rel = [string]$f.rel; full = [string]$f.full; name = [string]$f.name; size = [int64]$f.size; ticks = [int64]$f.ticks }
         if ($f.size -le $smallBytes) {
-            if (Add-ToBundle $f) { $sent++ }
+            $bundle.Add($item)
+            $bundleBytes += $f.size
+            if ($bundle.Count -ge 500 -or $bundleBytes -ge 16MB) {
+                $queue.Add(@{ kind = "bundle"; files = @($bundle.ToArray()) })
+                $bundle.Clear()
+                $bundleBytes = [int64]0
+            }
             continue
         }
-        Send-Bundle
-        $res = Send-LargeFile $f
-        if ($res -eq "ok") { $sent++ }
-        elseif ($res -eq "conflict") { $conflicts[$rel] = "A different file with this name is already on the server" }
-        elseif ($res -eq "changed" -or $res -eq "resend") { $stableSince.Remove($rel) }
-        else { Write-Log ("Not sent this time: " + $rel + " (" + $res + ")") }
+        if ($bundle.Count -gt 0) {
+            $queue.Add(@{ kind = "bundle"; files = @($bundle.ToArray()) })
+            $bundle.Clear()
+            $bundleBytes = [int64]0
+        }
+        $queue.Add(@{ kind = "large"; file = $item })
     }
-    Send-Bundle
+    if ($bundle.Count -gt 0) {
+        $queue.Add(@{ kind = "bundle"; files = @($bundle.ToArray()) })
+    }
+    $sent = Invoke-ParallelUploads $queue
     Save-Status @{ files_seen = $script:SeenFiles; bytes_seen = $script:SeenBytes; files_sent = $uploaded.Count }
     return $sent
 }
@@ -735,7 +1163,7 @@ function Remove-LocalRun($Files, [string]$ServerCaseDir, [string]$HashList, [str
 }
 
 # ---------------------------------------------------------------- main
-Write-Log ("Upload of collection job " + $job + " to " + $script:Server + " (session " + $script:SessionId + ", keep local copy: " + $keepLocal + ")")
+Write-Log ("Upload of collection job " + $job + " to " + $script:Server + " (session " + $script:SessionId + ", keep local copy: " + $keepLocal + ", " + $script:Parallel + " files at a time, " + $script:Parallel + " pieces of a large file at a time)")
 if (-not $script:Server -or -not $script:SessionId -or -not $script:Token) {
     Complete-Stream "kept_local" "The upload session is incomplete; the collection stays on this computer." "stream file incomplete"
 }

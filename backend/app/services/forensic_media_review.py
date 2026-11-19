@@ -630,12 +630,15 @@ def media_review_workers() -> int:
     MEDIA_REVIEW_WORKERS overrides. Each Tesseract call is held to one OpenMP
     thread so N workers use about N cores instead of oversubscribing them.
     """
+    from app.services.cpu_budget import effective_cpu_count, target_parallel_cores
+
+    budget = target_parallel_cores(effective_cpu_count())
     raw = str(os.environ.get("MEDIA_REVIEW_WORKERS") or "").strip()
     if raw.isdigit() and int(raw) > 0:
-        return min(int(raw), 16)
+        return max(1, min(int(raw), 16, budget))
     # Leave a couple of cores for the database and the shard reader.
-    cpus = os.cpu_count() or 8
-    return max(1, min(16, cpus - 2))
+    cpus = effective_cpu_count()
+    return max(1, min(16, cpus - 2, budget))
 
 
 _PROGRESS_EVERY_FILES = 50

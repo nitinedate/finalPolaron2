@@ -83,6 +83,7 @@ services:
       - gvm_psql_socket:/var/run/postgresql
 
   pg-gvm:
+    cpus: "${SCANNER_CPU_POSTGRES_CPUS:-0.5}"
     image: registry.community.greenbone.net/community/pg-gvm:stable
     restart: on-failure
     volumes:
@@ -110,6 +111,7 @@ services:
         condition: service_started
 
   gvmd:
+    cpus: "${SCANNER_CPU_GVMD_CPUS:-0.65}"
     image: registry.community.greenbone.net/community/gvmd:stable
     restart: on-failure
     volumes:
@@ -152,7 +154,7 @@ services:
     image: registry.community.greenbone.net/community/openvas-scanner:stable
     environment:
       GVM_MAX_HOSTS: ${GVM_MAX_HOSTS:-1}
-      GVM_MAX_CHECKS: ${GVM_MAX_CHECKS:-8}
+      GVM_MAX_CHECKS: ${GVM_MAX_CHECKS:-4}
       GVM_OPTIMIZE_TEST: ${GVM_OPTIMIZE_TEST:-no}
       GVM_CHECKS_READ_TIMEOUT: ${GVM_CHECKS_READ_TIMEOUT:-10}
       GVM_TIMEOUT_RETRY: ${GVM_TIMEOUT_RETRY:-3}
@@ -197,6 +199,7 @@ services:
         condition: service_completed_successfully
 
   openvasd:
+    cpus: "${SCANNER_CPU_OPENVASD_CPUS:-0.75}"
     image: registry.community.greenbone.net/community/openvas-scanner:stable
     restart: on-failure
     environment:
@@ -224,6 +227,7 @@ services:
         aliases: [openvasd]
 
   ospd-openvas:
+    cpus: "${SCANNER_CPU_OSPD_CPUS:-1.75}"
     image: registry.community.greenbone.net/community/ospd-openvas:stable
     hostname: ospd-openvas.local
     restart: on-failure
@@ -284,6 +288,7 @@ services:
     entrypoint: ["python", "-m", "agent.bootstrap_control_plane"]
 
   scanner-agent:
+    cpus: "${SCANNER_CPU_AGENT_CPUS:-0.5}"
     build: ./scanner-agent
     restart: unless-stopped
     env_file: .env
@@ -313,12 +318,12 @@ services:
 
       QUEUE_POLL_INTERVAL_SEC: ${QUEUE_POLL_INTERVAL_SEC:-3}
       READINESS_RECHECK_SEC: ${READINESS_RECHECK_SEC:-60}
-      MAX_CONCURRENT_SCAN_JOBS: ${MAX_CONCURRENT_SCAN_JOBS:-1}
+      MAX_CONCURRENT_SCAN_JOBS: ${MAX_CONCURRENT_SCAN_JOBS:-2}
       SCAN_IP_PARALLELISM: ${SCAN_IP_PARALLELISM:-auto}
-      SCAN_IP_MAX_PARALLELISM: ${SCAN_IP_MAX_PARALLELISM:-8}
+      SCAN_IP_MAX_PARALLELISM: ${SCAN_IP_MAX_PARALLELISM:-4}
       SCAN_SERVICE_PARALLELISM: ${SCAN_SERVICE_PARALLELISM:-6}
       # V1.10.3: per-IP port semaphore (pre-probe connects + OpenVAS max_checks).
-      SCAN_PORT_SEMAPHORE: ${SCAN_PORT_SEMAPHORE:-6}
+      SCAN_PORT_SEMAPHORE: ${SCAN_PORT_SEMAPHORE:-4}
       SCAN_SLO_MIN_HOSTS_PER_HOUR: ${SCAN_SLO_MIN_HOSTS_PER_HOUR:-15}
       SCAN_SLO_HOSTS_PER_HOUR: ${SCAN_SLO_HOSTS_PER_HOUR:-18}
       SCAN_EXPECTED_HOST_MINUTES: ${SCAN_EXPECTED_HOST_MINUTES:-20}
@@ -339,7 +344,7 @@ services:
       GVM_TIMEOUT_RETRY: ${GVM_TIMEOUT_RETRY:-3}
       GVM_CHECKS_READ_TIMEOUT: ${GVM_CHECKS_READ_TIMEOUT:-10}
       GVM_MAX_HOSTS: ${GVM_MAX_HOSTS:-1}
-      GVM_MAX_CHECKS: ${GVM_MAX_CHECKS:-8}
+      GVM_MAX_CHECKS: ${GVM_MAX_CHECKS:-4}
       HIGH_PROGRESS_WARN_SEC: ${HIGH_PROGRESS_WARN_SEC:-300}
       HIGH_PROGRESS_STALL_SEC: ${HIGH_PROGRESS_STALL_SEC:-0}
       HIGH_PROGRESS_STALL_PCT: ${HIGH_PROGRESS_STALL_PCT:-90}
@@ -397,9 +402,9 @@ services:
       # V1.6.8: no time limits; stop only when OpenVAS shows nothing running (auto).
       SCAN_STALL_ACTION: ${SCAN_STALL_ACTION:-auto}
       SCAN_IP_DEADLINE_SEC: ${SCAN_IP_DEADLINE_SEC:-}
-      SCAN_IP_WORKERS_FIXED: ${SCAN_IP_WORKERS_FIXED:-5}
+      SCAN_IP_WORKERS_FIXED: ${SCAN_IP_WORKERS_FIXED:-2}
       # V1.10.3: IP semaphore (IPs scanned at once); wins over SCAN_IP_WORKERS_FIXED.
-      SCAN_IP_SEMAPHORE: ${SCAN_IP_SEMAPHORE:-5}
+      SCAN_IP_SEMAPHORE: ${SCAN_IP_SEMAPHORE:-2}
       SCAN_INTERRUPTED_RESTARTS: ${SCAN_INTERRUPTED_RESTARTS:-1}
       # V1.9.3: checks whose OWN timeout is longer than this (or unlimited) are capped
       # to it; those are what hold a host at 98-99 %. 0 = off. Needs the plugins mount below.

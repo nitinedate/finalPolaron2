@@ -25,7 +25,9 @@ def _rewrite_celery_concurrency(argv: list[str]) -> list[str]:
             queues = part.split("=", 1)[1]
     queue_set = {q.strip() for q in queues.split(",") if q.strip()}
 
-    forensic = {"disk-build", "report-gen"}
+    # disk-inventory was missing: the actual worker consumes both queues and
+    # silently retained --concurrency=8 despite a smaller dynamic CPU budget.
+    forensic = {"disk-build", "disk-inventory", "report-gen"}
     conc = ""
     if queue_set == {"ocr"}:
         # Never inherit OCR_CPU_WORKERS (8). Prefork + CUDA after thermal prep
@@ -91,6 +93,65 @@ def _rewrite_celery_concurrency(argv: list[str]) -> list[str]:
     return out
 
 
+def _apply_native_thread_limits() -> None:
+    """Prevent 1 Celery process from spawning all host CPU threads in BLAS/OCR.
+
+    Must run before importing torch, numpy, OpenCV or the dynamic GPU planner.
+    Independent Celery workers and native libraries otherwise multiply the
+    number of runnable threads well beyond the cgroup CPU limit.
+    """
+    if os.environ.get("CPU_SAFE_MODE_ENABLED", "true").lower() in {"0", "false", "no"}:
+        return
+    try:
+        native = max(1, min(4, int(os.environ.get("CPU_NATIVE_THREADS", "1"))))
+    except ValueError:
+        native = 1
+    for key in (
+        "OMP_NUM_THREADS", "OMP_THREAD_LIMIT", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+        "BLIS_NUM_THREADS", "NUMEXPR_NUM_THREADS", "NUMEXPR_MAX_THREADS",
+        "VECLIB_MAXIMUM_THREADS", "TF_NUM_INTRAOP_THREADS", "TF_NUM_INTEROP_THREADS",
+        "RAYON_NUM_THREADS", "POLARS_MAX_THREADS", "TESSERACT_NUM_THREADS",
+    ):
+        try:
+            existing = int(os.environ.get(key, str(native)))
+        except ValueError:
+            existing = native
+        os.environ[key] = str(max(1, min(existing, native)))
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def _limit_celery_concurrency(argv: list[str]) -> list[str]:
+    """Hard-clamp worker process fan-out to the effective container CPU budget.
+
+    Applies to disk-inventory, disk-parse, OCR documents and all other queues.
+    GPU solo worker process counts remain one. Docker CFS still enforces actual
+    CPU time even when a native library ignores cooperative backoff.
+    """
+    if not argv or argv[0] != "celery" or "worker" not in argv:
+        return argv
+    if os.environ.get("CPU_SAFE_MODE_ENABLED", "true").lower() in {"0", "false", "no"}:
+        return argv
+    from app.services.cpu_budget import effective_cpu_count, target_parallel_cores
+
+    maximum = target_parallel_cores(effective_cpu_count())
+    result = list(argv)
+    for i, part in enumerate(result):
+        if part in {"-c", "--concurrency"} and i + 1 < len(result):
+            try:
+                result[i + 1] = str(min(maximum, max(1, int(result[i + 1]))))
+            except ValueError:
+                pass
+            return result
+        if part.startswith("--concurrency="):
+            try:
+                value = int(part.split("=", 1)[1])
+                result[i] = f"--concurrency={min(maximum, max(1, value))}"
+            except ValueError:
+                pass
+            return result
+    return result
+
+
 def _rewrite_ocr_solo_pool(argv: list[str]) -> list[str]:
     """OCR drain must be solo so SuryaOCR sees the same CUDA context as nvidia-smi."""
     if not argv or argv[0] != "celery" or "worker" not in argv:
@@ -153,6 +214,7 @@ def _rewrite_beat_schedule(argv: list[str]) -> list[str]:
 
 
 def main() -> None:
+    _apply_native_thread_limits()
     # Keep tempfile/scratch on the host backup mount, not the container layer.
     tmp = os.environ.get("TMPDIR") or os.environ.get("TMP")
     if tmp:
@@ -169,6 +231,10 @@ def main() -> None:
         apply_dynamic_performance()
     except Exception as exc:  # never block startup
         print(f"[dynamic_perf] apply failed (continuing): {exc}", file=sys.stderr)
+
+    # The dynamic planner may have raised OMP/MKL values for a larger GPU
+    # profile; re-apply the user CPU budget before importing inference libraries.
+    _apply_native_thread_limits()
 
     # Cap GPU power immediately on GPU workers — prevents thermal runaway before first batch.
     try:
@@ -193,7 +259,10 @@ def main() -> None:
         print("usage: dynamic_perf_entrypoint.py <command> [args...]", file=sys.stderr)
         sys.exit(2)
 
-    cmd = _rewrite_beat_schedule(_rewrite_ocr_solo_pool(_rewrite_celery_concurrency(sys.argv[1:])))
+    cmd = _limit_celery_concurrency(
+        _rewrite_beat_schedule(_rewrite_ocr_solo_pool(_rewrite_celery_concurrency(sys.argv[1:])))
+    )
+    print(f"[cpu_safe] effective Celery command: {' '.join(cmd)}", file=sys.stderr)
     os.execvp(cmd[0], cmd)
 
 

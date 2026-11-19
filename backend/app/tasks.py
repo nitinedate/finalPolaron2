@@ -3334,3 +3334,11 @@ def disk_vector_sidecar_task(self, schema_name: str, job_id: str, task_id: str) 
     except Exception as exc:
         _sidecar_failed("disk_vectors", schema_name, job_id, task_id, exc)
         raise
+
+
+@celery.task(name="app.tasks.ocr_document_search_task", reject_on_worker_lost=True)
+def ocr_document_search_task(job_id: str) -> dict:
+    """Dedicated OCR-documents lane; no shared forensic extraction semaphore."""
+    from app.services.document_search import scan_job
+
+    return scan_job(job_id)

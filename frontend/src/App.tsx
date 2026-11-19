@@ -30,6 +30,7 @@ import { JobIntakePage } from "./pages/forensic/JobIntakePage";
 const ReportEditorPage = lazy(() => import("./pages/forensic/ReportEditorPage").then(module => ({ default: module.ReportEditorPage })));
 const ReportListPage = lazy(() => import("./pages/forensic/ReportListPage").then(module => ({ default: module.ReportListPage })));
 import { SearchEvidencePage } from "./pages/forensic/SearchEvidencePage";
+import { OcrDocumentsPage } from "./pages/forensic/OcrDocumentsPage";
 import { ArtifactExplorerPage } from "./pages/forensic/ArtifactExplorerPage";
 import { ArtifactPageErrorBoundary } from "./components/forensic/ArtifactPageErrorBoundary";
 import { DiskArtifactsHubPage } from "./pages/forensic/DiskArtifactsHubPage";
@@ -378,6 +379,9 @@ export default function App() {
               </RequireFirmScope>
             }
           />
+        )}
+        {isForensicService() && (
+          <Route path="forensic/ocr" element={<RequireFirmScope><RequirePermission perm="job:run"><OcrDocumentsPage /></RequirePermission></RequireFirmScope>} />
         )}
         {isForensicService() && (
           <Route

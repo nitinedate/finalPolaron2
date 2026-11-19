@@ -2670,7 +2670,7 @@ export function MobileAcquisitionPage() {
           <ol className="mt-1 list-decimal space-y-0.5 pl-5 text-ink-700" data-testid="client-stream-steps">
             <li>
               Every finished file of the collection on this computer{site?.localComputer ? ` (${site.localComputer})` : ""} is sent
-              to the forensic server{site?.serverComputer ? ` (${site.serverComputer})` : ""} right away, in chunks.
+              to the forensic server{site?.serverComputer ? ` (${site.serverComputer})` : ""} right away, several files at a time, and several pieces of a large file at once.
             </li>
             <li>The server checks each file with SHA-256 on its own disk and never overwrites one.</li>
             <li>

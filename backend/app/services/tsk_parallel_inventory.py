@@ -16,13 +16,20 @@ from typing import Any
 
 
 def inventory_readers(vd, *, requested: str | None = None) -> tuple[int, str]:
-    """Cap metadata read concurrency for seek-heavy compressed/rotational media."""
-    raw = str(requested if requested is not None else os.getenv('EXTRACT_TSK_ENUM_WORKERS', '2')).strip().lower()
+    """Auto-tune independent TSK readers for media while avoiding HDD seek storms.
+
+    Each worker gets its own native EWF/TSK handle. SSD/NVMe can use four
+    concurrent directory readers; unknown, HDD and network mounts use at most
+    two. The limit is also capped at half the logical CPUs for host headroom.
+    """
+    raw = str(requested if requested is not None else os.getenv('EXTRACT_TSK_ENUM_WORKERS', 'auto')).strip().lower()
     if raw in ('off', 'false', 'no', '0', 'serial'):
         return 1, 'disabled'
     try:
-        target = max(1, min(int(raw), 8)) if raw not in ('auto', '') else 2
+        automatic = raw in ('auto', '')
+        target = max(1, min(int(raw), 8)) if not automatic else 2
     except ValueError:
+        automatic = True
         target = 2
     media = 'unknown'
     try:
@@ -30,6 +37,13 @@ def inventory_readers(vd, *, requested: str | None = None) -> tuple[int, str]:
         media = detect_source_io_profile(list(vd.segment_paths or [])).media
     except Exception:
         pass
+    if automatic and media in ('ssd', 'nvme'):
+        target = 4
+    # No more than half of the logical CPUs in this independently scheduled
+    # process. Serial policy is still available for damaged images.
+    from app.services.cpu_budget import effective_cpu_count, target_parallel_cores
+
+    target = min(target, max(1, target_parallel_cores(effective_cpu_count())))
     if media in ('hdd', 'network'):
         target = min(target, 2)
     return target, media

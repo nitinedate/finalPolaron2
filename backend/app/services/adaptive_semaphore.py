@@ -126,6 +126,22 @@ def _cpu_pace_from_snapshot(snap) -> float:
     if snap is None:
         return 0.80
     pace = 1.0
+    # Load average alone is not a CPU percentage and can hide overcommitment
+    # under Docker CFS quotas. Use a sampled host-wide busy percentage as an
+    # additional live throttle; never block waiting for the sample.
+    busy = getattr(snap, "cpu_util_pct", None)
+    if busy is not None:
+        from app.services.cpu_budget import target_percent
+
+        target = target_percent()
+        if busy >= min(95, target + 35):
+            pace = min(pace, 0.20)
+        elif busy >= target + 20:
+            pace = min(pace, 0.35)
+        elif busy >= target + 10:
+            pace = min(pace, 0.50)
+        elif busy >= target:
+            pace = min(pace, 0.70)
     cpus = max(int(getattr(snap, "cpu_logical", 1) or 1), 1)
     load = getattr(snap, "load_1m", None)
     if load is not None:

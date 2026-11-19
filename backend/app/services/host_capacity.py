@@ -25,6 +25,9 @@ _last_plan: "CapacityPlan | None" = None
 @dataclass
 class HostSnapshot:
     cpu_logical: int = 1
+    # host-wide sampled busy percent; unlike loadavg this detects CPU saturation
+    # even on Windows/WSL and on containers with a smaller quota than the host.
+    cpu_util_pct: float | None = None
     mem_total_mb: int = 0
     mem_available_mb: int = 0
     load_1m: float | None = None
@@ -243,9 +246,15 @@ def _probe_npu() -> tuple[bool, str | None]:
 
 
 def probe_host() -> HostSnapshot:
-    cpus = max(int(os.cpu_count() or 1), 1)
+    from app.services.cpu_budget import (
+        effective_cpu_count, effective_memory_mb, host_cpu_utilization_percent,
+    )
+
+    cpus = effective_cpu_count()
     mem_total, mem_avail = _read_meminfo_mb()
+    mem_total, mem_avail = effective_memory_mb(mem_total, mem_avail)
     load = _read_load_1m()
+    busy_pct = host_cpu_utilization_percent()
     cpu_temp = _read_cpu_temp_c()
     gpu_ok, gpu_name, vram_total, vram_free, gpu_temp = _probe_gpu()
     npu_ok, npu_name = _probe_npu()
@@ -274,6 +283,7 @@ def probe_host() -> HostSnapshot:
 
     return HostSnapshot(
         cpu_logical=cpus,
+        cpu_util_pct=busy_pct,
         mem_total_mb=mem_total,
         mem_available_mb=mem_avail,
         load_1m=load,
@@ -573,6 +583,35 @@ def build_capacity_plan(snap: HostSnapshot | None = None) -> CapacityPlan:
     if snap.cpu_temp_c is not None and snap.cpu_temp_c >= 85:
         inv_workers = max(1, inv_workers // 2)
 
+    # V1.31 CPU-safety repair: OS core counts and GPU size must not multiply
+    # disk readers, parse threads and Celery tasks beyond the CPU actually
+    # available to this *container*. The old 12GB GPU performance branch used
+    # 8 readers + up to 16 parse workers before any cgroup-aware budgeting.
+    if _truthy(os.environ.get("CPU_SAFE_MODE_ENABLED"), True):
+        from app.services.cpu_budget import target_parallel_cores, target_percent
+
+        local_budget = target_parallel_cores(cpus)
+        extract_readers = min(extract_readers, max(1, (local_budget + 1) // 2))
+        parse_workers = min(parse_workers, max(1, (local_budget + 1) // 2))
+        upload = min(upload, max(1, local_budget))
+        ocr_cpu = min(ocr_cpu, max(1, local_budget))
+        inv_workers = min(inv_workers, max(1, local_budget // 2))
+        parse_buckets = min(parse_buckets, max(1, local_budget // 2))
+        max_disk = min(max_disk, max(1, local_budget // max(1, extract_readers)))
+        if snap.cpu_util_pct is not None and snap.cpu_util_pct >= target_percent() + 15:
+            extract_readers = min(extract_readers, 1)
+            parse_workers = min(parse_workers, 1)
+            parse_buckets = 1
+            inv_workers = 1
+            upload = min(upload, 2)
+            max_disk = 1
+        notes.append(
+            f"CPU safety: visible_cores={cpus} target={target_percent()}% "
+            f"budget_cores={local_budget} busy={snap.cpu_util_pct}%; "
+            f"disk_readers={extract_readers}, parse={parse_workers}, "
+            f"max_disk_jobs={max_disk}"
+        )
+
     # Disk E01 reads and independent CPU parse units share a documented
     # eight-slot ceiling. Hardware/media/thermal profiles may lower it but
     # must never suggest extra workers that the disk semaphore cannot admit.
@@ -684,7 +723,7 @@ def build_capacity_plan(snap: HostSnapshot | None = None) -> CapacityPlan:
             "CELERY_LIGHT_CONCURRENCY": str(celery_light),
             # Cap BLAS threads per process — buckets already multiply process count.
             "OMP_NUM_THREADS": str(_clamp(max(1, parse_workers // 2), 1, 2)),
-            "MKL_NUM_THREADS": str(_clamp(max(1, parse_workers // 2), 1, 2)),
+            "MKL_NUM_THREADS": "1",
             "TOKENIZERS_PARALLELISM": "false",
             "GPU_HEAVY_MAX_CONCURRENT": str(max(gpu_slots, 1) if snap.gpu_available else 1),
             "OCR_CUDA_MEMORY_FRACTION": f"{ocr_cuda_frac:.2f}",

@@ -131,7 +131,8 @@ def build_live_plan(
     if snap is not None:
         cpus = max(int(getattr(snap, "cpu_logical", 0) or 0), 1)
     if cpus <= 1:
-        cpus = max(int(os.cpu_count() or 8), 1)
+        from app.services.cpu_budget import effective_cpu_count
+        cpus = effective_cpu_count()
     # Keep two cores for the database and the API. Cap at 16 so a single
     # disk image is not thrashed by one reader per core.
     io_hw = min(16, max(4, cpus - 2))

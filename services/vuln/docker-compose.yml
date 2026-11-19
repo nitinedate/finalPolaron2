@@ -24,7 +24,14 @@ x-vuln-env: &vuln-env
   RAG_EMBEDDING_ENABLED: "false"
   MAIL_SEND_ENABLED: "false"
   NESSUS_WORKER_CONCURRENCY: ${NESSUS_WORKER_CONCURRENCY:-4}
-  VULN_MAX_PARALLEL_JOBS: ${VULN_MAX_PARALLEL_JOBS:-4}
+  VULN_MAX_PARALLEL_JOBS: ${VULN_MAX_PARALLEL_JOBS:-2}
+  CPU_SAFE_MODE_ENABLED: ${CPU_SAFE_MODE_ENABLED:-true}
+  CPU_SAFE_TARGET_PCT: ${CPU_SAFE_TARGET_PCT:-50}
+  CPU_NATIVE_THREADS: ${CPU_NATIVE_THREADS:-1}
+  OMP_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  OPENBLAS_NUM_THREADS: "1"
+  TOKENIZERS_PARALLELISM: "false"
   DYNAMIC_PERF_ENABLED: ${DYNAMIC_PERF_ENABLED:-true}
   DYNAMIC_PERF_FORCE: ${DYNAMIC_PERF_FORCE:-true}
   AETHERIS_SHARE_HOST: ${AETHERIS_SHARE_HOST:-true}
@@ -53,6 +60,7 @@ x-vuln-env: &vuln-env
 
 services:
   api:
+    cpus: "${VULN_CPU_API_CPUS:-0.5}"
     networks:
       default: {}
       aetheris-common:
@@ -95,6 +103,7 @@ services:
       start_period: 420s
 
   worker-nessus:
+    cpus: "${VULN_CPU_WORKER_CPUS:-0.75}"
     networks:
       - default
       - aetheris-common

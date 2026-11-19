@@ -64,7 +64,10 @@ def test_legacy_running_without_task_id_still_claims_queued(monkeypatch):
     assert out["resume"] is False
 
 
-def test_adopts_queued_job_from_stale_scanner(monkeypatch):
+def test_admin_optin_adopts_queued_job_from_stale_scanner(monkeypatch):
+    monkeypatch.setenv("EDGE_CROSS_SCANNER_JOB_REASSIGNMENT", "true")
+    monkeypatch.setattr(saj, "_scanner_registered_version", lambda db, sid: (1, 0, 0))
+    monkeypatch.setattr(saj, "_fresh_running_edge_job", lambda db, sid: None)
     orphan = {
         "id": "00000000-0000-0000-0000-000000000031",
         "case_id": "00000000-0000-0000-0000-000000000012",
@@ -107,3 +110,23 @@ def test_adopts_queued_job_from_stale_scanner(monkeypatch):
     assert out is not None, "no claim; sql=" + " || ".join(seen)
     assert out["id"] == orphan["id"]
     assert out["resume"] is False
+
+
+def test_other_laptops_queued_job_is_not_stolen_by_default(monkeypatch):
+    monkeypatch.delenv("EDGE_CROSS_SCANNER_JOB_REASSIGNMENT", raising=False)
+    monkeypatch.setattr(saj, "_scanner_registered_version", lambda db, sid: (1, 0, 0))
+    monkeypatch.setattr(saj, "_fresh_running_edge_job", lambda db, sid: None)
+    calls = []
+    def fake_fetchone(db, sql, params=None):
+        txt = " ".join(str(sql).split())
+        calls.append(txt)
+        if "FROM vuln_scanners" in txt:
+            return {"version": "1.7.0"}
+        if "stale_scanner_queued" in txt:
+            raise AssertionError("must not inspect other laptops' jobs")
+        return None
+    monkeypatch.setattr(saj, "fetchone", fake_fetchone)
+    monkeypatch.setattr(saj, "_agent_supports_parallel", lambda db, sid: True)
+    out = saj.claim_next_job(object(), "00000000-0000-0000-0000-000000000099", active_job_ids=[])
+    assert out is None
+    assert not any("stale_scanner_queued" in sql for sql in calls)

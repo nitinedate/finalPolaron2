@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import os
 import math
 import re
 from datetime import datetime, timezone
@@ -767,7 +768,11 @@ def claim_next_job(
             params,
         )
         if not candidate:
-            candidate = _stale_scanner_queued_job(db, scanner_id, exclude_ids)
+            # A disconnected laptop's jobs must not be silently given to a
+            # different network/laptop. An administrator may explicitly opt
+            # into legacy migration, but the secure default keeps ownership.
+            allow_adoption = os.environ.get("EDGE_CROSS_SCANNER_JOB_REASSIGNMENT", "false").lower() in {"1", "true", "yes"}
+            candidate = _stale_scanner_queued_job(db, scanner_id, exclude_ids) if allow_adoption else None
             if not candidate:
                 return None
         jid = str(candidate["id"])

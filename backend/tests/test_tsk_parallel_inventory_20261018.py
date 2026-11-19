@@ -158,3 +158,16 @@ def test_root_path_preference_and_retry(monkeypatch):
     out = tsk_walk_isolated.enumerate_tsk_isolated(SimpleNamespace(job_id='test'), retries=2)
     assert methods == ['inode','inode']  # inode first; path is only the last fallback
     assert out == [{'path':'recovered'}]
+
+
+def test_auto_reader_count_uses_ssd_only_when_cpu_budget_allows(monkeypatch):
+    import sys
+    vd, _, _ = setup(monkeypatch)
+    from app.services import cpu_budget
+    monkeypatch.setenv('EXTRACT_TSK_ENUM_WORKERS', 'auto')
+    monkeypatch.setattr(cpu_budget, 'effective_cpu_count', lambda: 16)
+    monkeypatch.setitem(sys.modules, 'app.services.disk_io_profile',
+                        SimpleNamespace(detect_source_io_profile=lambda _: SimpleNamespace(media='nvme')))
+    assert inv.inventory_readers(vd) == (4, 'nvme')
+    monkeypatch.setattr(cpu_budget, 'effective_cpu_count', lambda: 4)
+    assert inv.inventory_readers(vd) == (2, 'nvme')

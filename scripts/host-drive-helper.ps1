@@ -5025,6 +5025,7 @@ public static class AetherisImport {
   const uint SHARE_DELETE = 4;
   const uint CREATE_ALWAYS = 2;
   const uint OPEN_EXISTING = 3;
+  const uint OPEN_ALWAYS = 4;
   const uint ATTR_READONLY = 0x1;
   const uint ATTR_DIRECTORY = 0x10;
   const uint ATTR_NORMAL = 0x80;
@@ -5309,59 +5310,93 @@ public static class AetherisImport {
       "],\"conflicts\":[" + conflicts.ToString() + "]}");
   }
 
+  // The body is read before the per-file lock so several pieces of one file can travel at once.
+  // A short body is refused without touching the part. Piece writes never truncate and never
+  // shrink the part: another piece may already be past this offset. Without X-Import-Piece the
+  // old rule stays: offset 0 replaces the part, any other offset must equal the part's length.
+  static byte[] ReadChunkBody(HttpListenerContext ctx, long declared, out string problem) {
+    problem = null;
+    using (MemoryStream ms = new MemoryStream()) {
+      byte[] buf = new byte[1 << 20];
+      Stream input = ctx.Request.InputStream;
+      int n;
+      long total = 0;
+      while ((n = input.Read(buf, 0, buf.Length)) > 0) {
+        total += n;
+        if (total > MaxChunkBytes) {
+          problem = "large";
+          return null;
+        }
+        ms.Write(buf, 0, n);
+      }
+      if (declared > 0 && total != declared) {
+        problem = "short";
+        return null;
+      }
+      return ms.ToArray();
+    }
+  }
+
   static void Chunk(HttpListenerContext ctx, string caseDir) {
     string[] segs = RelSegments(HeaderRel(ctx));
     long offset = HeaderLong(ctx, "X-Import-Offset", 0);
     long declared = ctx.Request.ContentLength64;
+    bool piece = string.Equals(ctx.Request.Headers["X-Import-Piece"], "1", StringComparison.Ordinal);
     if (offset < 0 || declared < 0 || declared > MaxChunkBytes) {
       Drain(ctx);
       Json(ctx, 413, Err("bad_chunk", "Chunks need a Content-Length of at most 64 MiB and a non-negative offset"));
+      return;
+    }
+    string problem;
+    byte[] payload;
+    try {
+      payload = ReadChunkBody(ctx, declared, out problem);
+    } catch (Exception ex) {
+      Json(ctx, 400, Err("short_body", ex.Message));
+      return;
+    }
+    if (problem == "large") {
+      Json(ctx, 413, Err("bad_chunk", "Chunks need a Content-Length of at most 64 MiB and a non-negative offset"));
+      return;
+    }
+    if (problem == "short" || payload == null) {
+      Json(ctx, 400, Err("short_body", "The chunk ended early; send it again"));
       return;
     }
     string full = FullPath(caseDir, segs);
     lock (LockFor(full)) {
       long finalSize = FileSize(full);
       if (finalSize >= 0) {
-        Drain(ctx);
         Json(ctx, 409, "{\"ok\":false,\"error\":\"exists\",\"size\":" + finalSize + "}");
         return;
       }
       EnsureParentDirs(caseDir, segs);
       string part = full + PartSuffix;
-      SafeFileHandle h = CreateFileW(Lp(part), GENERIC_WRITE, SHARE_READ, IntPtr.Zero, offset == 0 ? CREATE_ALWAYS : OPEN_EXISTING, ATTR_NORMAL, IntPtr.Zero);
+      uint share = piece ? (SHARE_READ | SHARE_WRITE) : SHARE_READ;
+      uint disposition = piece ? OPEN_ALWAYS : (offset == 0 ? CREATE_ALWAYS : OPEN_EXISTING);
+      SafeFileHandle h = CreateFileW(Lp(part), GENERIC_WRITE, share, IntPtr.Zero, disposition, ATTR_NORMAL, IntPtr.Zero);
       if (h.IsInvalid) {
         int err = Marshal.GetLastWin32Error();
         h.Dispose();
-        Drain(ctx);
         if (err == 2) Json(ctx, 409, "{\"ok\":false,\"error\":\"offset_mismatch\",\"size\":0}");
         else Json(ctx, 500, Err("open_failed", "Could not open " + part + " (Win32 error " + err + ")"));
         return;
       }
-      long written = 0;
       using (FileStream fs = new FileStream(h, FileAccess.Write, 1 << 20)) {
-        long current = fs.Length;
-        if (current != offset) {
-          Drain(ctx);
-          Json(ctx, 409, "{\"ok\":false,\"error\":\"offset_mismatch\",\"size\":" + current + "}");
-          return;
+        if (!piece) {
+          long current = fs.Length;
+          if (current != offset) {
+            Json(ctx, 409, "{\"ok\":false,\"error\":\"offset_mismatch\",\"size\":" + current + "}");
+            return;
+          }
+        } else if (offset > fs.Length) {
+          fs.SetLength(offset);
         }
         fs.Seek(offset, SeekOrigin.Begin);
-        byte[] buf = new byte[1 << 20];
-        Stream input = ctx.Request.InputStream;
-        int n;
-        while ((n = input.Read(buf, 0, buf.Length)) > 0) {
-          written += n;
-          if (written > MaxChunkBytes) throw new IOException("Chunk is larger than 64 MiB");
-          fs.Write(buf, 0, n);
-        }
+        if (payload.Length > 0) fs.Write(payload, 0, payload.Length);
         fs.Flush();
-        if (declared > 0 && written != declared) {
-          fs.SetLength(offset);
-          Json(ctx, 400, Err("short_body", "The chunk ended early; send it again"));
-          return;
-        }
       }
-      Json(ctx, 200, "{\"ok\":true,\"size\":" + (offset + written) + "}");
+      Json(ctx, 200, "{\"ok\":true,\"size\":" + (offset + payload.LongLength) + "}");
     }
   }
 

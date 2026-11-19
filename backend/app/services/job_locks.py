@@ -1282,7 +1282,7 @@ def cpu_heavy_slot(
                 fail_closed=fail_closed,
                 requested_limit=max(_settings_int("max_concurrent_disk_builds", 2), 1),
                 fail_open_if_unavailable=_settings_bool(
-                    "resource_governor_fail_open_on_unavailable", True
+                    "resource_governor_fail_open_on_unavailable", False
                 ),
             )
         except ResourceSemaphoreTimeout as exc:

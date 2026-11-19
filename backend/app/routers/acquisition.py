@@ -1093,6 +1093,7 @@ async def client_stream_chunk(session_id: str, request: Request):
             raise client_stream.StreamError(413, "bad_chunk", "Chunks are at most 64 MiB.")
         rel = client_stream.decode_rel(request.headers.get("x-stream-rel") or "")
         offset = int(request.headers.get("x-stream-offset") or 0)
+        piece = (request.headers.get("x-stream-piece") or "").strip() == "1"
         data = await request.body()
         status, body = await run_in_threadpool(
             client_stream.put_chunk,
@@ -1101,6 +1102,8 @@ async def client_stream_chunk(session_id: str, request: Request):
             rel,
             offset,
             data,
+            "",
+            piece,
         )
         return JSONResponse(body, status_code=status)
     except ValueError:

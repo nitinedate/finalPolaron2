@@ -39,7 +39,7 @@ def test_build_plan_laptop_gpu():
     assert plan.env["PHASE3_STREAM_RAG_DURING_EXTRACT"] == "false"
 
 
-def test_build_plan_laptop_12gb_uses_larger_exclusive_batches():
+def test_build_plan_laptop_12gb_preserves_gpu_batches_but_caps_cpu_fanout():
     plan = build_capacity_plan(
         HostSnapshot(
             cpu_logical=16,
@@ -63,9 +63,9 @@ def test_build_plan_laptop_12gb_uses_larger_exclusive_batches():
     assert int(plan.env["OCR_PARALLEL_BUCKETS"]) == 3
     assert int(plan.env["GPU_THERMAL_PAUSE_C"]) == 92
     assert int(plan.env["GPU_THERMAL_ABORT_C"]) == 94
-    assert int(plan.env["EXTRACT_DISK_WORKERS"]) >= 6
+    assert 1 <= int(plan.env["EXTRACT_DISK_WORKERS"]) <= 4
     assert int(plan.env["EXTRACT_SHARD_COUNT"]) >= 8
-    assert int(plan.env["AXIOM_INVENTORY_WORKERS"]) >= 6
+    assert 1 <= int(plan.env["AXIOM_INVENTORY_WORKERS"]) <= 4
     assert int(plan.env["AXIOM_INVENTORY_BATCH_SIZE"]) >= 200
 
 

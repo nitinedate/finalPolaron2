@@ -9,12 +9,14 @@ import multiprocessing
 import os
 
 from app.services.disk_slots import DISK_SLOTS, run_bounded
+from app.services.cpu_budget import effective_cpu_count, target_parallel_cores
 
 # CPU-bound helpers stay within the host. Disk shard and parse work uses DISK_SLOTS
 # (eight) instead, because those waits are storage waits.
-_CPU_COUNT = max(int(os.cpu_count() or 4), 1)
-MAX_PARALLELISM = max(2, min(int(os.environ.get("FORENSIC_MAX_PARALLELISM", min(8, _CPU_COUNT)) or 8), 8))
-PIPELINE_PARALLEL_SLOTS = max(2, min(int(os.environ.get("PIPELINE_PARALLEL_SLOTS", "8") or 8), 8))
+_CPU_COUNT = effective_cpu_count()
+_CPU_BUDGET = target_parallel_cores(_CPU_COUNT)
+MAX_PARALLELISM = max(1, min(int(os.environ.get("FORENSIC_MAX_PARALLELISM", "8") or 8), 8, _CPU_BUDGET))
+PIPELINE_PARALLEL_SLOTS = max(1, min(int(os.environ.get("PIPELINE_PARALLEL_SLOTS", "8") or 8), 8, _CPU_BUDGET))
 # Character windows for complete forensic evidence, including any source header.
 CHUNK_SIZE = 3000
 CHUNK_OVERLAP = 800
@@ -80,7 +82,7 @@ def bounded_map(fn, items, *, workers: int = MAX_PARALLELISM):
     """
     # Disk stages admit eight slots even when the host CPU cap is lower.
     # The work is storage-bound. OCR and other CPU helpers keep parallelism().
-    slots = max(1, min(int(workers or 1), DISK_SLOTS))
+    slots = max(1, min(int(workers or 1), DISK_SLOTS, _CPU_BUDGET))
     yield from run_bounded(fn, items, slots=slots)
 
 

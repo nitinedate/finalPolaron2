@@ -48,11 +48,11 @@ class Settings(BaseSettings):
     resource_governor_redis_url: str = Field(default="", validation_alias="RESOURCE_GOVERNOR_REDIS_URL")
     resource_governor_enabled: bool = Field(default=True, validation_alias="RESOURCE_GOVERNOR_ENABLED")
     resource_governor_group: str = Field(default="aetheris-host", validation_alias="RESOURCE_GOVERNOR_GROUP")
-    # If the shared host-level governor Redis is temporarily unreachable, CPU/I/O
-    # forensic extraction may continue under the product-local Redis/thermal lease.
-    # Capacity exhaustion still fails closed; this applies only to governor transport/DNS outages.
+    # CPU-heavy work must not bypass shared host admission when Redis is down.
+    # A task should report a recoverable resource-coordinator error, not force
+    # another CPU-intensive job onto an already-saturated machine.
     resource_governor_fail_open_on_unavailable: bool = Field(
-        default=True, validation_alias="RESOURCE_GOVERNOR_FAIL_OPEN_ON_UNAVAILABLE"
+        default=False, validation_alias="RESOURCE_GOVERNOR_FAIL_OPEN_ON_UNAVAILABLE"
     )
 
     minio_endpoint: str = Field(default="localhost:9000", validation_alias="MINIO_ENDPOINT")

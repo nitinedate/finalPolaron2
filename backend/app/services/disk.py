@@ -417,6 +417,30 @@ def _build_extracted_image_locked(db: Session, job_id: str, *, schema_name: str)
 
     _live = JobLiveness(schema_name, job_id, stage="extract", label="Extraction", lock_kind="extract")
     _live.__enter__()
+    # A client E01 over the internet cannot sustain TSK's random-read pattern.
+    # Stage read-only client segments sequentially, verify SHA-256 and atomically
+    # switch the registered paths BEFORE taking the constrained extract CPU slot.
+    # This I/O-heavy transfer must not block another case's native parsing.
+    try:
+        from app.services.client_disk_staging import needs_staging, stage_remote_disk_evidence
+        from app.services.mobile_os import load_job_disk_source
+
+        source = load_job_disk_source(fetchone(db, "SELECT disk_source FROM jobs WHERE id=:id", {"id": job_id}) or {})
+        if needs_staging(files, source_type=str(source.get("source_type") or "disk")):
+            _live.step("verify and stage remote client disk image")
+            db.commit()
+            files = stage_remote_disk_evidence(db, job_id, files, schema_name=schema_name)
+            execute(db, """UPDATE jobs SET pipeline_progress=jsonb_set(
+                  COALESCE(pipeline_progress, '{}'::jsonb), '{extraction_activity}',
+                  CAST(:activity AS jsonb), true), updated_at=NOW() WHERE id=:id""",
+                    {'id': job_id, 'activity': json.dumps({'subphase': 'preparing',
+                                                           'detail': 'verified remote image staged; waiting for native TSK'})})
+            db.commit()
+    except Exception as exc:
+        write_disk_log(db, job_id, f"Client disk image staging failed: {exc}", stage="remote_stage", level="error")
+        db.commit()
+        _live.__exit__(None, None, None)
+        raise
     _live.step("waiting for CPU lane")
     _extract_slot = cpu_heavy_slot("extract", wait_sec=180.0, fail_closed=True, job_id=job_id)
     try:

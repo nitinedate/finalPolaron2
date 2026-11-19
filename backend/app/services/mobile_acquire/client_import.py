@@ -431,11 +431,16 @@ class HelperWriter:
             )
         return body
 
-    def chunk(self, rel: str, offset: int, data: bytes) -> tuple[int, dict[str, Any]]:
+    def chunk(self, rel: str, offset: int, data: bytes, piece: bool = False) -> tuple[int, dict[str, Any]]:
+        headers = {"X-Import-Rel": _b64(rel), "X-Import-Offset": str(offset), "Content-Type": "application/octet-stream"}
+        # X-Import-Piece lets several chunks of one file land at once. Absent, the helper still
+        # requires the next byte of the part (older servers, and this copy path).
+        if piece:
+            headers["X-Import-Piece"] = "1"
         return self._post(
             "/acquisition/import/chunk",
             content=data,
-            headers={"X-Import-Rel": _b64(rel), "X-Import-Offset": str(offset), "Content-Type": "application/octet-stream"},
+            headers=headers,
         )
 
     def commit(self, f: ImportFile, sha256: str) -> tuple[int, dict[str, Any]]:

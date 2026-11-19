@@ -751,6 +751,15 @@ def acquisition_diagnosis(job: dict, age_seconds: float) -> str:
                 f"entries={entries:,}, unreadable={errors:,}; "
                 f"{detail}. Isolated watchdog will use serial fallback before alternating the root method; "
                 "do not start a duplicate extraction.")
+    if subphase == "remote_staging":
+        copied = int(activity.get("copied_bytes") or 0)
+        total = int(activity.get("total_bytes") or 0)
+        last = str(activity.get("last_path") or "starting")[:140]
+        return (f"Client evidence transfer: {copied:,}/{total:,} bytes staged; "
+                f"no useful byte progress for {int(age_seconds)}s, segment={last}. "
+                "Check client agent / internet uplink / FUSE mount and server staging free space. "
+                "Source images are read-only; TSK will start only after SHA-256-verified staging. "
+                "Do not dispatch a duplicate extraction.")
     if subphase == "copying":
         return (f"MinIO copy: no committed file/byte/shard progress for {int(age_seconds)}s; "
                 "check S3 writes, disk source reads, extraction lock and storage capacity.")

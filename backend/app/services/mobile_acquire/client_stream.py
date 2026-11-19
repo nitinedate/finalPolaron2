@@ -6,8 +6,8 @@ destination from the start:
 
     page    POST /api/acquisition/client-stream             -> session id + upload token (this server only)
     page    POST 127.0.0.1:9876/acquisition/run?native=...  -> the collection on the client, with the session
-    helper  polaron-stream-upload.ps1 (client)              -> sends each finished file in chunks:
-              PUT  /api/acquisition/client-stream/<id>/chunk    (<= 16 MiB, offset checked)
+    helper  polaron-stream-upload.ps1 (client)              -> sends finished files in parallel, and pieces of a large file together:
+              PUT  /api/acquisition/client-stream/<id>/chunk    (<= 64 MiB; X-Stream-Piece: 1 allows any offset)
               POST /api/acquisition/client-stream/<id>/commit   (SHA-256 verified on the server disk)
             when the collection ends:
               POST /api/acquisition/client-stream/<id>/finish   (every file present + hashes match)
@@ -33,6 +33,7 @@ import json
 import logging
 import re
 import secrets
+import threading
 import uuid
 from typing import Any
 
@@ -63,6 +64,20 @@ from app.services.mobile_acquire.client_import import (
 )
 
 log = logging.getLogger("mobile_acquire.client_stream")
+
+# Parallel commits each rewrite the session document. One lock per session keeps a slow flush from
+# saving an older file count over a newer one. The lock is not held while bytes are written.
+_state_locks_guard = threading.Lock()
+_state_locks: dict[str, threading.Lock] = {}
+
+
+def _state_lock(sid: str) -> threading.Lock:
+    with _state_locks_guard:
+        lock = _state_locks.get(sid)
+        if lock is None:
+            lock = threading.Lock()
+            _state_locks[sid] = lock
+        return lock
 
 SCHEMA = "polaron.client_mobile_stream/1"
 TOKEN_HEADER = "X-Polaron-Stream-Token"
@@ -218,18 +233,24 @@ def _rel_parts(state: dict[str, Any], rel: str) -> list[str]:
 
 
 def _claim_run(state: dict[str, Any], run: str, client_case_dir: str = "") -> None:
-    changed = False
-    if not state.get("run_name"):
-        state["run_name"] = run
-        changed = True
-    if client_case_dir and not state.get("client_case_dir"):
-        state["client_case_dir"] = client_case_dir[:1024]
-        changed = True
-    if state.get("status") == "waiting":
-        state.update({"status": "running", "stage": "receiving", "detail": "Receiving the collection from the client computer"})
-        changed = True
-    if changed:
-        save_state(state)
+    sid = str(state.get("import_id") or "")
+    with _state_lock(sid):
+        fresh = load_state(sid) or state
+        changed = False
+        if not fresh.get("run_name"):
+            fresh["run_name"] = run
+            changed = True
+        if client_case_dir and not fresh.get("client_case_dir"):
+            fresh["client_case_dir"] = client_case_dir[:1024]
+            changed = True
+        if fresh.get("status") == "waiting":
+            fresh.update({"status": "running", "stage": "receiving", "detail": "Receiving the collection from the client computer"})
+            changed = True
+        if changed:
+            save_state(fresh)
+        if fresh is not state:
+            state.clear()
+            state.update(fresh)
 
 
 def decode_rel(header_value: str) -> str:
@@ -241,7 +262,9 @@ def decode_rel(header_value: str) -> str:
         raise StreamError(400, "bad_path", "X-Stream-Rel must be base64 of the UTF-8 path") from exc
 
 
-def put_chunk(sid: str, token: str, rel: str, offset: int, data: bytes, client_case_dir: str = "") -> tuple[int, dict[str, Any]]:
+def put_chunk(
+    sid: str, token: str, rel: str, offset: int, data: bytes, client_case_dir: str = "", piece: bool = False
+) -> tuple[int, dict[str, Any]]:
     state = _session(sid, token)
     parts = _rel_parts(state, rel)
     if len(data) > MAX_CHUNK_BYTES or offset < 0:
@@ -249,7 +272,7 @@ def put_chunk(sid: str, token: str, rel: str, offset: int, data: bytes, client_c
     _claim_run(state, parts[1], client_case_dir)
     writer = _writer(state)
     try:
-        status, body = writer.chunk(rel, offset, data)
+        status, body = writer.chunk(rel, offset, data, piece=piece)
     except HelperImportError as exc:
         raise StreamError(503, "server_helper_error", str(exc)) from exc
     finally:
@@ -264,6 +287,11 @@ def put_chunk(sid: str, token: str, rel: str, offset: int, data: bytes, client_c
 
 
 def _flush_progress(sid: str, totals: tuple[int, int] | None = None) -> None:
+    with _state_lock(sid):
+        _flush_progress_locked(sid, totals)
+
+
+def _flush_progress_locked(sid: str, totals: tuple[int, int] | None = None) -> None:
     state = load_state(sid)
     if not state or state.get("status") in TERMINAL:
         return

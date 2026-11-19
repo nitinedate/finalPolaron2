@@ -997,6 +997,7 @@ def _index_job_evidence(
             apply_firm_search_path(db, schema_name)
 
         from concurrent.futures import ThreadPoolExecutor
+        from app.services.cpu_budget import effective_cpu_count, target_parallel_cores
 
         def _fetch_evidence_batch(after_id: str):
             params: dict = {"jid": job_id, "last_id": after_id}
@@ -1009,7 +1010,8 @@ def _index_job_evidence(
             )
 
         chunk_pool = stack.enter_context(
-            ThreadPoolExecutor(max_workers=max(1, min(int(os.environ.get("RAG_CPU_PREP_WORKERS", "6") or 6), 12)), thread_name_prefix="rag-chunk")
+            ThreadPoolExecutor(max_workers=max(1, min(int(os.environ.get("RAG_CPU_PREP_WORKERS", "2") or 2),
+                                                   12, target_parallel_cores(effective_cpu_count()))), thread_name_prefix="rag-chunk")
         )
         from collections import deque
 
