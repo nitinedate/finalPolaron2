@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import ipaddress
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 
 from app.db.session import apply_firm_search_path
@@ -470,6 +471,28 @@ def get_gap_intake(
     return load_gap_site(db, case_id)
 
 
+class SiteServerRecord(BaseModel):
+    """An examiner-entered server in the site infrastructure inventory."""
+    name: str = Field(min_length=1, max_length=120)
+    ip: str = Field(min_length=2, max_length=45)
+    role: str = Field(default='', max_length=120)
+    operating_system: str = Field(default='', max_length=120)
+    location: str = Field(default='', max_length=120)
+
+    @field_validator('name', 'role', 'operating_system', 'location', mode='before')
+    @classmethod
+    def strip_text(cls, value: str) -> str:
+        return str(value or '').strip()
+
+    @field_validator('ip')
+    @classmethod
+    def valid_ip_address(cls, value: str) -> str:
+        try:
+            return str(ipaddress.ip_address(value.strip()))
+        except ValueError as exc:
+            raise ValueError('Enter a valid IPv4 or IPv6 server address') from exc
+
+
 class GapSiteBody(BaseModel):
     client_name: str | None = None
     branch_locations: str | None = None
@@ -488,6 +511,10 @@ class GapSiteBody(BaseModel):
     nac: str | None = None
     antivirus: str | None = None
     backup_storage: str | None = None
+    switch: str | None = None
+    router: str | None = None
+    email_summary: str | None = None
+    server_inventory: list[SiteServerRecord] | None = Field(default=None, max_length=200)
     author: str | None = None
     document_version: str | None = None
     date_of_visit: str | None = None

@@ -242,6 +242,9 @@ def _page_wrap(
 
 
 GAP_REPORT_CSS = """
+.site-server-table { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 8pt; }
+.site-server-table th { background-color: #e4eaf6; font-weight: bold; }
+.site-server-table th, .site-server-table td { border: 1px solid #a9b9d4; padding: 4pt; overflow-wrap: break-word; word-wrap: break-word; }
 @page { size: 597pt 843pt; margin: 14mm 16mm 18mm 16mm; }
 * { box-sizing: border-box; }
 body {
@@ -1080,6 +1083,58 @@ def _site_infrastructure_reference_body(site: dict[str, Any]) -> str:
     )
 
 
+def _server_inventory_table(records: list[dict[str, Any]], *, heading: bool = True) -> str:
+    """Display examiner-entered name/IP pairs and additional server columns.
+
+    Each HTML page contains at most 14 rows to keep xhtml2pdf from silently
+    dropping table rows beyond the printable page boundary.
+    """
+    if not records:
+        return ''
+    cells = ('name', 'ip', 'role', 'operating_system', 'location')
+    names = ('Server name', 'IP address', 'Role', 'OS', 'Location')
+    rows = []
+    for record in records:
+        rows.append('<tr>' + ''.join(
+            f'<td>{_esc(str(record.get(key) or ""))}</td>' for key in cells
+        ) + '</tr>')
+    return (
+        ("<p class='body-text'><strong>SERVER INVENTORY (NAME / IP):</strong></p>" if heading else '')
+        + "<table class='site-server-table' width='100%' border='1' cellspacing='0' cellpadding='3'>"
+        + '<thead><tr>' + ''.join(f'<th>{name}</th>' for name in names) + '</tr></thead>'
+        + '<tbody>' + ''.join(rows) + '</tbody></table>'
+    )
+
+
+def _site_infrastructure_extra_pages(site: dict[str, Any]) -> list[str]:
+    """Continuation pages for an unbounded (API-capped) server IP inventory."""
+    records = [r for r in (site.get('server_inventory') or []) if isinstance(r, dict)]
+    pages = [_server_inventory_table(records[i:i + 14]) for i in range(0, len(records), 14)]
+    # When multiple jobs from different cases are merged, show provenance
+    # rather than silently replacing a different case's site details.
+    for index, other in enumerate(site.get('_merged_site_details') or [], start=1):
+        if not isinstance(other, dict):
+            continue
+        fw = other.get('firewall') or {}
+        inet = other.get('internet') or {}
+        rows = [
+            ('Client / site', other.get('client_name') or other.get('branch_locations')),
+            ('Branch', other.get('branch_locations')),
+            ('Endpoints', other.get('num_endpoints')),
+            ('Firewall', fw.get('make_model')),
+            ('Backup', other.get('backup_storage')),
+            ('Switch', other.get('switch')),
+            ('Router', other.get('router')),
+            ('Internet', inet.get('vendors') or inet.get('type')),
+            ('Antivirus', other.get('antivirus')),
+            ('Email', other.get('email_summary')),
+        ]
+        parts = [f"<p class='body-text'><strong>Site {index} — source details:</strong></p>"]
+        parts += [f"<p class='body-text'><strong>{_esc(k)}:</strong> {_esc(_site_value(v))}</p>" for k, v in rows]
+        pages.append(''.join(parts))
+    return pages
+
+
 def _site_overview_reference_body(site: dict[str, Any], client: str, report_date: str = "") -> str:
     return _site_overview_fields(site, client, report_date)
 
@@ -1217,17 +1272,15 @@ def _assessment_notice_html(assessment: dict[str, Any] | None, *, no_findings: b
 
 def _severity_summary_html(summary: dict[str, Any] | None) -> str:
     summary = summary or {}
-    values = {key: int(summary.get(key) or 0) for key in ("Critical", "High", "Medium", "Low", "Info")}
-    total = int(summary.get("total") or sum(values.values()))
-    actionable = int(summary.get("actionable") or sum(values[k] for k in ("Critical", "High", "Medium", "Low")))
+    labels = ('Critical', 'High', 'Medium', 'Info') if summary.get('_exclude_low') else ('Critical', 'High', 'Medium', 'Low', 'Info')
+    values = {key: int(summary.get(key) or 0) for key in labels}
+    total = int(summary.get('total') if summary.get('total') is not None else sum(values.values()))
+    actionable = int(summary.get('actionable') if summary.get('actionable') is not None else sum(values[k] for k in labels if k != 'Info'))
+    headers = ''.join(f'<th>{_esc(key)}</th>' for key in labels)
+    numbers = ''.join(f"<td class='sev-{key.lower()}'>{values[key]}</td>" for key in labels)
     return (
         "<table width='100%' class='severity-summary'><tr>"
-        "<th>Critical</th><th>High</th><th>Medium</th><th>Low</th><th>Info</th><th>Total</th></tr>"
-        f"<tr><td class='sev-critical'>{values['Critical']}</td>"
-        f"<td class='sev-high'>{values['High']}</td>"
-        f"<td class='sev-medium'>{values['Medium']}</td>"
-        f"<td class='sev-low'>{values['Low']}</td>"
-        f"<td class='sev-info'>{values['Info']}</td><td>{total}</td></tr></table>"
+        f"{headers}<th>Total</th></tr><tr>{numbers}<td>{total}</td></tr></table>"
         f"<p class='appendix-note'><strong>Actionable findings:</strong> {actionable} &nbsp; | &nbsp; "
         f"<strong>Informational observations:</strong> {values['Info']}</p>"
     )
@@ -1732,12 +1785,12 @@ def _finding_details_pages(findings: list[dict[str, Any]], ctx: dict[str, Any]) 
     return pages
 
 
-def _compute_toc_page_map(*, findings_count: int, findings: list[dict[str, Any]] | None = None, ctx: dict[str, Any] | None = None) -> dict[str, Any]:
+def _compute_toc_page_map(*, findings_count: int, findings: list[dict[str, Any]] | None = None, ctx: dict[str, Any] | None = None, infrastructure_extra_pages: int = 0) -> dict[str, Any]:
     ctx = ctx or {}
     intro = 4
     site_overview = 5
     site_infra = 5
-    summary = 6
+    summary = 6 + infrastructure_extra_pages
     # Section 4 now spans one page per SUMMARY_ROWS_PER_PAGE findings, so the
     # observation section starts after all summary pages.
     summary_pages = _summary_page_count(findings_count)
@@ -1881,16 +1934,15 @@ def _fallback_section_bodies(ctx: dict[str, Any]) -> dict[str, str]:
             ("CONTACT PERSON:", _esc(_site_value(site.get("contact_person"))))))
 
     # --- 3. Site infrastructure ---
-    fw = site.get("firewall") or {}
     infra = ("<h2 class='section'>3. SITE INFRASTRUCTURE</h2>"
-             f"<p class='body'><strong>ENDPOINTS:</strong> No. of Endpoints – {_esc(_site_value(site.get('num_endpoints')))}</p>"
-             f"<p class='body'><strong>FIREWALL:</strong> {_esc(_site_value(fw.get('make_model') or site.get('firewall_summary'), 'No Firewall'))}</p>")
+             + _site_infrastructure_reference_body(site)
+             + ''.join(_site_infrastructure_extra_pages(site)))
 
     # --- 4. Summary ---
-    sev_headers = "".join(f"<th>{label}</th>" for label in ("Critical", "High", "Medium", "Low", "Info", "Total"))
+    sev_labels = ('Critical', 'High', 'Medium', 'Info') if fs.get('_exclude_low') else ('Critical', 'High', 'Medium', 'Low', 'Info')
+    sev_headers = "".join(f"<th>{label}</th>" for label in (*sev_labels, "Total"))
     sev_values = "".join(
-        f"<td class='sev-{key.lower()}'>{_esc(fs.get(key, 0))}</td>"
-        for key in ("Critical", "High", "Medium", "Low", "Info")
+        f"<td class='sev-{key.lower()}'>{_esc(fs.get(key, 0))}</td>" for key in sev_labels
     ) + f"<td class='sev-total'>{_esc(fs.get('total', len(findings)))}</td>"
     summary_parts = ["<h2 class='section'>4. SUMMARY OF VULNERABILITY ASSESSMENT</h2>",
                      f"<table class='sev'><tbody><tr>{sev_headers}</tr><tr>{sev_values}</tr></tbody></table>"]
@@ -1993,7 +2045,7 @@ def build_fallback_summary_pages(ctx: dict[str, Any], *, per_page: int = SUMMARY
         title = "4. SUMMARY OF VULNERABILITY ASSESSMENT" + (" (CONTINUED)" if page_idx else "")
         body = [f"<h2 class='section'>{title}</h2>"]
         if page_idx == 0:
-            labels = ("Critical", "High", "Medium", "Low", "Info", "Total")
+            labels = ("Critical", "High", "Medium", "Info", "Total") if fs.get('_exclude_low') else ("Critical", "High", "Medium", "Low", "Info", "Total")
             severity_bg = {"Critical": COLOR_CRITICAL, "High": COLOR_HIGH, "Medium": COLOR_MEDIUM,
                            "Low": COLOR_LOW, "Info": COLOR_INFO, "Total": "#ffffff"}
             severity_fg = {"Critical": "#ffffff", "High": "#ffffff", "Medium": "#000000",
@@ -2126,6 +2178,7 @@ def build_styled_gap_report_html(ctx: dict[str, Any], *, include_cover: bool = T
     site_overview_html = _site_overview_reference_body(site, client, report_date)
     site_infra_html = _site_infrastructure_reference_body(site)
     site_body = site_overview_html + _section_bar("3. SITE INFRASTRUCTURE") + site_infra_html
+    infrastructure_extra = _site_infrastructure_extra_pages(site)
 
     pages.append(
         _page_wrap(
@@ -2135,6 +2188,10 @@ def build_styled_gap_report_html(ctx: dict[str, Any], *, include_cover: bool = T
         )
     )
     page_no += 1
+
+    for extra_body in infrastructure_extra:
+        pages.append(_page_wrap(extra_body, page_no, section_bars=["3. SITE INFRASTRUCTURE (CONTINUED)"]))
+        page_no += 1
 
     summary_bodies = _summary_pages(findings, ctx.get("finding_summary"))
     for i, summary_body in enumerate(summary_bodies):
@@ -2165,7 +2222,9 @@ def build_styled_gap_report_html(ctx: dict[str, Any], *, include_cover: bool = T
     # the report; per-host service coverage stays available as the separate
     # "Service coverage CSV" export on the Reports page.
 
-    toc_html = _toc_page(toc_page_no, _compute_toc_page_map(findings_count=len(findings), findings=findings, ctx=ctx))
+    toc_html = _toc_page(toc_page_no, _compute_toc_page_map(
+        findings_count=len(findings), findings=findings, ctx=ctx,
+        infrastructure_extra_pages=len(infrastructure_extra)))
     pages.insert(1 if not include_cover else 2, toc_html)
 
     return (

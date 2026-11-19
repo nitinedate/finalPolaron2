@@ -1074,6 +1074,26 @@ def render_gap_docx(ctx: dict[str, Any]) -> bytes:
         ("CONTACT PERSON", "contact_person"),
     ):
         doc.add_paragraph(f"{label}: {site.get(key, client if key == 'client_name' else '—')}")
+    doc.add_heading("3. Site Infrastructure", level=1)
+    fw = site.get('firewall') or {}
+    inet = site.get('internet') or {}
+    for title, value in (
+        ('ENDPOINTS', site.get('num_endpoints')), ('FIREWALL', fw.get('make_model')),
+        ('BACKUP', site.get('backup_storage')), ('SWITCH', site.get('switch')),
+        ('ROUTER', site.get('router')), ('INTERNET', inet.get('vendors') or inet.get('type')),
+        ('ANTIVIRUS', site.get('antivirus')), ('EMAIL', site.get('email_summary')),
+    ):
+        doc.add_paragraph(f"{title}: {value or 'Not specified'}")
+    server_rows = [x for x in site.get('server_inventory') or [] if isinstance(x, dict)]
+    if server_rows:
+        doc.add_heading('Server inventory (names and IP addresses)', level=2)
+        table = doc.add_table(rows=1, cols=5)
+        for idx, name in enumerate(('Name', 'IP Address', 'Role', 'Operating System', 'Location')):
+            table.rows[0].cells[idx].text = name
+        for record in server_rows:
+            cells = table.add_row().cells
+            for idx, key in enumerate(('name', 'ip', 'role', 'operating_system', 'location')):
+                cells[idx].text = str(record.get(key) or '')
 
     doc.add_heading("4. Summary of Vulnerability Assessment", level=1)
     assessment = ctx.get("assessment") or {}
@@ -1138,6 +1158,24 @@ def render_gap_docx(ctx: dict[str, Any]) -> bytes:
     return buf.getvalue()
 
 
+def _pdf_view_without_low(ctx: dict[str, Any]) -> dict[str, Any]:
+    """View-time policy, intentionally scoped to generated gap-assessment PDFs.
+
+    Do not mutate the source context, recorded scan results or Solution Set.
+    Informational observations remain for completeness and assessment integrity.
+    """
+    summary = dict(ctx.get('finding_summary') or {})
+    excluded = int(summary.get('Low') or 0)
+    for key in ('total', 'actionable'):
+        if key in summary:
+            summary[key] = max(0, int(summary.get(key) or 0) - excluded)
+    summary.pop('Low', None)
+    summary['_exclude_low'] = True
+    kept = [f for f in (ctx.get('findings') or []) if str(f.get('risk') or '').casefold() != 'low']
+    return {**ctx, 'findings': kept, 'finding_summary': summary,
+            'exclude_low_in_pdf': True, 'low_findings_excluded_from_pdf': excluded}
+
+
 def export_gap_report(
     db,
     case_id: str,
@@ -1161,13 +1199,14 @@ def export_gap_report(
     if fmt == "docx":
         data = render_gap_docx(ctx)
         return data, "application/vnd.openxmlformats-officedocument.wordprocessingml.document", f"gap-assessment-{client_slug}.docx"
-    html_doc = build_gap_report_html(ctx, include_cover=False)
+    pdf_ctx = _pdf_view_without_low(ctx)
+    html_doc = build_gap_report_html(pdf_ctx, include_cover=False)
     pdf = render_gap_pdf(
         html_doc,
-        client=ctx["client"],
-        company=ctx["site"].get("company_name"),
-        report_date=ctx.get("report_date"),
-        ctx=ctx,
+        client=pdf_ctx["client"],
+        company=pdf_ctx["site"].get("company_name"),
+        report_date=pdf_ctx.get("report_date"),
+        ctx=pdf_ctx,
     )
     if pdf:
         return pdf, "application/pdf", f"gap-assessment-{client_slug}.pdf"
@@ -1199,6 +1238,9 @@ _SITE_COMPARE_KEYS = (
     "nac",
     "antivirus",
     "backup_storage",
+    "switch",
+    "router",
+    "email_summary",
     "company_name",
     "introduction",
 )
@@ -1284,21 +1326,44 @@ def sites_are_equivalent(sites: list[dict[str, Any]]) -> bool:
         for key in _SITE_COMPARE_KEYS:
             if _norm_merge_text(base.get(key)) != _norm_merge_text(other.get(key)):
                 return False
-        for key in ("operating_systems", "firewall", "internet"):
+        for key in ("operating_systems", "firewall", "internet", "server_inventory"):
             if not _nested_dict_equal(base.get(key) or {}, other.get(key) or {}):
                 return False
     return True
 
 
 def merge_gap_sites(sites: list[dict[str, Any]]) -> dict[str, Any]:
-    """Use first site when equivalent; otherwise keep primary and note divergence."""
+    """Preserve site provenance and union distinct server inventories across jobs.
+
+    Do not overwrite a different client's firewall, backup or other field with
+    a fabricated combined value. The report displays a short per-site appendix
+    in Site Infrastructure when sites disagree.
+    """
     if not sites:
         return {}
     primary = dict(sites[0])
-    if sites_are_equivalent(sites):
-        return primary
-    # Different site overview — keep primary fields; do not invent a blended narrative.
-    primary["_merged_site_diverged"] = True
+    merged_servers: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str, str]] = set()
+    unique_sites: list[dict[str, Any]] = []
+    for site in sites:
+        if not any(_nested_dict_equal(site, prior) for prior in unique_sites):
+            unique_sites.append(site)
+        for record in site.get('server_inventory') or []:
+            if not isinstance(record, dict):
+                continue
+            key = tuple(str(record.get(k) or '').strip().casefold()
+                        for k in ('name', 'ip', 'role', 'operating_system', 'location'))
+            if not key[0] or not key[1] or key in seen:
+                continue
+            merged_servers.append(dict(record))
+            seen.add(key)
+    primary['server_inventory'] = merged_servers
+    if len(unique_sites) > 1 and not sites_are_equivalent(sites):
+        primary['_merged_site_diverged'] = True
+        primary['_merged_site_details'] = [
+            {k: v for k, v in site.items() if not k.startswith('_') and k != 'server_inventory'}
+            for site in unique_sites
+        ]
     return primary
 
 
@@ -1494,13 +1559,14 @@ def export_merged_gap_report(
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             f"gap-assessment-{client_slug}-{suffix}.docx",
         )
-    html_doc = build_gap_report_html(ctx, include_cover=False)
+    pdf_ctx = _pdf_view_without_low(ctx)
+    html_doc = build_gap_report_html(pdf_ctx, include_cover=False)
     pdf = render_gap_pdf(
         html_doc,
-        client=ctx["client"],
-        company=ctx["site"].get("company_name"),
-        report_date=ctx.get("report_date"),
-        ctx=ctx,
+        client=pdf_ctx["client"],
+        company=pdf_ctx["site"].get("company_name"),
+        report_date=pdf_ctx.get("report_date"),
+        ctx=pdf_ctx,
     )
     if pdf:
         return pdf, "application/pdf", f"gap-assessment-{client_slug}-{suffix}.pdf"

@@ -194,8 +194,14 @@ def stage_remote_disk_evidence(db, job_id: str, files: list[dict], *, schema_nam
         if not plan:
             return files
         # Client shares are mounted read-only. All sources must be reachable.
+        mount_activity = {'subphase': 'remote_mount', 'segment_count': len(plan),
+                          'detail': 'waiting for frozen client share before sequential E01 transfer'}
+        execute(db, """UPDATE jobs SET pipeline_progress=jsonb_set(
+                    COALESCE(pipeline_progress, '{}'::jsonb), '{extraction_activity}',
+                    CAST(:activity AS jsonb), true), updated_at=NOW() WHERE id=:id""",
+                {'id': job_id, 'activity': json.dumps(mount_activity)})
         write_disk_log(db, job_id, f'Client image staging: {len(plan)} disk segments, sequential transfer before TSK parsing',
-                       stage='remote_stage', metadata={'segment_count': len(plan)})
+                       stage='remote_stage', metadata=mount_activity)
         db.commit()
         ensure_mounted_for_paths([step['original'] for step in plan])
         manifest_path = stage / 'sha256-manifest.json'

@@ -610,6 +610,8 @@ services:
       OCR_DOCUMENT_WORK_ROOT: ${OCR_DOCUMENT_WORK_ROOT:-/app/data/ocr_search}
       OCR_DOCUMENT_SOURCE_ROOTS: ${OCR_DOCUMENT_SOURCE_ROOTS:-/app/data/ocr_search/inbox}
       OCR_DOCUMENT_THREADS: ${OCR_DOCUMENT_THREADS:-1}
+      OCR_DOCUMENT_ENGINE: ${OCR_DOCUMENT_ENGINE:-surya}
+      OCR_DOCUMENT_DEVICE: ${OCR_DOCUMENT_DEVICE:-cpu}
       OCR_ENGINE: ${OCR_ENGINE:-surya}
     volumes:
       - ./backend:/app

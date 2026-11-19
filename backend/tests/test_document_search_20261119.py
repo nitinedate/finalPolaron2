@@ -222,3 +222,43 @@ def test_interrupted_server_snapshot_can_resume_without_duplicate_results(tmp_pa
     assert sorted(row['path'] for row in finished['results']) == ['a.txt', 'b.txt']
     assert (copy_dir / 'b.txt').read_text() == 'other'
     assert not (copy_dir / 'b.txt.ocr-partial').exists()
+
+
+def test_optional_paddle_v6_small_uses_pretrained_batch_and_model_cache(monkeypatch):
+    """Runs without downloading Paddle weights: test its documented Python API."""
+    import sys
+    from types import SimpleNamespace
+    from PIL import Image
+
+    calls = {'init': [], 'predict': 0}
+
+    class MockPaddle:
+        def __init__(self, **kwargs):
+            calls['init'].append(kwargs)
+
+        def predict(self, input):
+            calls['predict'] += 1
+            return [SimpleNamespace(json={'res': {'rec_texts': [f'Receipt {i}', 'amount 1200']}})
+                    for i in range(len(input))]
+
+    monkeypatch.setitem(sys.modules, 'paddleocr', SimpleNamespace(PaddleOCR=MockPaddle))
+    monkeypatch.setenv('OCR_DOCUMENT_ENGINE', 'paddle_v6_small')
+    monkeypatch.setenv('OCR_DOCUMENT_DEVICE', 'cpu')
+    monkeypatch.setattr(ocr, '_PADDLE_MODEL', None)
+    monkeypatch.setattr(ocr, '_PADDLE_MODEL_KEY', None)
+    img = Image.new('RGB', (10, 10), 'white')
+    assert ocr._recognize_many([img, img]) == ['Receipt 0\namount 1200', 'Receipt 1\namount 1200']
+    assert ocr._recognize_many([img]) == ['Receipt 0\namount 1200']
+    assert len(calls['init']) == 1 and calls['predict'] == 2
+    assert calls['init'][0]['text_detection_model_name'] == 'PP-OCRv6_small_det'
+    assert calls['init'][0]['text_recognition_model_name'] == 'PP-OCRv6_small_rec'
+
+
+def test_failed_optional_paddle_does_not_silently_mark_missing_text_as_nonmatch(monkeypatch):
+    from PIL import Image
+
+    monkeypatch.setenv('OCR_DOCUMENT_ENGINE', 'paddle_v6_small')
+    monkeypatch.setattr(ocr, '_paddle_recognize_many', lambda images: (_ for _ in ()).throw(OSError('Paddle unavailable')))
+    monkeypatch.setattr(ocr, '_recognize_fallback', lambda image, try_surya: 'Found contract ABC')
+    assert ocr._recognize(Image.new('RGB', (16, 16), 'white')) == 'Found contract ABC'
+    assert ocr._recognize_many([Image.new('RGB', (16, 16), 'white')]) == ['Found contract ABC']

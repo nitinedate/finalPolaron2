@@ -1,0 +1,72 @@
+{
+  "package": "Polaron 2026-11-19 patch",
+  "base": "polaron3(3).zip",
+  "files": [
+    {
+      "path": "backend/app/routers/cases.py",
+      "size": 20202,
+      "sha256": "bf42564c7092b465956492878ac0daacdffc69bee419874f3ead9e24e6cd6553"
+    },
+    {
+      "path": "backend/app/services/gap_assessment_report.py",
+      "size": 67300,
+      "sha256": "35e284598dc9195bf04ca984877664c0b3536d6b0216916ae10b9fb37c1ed7be"
+    },
+    {
+      "path": "backend/app/services/gap_report_template.py",
+      "size": 82321,
+      "sha256": "748e3ed9040fe7e6fa7dd530278e19410d35b8289d45da3931e78744cb130935"
+    },
+    {
+      "path": "backend/app/services/progress_agent.py",
+      "size": 60855,
+      "sha256": "53e39fb9b66f0ebe696998175d200b15393350bf119b54ed4cf2a55b1e594847"
+    },
+    {
+      "path": "backend/app/services/client_disk_staging.py",
+      "size": 18506,
+      "sha256": "c816bd9ab8e5bf8f20199897e2943dd78bfaf53111e2b131a69daebea97234f0"
+    },
+    {
+      "path": "backend/app/services/document_search.py",
+      "size": 27847,
+      "sha256": "4d91b3c7bb973f3533b71392a7a6adff99c235fe3a3c9740392b171050bd84c4"
+    },
+    {
+      "path": "frontend/src/pages/vuln/ReportsExportPage.tsx",
+      "size": 53158,
+      "sha256": "09f13fb1edbe44ef15b4f897cebc1d26ae3ec5614f9c84b93172ff4ee279768e"
+    },
+    {
+      "path": "backend/tests/test_document_search_20261119.py",
+      "size": 12640,
+      "sha256": "3d475ca40c5cf0dab624ca08f873a7a4c2e6c5e9a068734eafcc9509490c6556"
+    },
+    {
+      "path": "backend/tests/test_gap_site_servers_and_low_pdf_20261119.py",
+      "size": 4409,
+      "sha256": "68988de532b74d3c3e84794573c0415de192279a9f223811208712ee53e28483"
+    },
+    {
+      "path": "backend/tests/test_remote_stage_progress_fingerprint_20261119.py",
+      "size": 1175,
+      "sha256": "abaeb996f54f8a304f42460676bc5d61b14e9e88ce39dcfc7fea8de6d6cb8fd3"
+    },
+    {
+      "path": ".env.example",
+      "size": 26199,
+      "sha256": "ed56694c5b6d0257e679420abf2e8a8e587bb80f5eefa0a462b235371a2d2432"
+    },
+    {
+      "path": "docker-compose.yml",
+      "size": 48438,
+      "sha256": "ddbb44e80e4da3130fe35056004c17970f82c37dfe059d0e7db89d8662819eee"
+    },
+    {
+      "path": "POLARON_FIXES_20261119_README.md",
+      "size": 10573,
+      "sha256": "8697ef3a5423e086d4fffee4c4639e895f540486fff56fc5523a8094dbaa0eec"
+    }
+  ],
+  "contains_deployment_secrets": false
+}

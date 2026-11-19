@@ -665,6 +665,9 @@ def acquisition_fingerprint(job: dict) -> str:
         activity.get("subphase"), activity.get("files_found"),
         activity.get("entries_scanned"), activity.get("directories_scanned"),
         activity.get("files_extracted"), activity.get("bytes_extracted"),
+        # Remote client staging precedes TSK. Actual transferred bytes are
+        # useful evidence progress, unlike heartbeat timestamps or log text.
+        activity.get("copied_bytes"), activity.get("total_bytes"),
         activity.get("shards_done"), activity.get("unreadable_directories"),
         activity.get("files_scanned"),
         activity.get("last_path"), activity.get("alias_directories_skipped"),
@@ -751,6 +754,11 @@ def acquisition_diagnosis(job: dict, age_seconds: float) -> str:
                 f"entries={entries:,}, unreadable={errors:,}; "
                 f"{detail}. Isolated watchdog will use serial fallback before alternating the root method; "
                 "do not start a duplicate extraction.")
+    if subphase == "remote_mount":
+        return (f"Client evidence mount: waiting {int(age_seconds)}s for a readable, "
+                "frozen client share before E01 transfer. Check client-agent heartbeat, "
+                "read-only FUSE mount, network connectivity and file permissions. "
+                "Do not dispatch a duplicate extraction.")
     if subphase == "remote_staging":
         copied = int(activity.get("copied_bytes") or 0)
         total = int(activity.get("total_bytes") or 0)

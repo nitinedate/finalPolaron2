@@ -32,6 +32,67 @@ MAX_FILE_BYTES = 200 * 1024 * 1024
 MAX_FILES = 3000
 MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
 _STATE_LOCK = Lock()
+# PaddleOCR inference engines are not guaranteed safe for concurrent predict()
+# calls. The lock protects only an optional OCR model in this worker process;
+# distinct OCR workers and other forensic pipeline stages remain independent.
+_PADDLE_LOCK = Lock()
+_PADDLE_MODEL = None
+_PADDLE_MODEL_KEY = None
+
+
+def document_ocr_engine() -> str:
+    """OCR Documents can choose its own engine without changing disk/mobile OCR."""
+    name = (os.environ.get('OCR_DOCUMENT_ENGINE') or os.environ.get('OCR_ENGINE') or 'surya').strip().lower()
+    choices = {'surya', 'tesseract', 'paddle_v6_tiny', 'paddle_v6_small', 'paddle_v6_medium'}
+    if name not in choices:
+        raise ValueError(f'Unsupported OCR_DOCUMENT_ENGINE={name}; select one of {sorted(choices)}')
+    return name
+
+
+def _paddle_recognize_many(images: list) -> list[str]:
+    """Optional pretrained PP-OCRv6 inference (PaddleOCR 3.x), with model reuse.
+
+    No model files or GPU drivers are installed from a request: administrators
+    provision PaddleOCR/model weights in the dedicated OCR worker image.
+    """
+    if not images:
+        return []
+    import numpy as np
+    from paddleocr import PaddleOCR
+
+    name = document_ocr_engine()
+    if not name.startswith('paddle_v6_'):
+        raise ValueError('PaddleOCR requested without paddle_v6_* engine')
+    scale = name.removeprefix('paddle_v6_')
+    device = (os.environ.get('OCR_DOCUMENT_DEVICE') or 'cpu').strip()
+    key = (name, device)
+    global _PADDLE_MODEL, _PADDLE_MODEL_KEY
+    with _PADDLE_LOCK:
+        if _PADDLE_MODEL is None or _PADDLE_MODEL_KEY != key:
+            _PADDLE_MODEL = PaddleOCR(
+                text_detection_model_name=f'PP-OCRv6_{scale}_det',
+                text_recognition_model_name=f'PP-OCRv6_{scale}_rec',
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+                device=device,
+            )
+            _PADDLE_MODEL_KEY = key
+        predictions = _PADDLE_MODEL.predict(input=[np.asarray(img.convert('RGB')) for img in images])
+    output = []
+    for row in predictions:
+        payload = getattr(row, 'json', None)
+        if callable(payload):
+            payload = payload()
+        if not isinstance(payload, dict):
+            raise RuntimeError('PaddleOCR returned unexpected response format')
+        result = payload.get('res', payload)
+        if not isinstance(result, dict) or not isinstance(result.get('rec_texts'), list):
+            raise RuntimeError('PaddleOCR did not return recognized text records')
+        output.append('\n'.join(str(text) for text in result['rec_texts'] if str(text).strip()))
+    if len(output) != len(images):
+        raise RuntimeError('PaddleOCR returned a different number of page results')
+    return output
 
 
 def work_root() -> Path:
@@ -190,7 +251,7 @@ def extract_text(path: Path) -> tuple[str, str]:
                 result[index] += '\n' + text
             ocr_indices.clear()
             ocr_images.clear()
-            engines.add('surya-or-tesseract')
+            engines.add('surya-or-tesseract' if document_ocr_engine() == 'surya' else f'{document_ocr_engine()}-with-fallback')
         with fitz.open(path) as pdf:
             if pdf.needs_pass:
                 raise RuntimeError('Password-protected PDF; provide an authorized unlocked copy')
@@ -218,13 +279,22 @@ def extract_text(path: Path) -> tuple[str, str]:
         from PIL import Image
         with Image.open(path) as opened:
             image = opened.convert('RGB')
-        return _recognize(image), 'surya-or-tesseract'
+        return _recognize(image), ('surya-or-tesseract' if document_ocr_engine() == 'surya' else f'{document_ocr_engine()}-with-fallback')
     raise ValueError('Unsupported document type')
 
 
 def _recognize_many(images: list) -> list[str]:
-    """Batch Surya for scanned PDF pages; fall back to Tesseract page by page."""
-    if (os.environ.get('OCR_ENGINE') or 'surya').lower() == 'surya':
+    """Batched PP-OCRv6 or Surya, with per-image fallback on engine failure."""
+    engine = document_ocr_engine()
+    if engine.startswith('paddle_v6_'):
+        try:
+            return _paddle_recognize_many(images)
+        except Exception:
+            # A PaddleGPU setup may be unavailable when the worker starts. A
+            # fallback must still be attempted; never silently mark OCR failed
+            # pages as not matching the user's phrase.
+            pass
+    if engine == 'surya' or engine.startswith('paddle_v6_'):
         try:
             from app.services.ocr_gpu import _surya_ocr_images
             results = _surya_ocr_images(images, prompt='Text Recognition:')
@@ -232,18 +302,12 @@ def _recognize_many(images: list) -> list[str]:
                 return [text for text, _ in results]
         except Exception:
             pass
-    return [_recognize(image) for image in images]
+    return [_recognize_fallback(image, try_surya=engine != 'tesseract') for image in images]
 
 
-def _recognize(image) -> str:
-    """Prefer configured Surya inference; fall back to local Tesseract.
-
-    A missing OCR engine is an ERROR, never a false 'no match'.
-    """
-    import os
-    engine = (os.environ.get('OCR_ENGINE') or 'surya').lower()
+def _recognize_fallback(image, *, try_surya: bool) -> str:
     failure = None
-    if engine == 'surya':
+    if try_surya:
         try:
             from app.services.ocr_gpu import _surya_ocr_image
             text, _confidence = _surya_ocr_image(image, prompt='Text Recognition:')
@@ -255,6 +319,19 @@ def _recognize(image) -> str:
         return _tesseract_image(image)
     except Exception as exc:
         raise RuntimeError(f'OCR engine failed (Surya={failure}; Tesseract={exc})') from exc
+
+
+def _recognize(image) -> str:
+    """Recognize an image using the configured OCR Documents engine."""
+    engine = document_ocr_engine()
+    if engine.startswith('paddle_v6_'):
+        try:
+            return _paddle_recognize_many([image])[0]
+        except Exception:
+            # Important: fallback errors still become processing errors, not
+            # a false nonmatching file eligible for source quarantine.
+            return _recognize_fallback(image, try_surya=True)
+    return _recognize_fallback(image, try_surya=engine == 'surya')
 
 
 def normalized(value: str) -> str:

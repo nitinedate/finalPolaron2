@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { Download, FileOutput, FileText, Upload } from "lucide-react";
+import { Download, FileOutput, FileText, Plus, Trash2, Upload } from "lucide-react";
 import clsx from "clsx";
 import { Badge, Button, Card, Field, Input, PageHeader, Select, Spinner } from "../../components/ui";
 import { vulnApi } from "../../lib/vulnApi";
@@ -55,6 +55,16 @@ type GapOperatingSystems = {
   mac?: string;
 };
 
+type ServerInventoryRow = {
+  name: string;
+  ip: string;
+  role?: string;
+  operating_system?: string;
+  location?: string;
+};
+
+const emptyServer = (): ServerInventoryRow => ({ name: "", ip: "", role: "", operating_system: "", location: "" });
+
 export type GapIntake = {
   client_name?: string;
   branch_locations?: string;
@@ -74,6 +84,10 @@ export type GapIntake = {
   nac?: string;
   antivirus?: string;
   backup_storage?: string;
+  switch?: string;
+  router?: string;
+  email_summary?: string;
+  server_inventory?: ServerInventoryRow[];
   author?: string;
   document_version?: string;
   has_saved_intake?: boolean;
@@ -140,6 +154,9 @@ export function ReportsExportPage() {
   // V1.10.6: the merge picks scan jobs (one case can hold several), not cases.
   const [mergeCandidates, setMergeCandidates] = useState<GapMergeJobCandidate[]>([]);
   const [selectedCaseId, setSelectedCaseId] = useState("");
+  const [selectionMode, setSelectionMode] = useState<"case" | "job">("case");
+  const [globalJobChoice, setGlobalJobChoice] = useState("");
+  const [allJobCandidates, setAllJobCandidates] = useState<GapMergeJobCandidate[]>([]);
   const [jobs, setJobs] = useState<ScanJob[]>([]);
   const [jobsLoading, setJobsLoading] = useState(true);
   const [selectedJobId, setSelectedJobId] = useState<string>(ALL_JOBS);
@@ -181,6 +198,37 @@ export function ReportsExportPage() {
     },
     [],
   );
+
+  const updateServer = useCallback((index: number, field: keyof ServerInventoryRow, value: string) => {
+    setGapIntake((prev) => ({ ...prev, server_inventory: (prev.server_inventory || []).map(
+      (server, i) => i === index ? { ...server, [field]: value } : server,
+    ) }));
+  }, []);
+
+  const addServer = useCallback(() => {
+    setGapIntake((prev) => ({ ...prev, server_inventory: [...(prev.server_inventory || []), emptyServer()] }));
+  }, []);
+
+  const removeServer = useCallback((index: number) => {
+    setGapIntake((prev) => ({ ...prev, server_inventory: (prev.server_inventory || []).filter((_, i) => i !== index) }));
+  }, []);
+
+  const intakePayload = useCallback((): Record<string, unknown> | null => {
+    const { has_saved_intake: _ignored, ...payload } = gapIntake;
+    const rows = (gapIntake.server_inventory || []).map((row) => ({
+      name: row.name.trim(), ip: row.ip.trim(), role: (row.role || "").trim(),
+      operating_system: (row.operating_system || "").trim(), location: (row.location || "").trim(),
+    })).filter((row) => Object.values(row).some(Boolean));
+    if (rows.some((row) => !row.name || !row.ip)) {
+      toast.error("Every server row must include both a server name and IP address.");
+      return null;
+    }
+    if (rows.length > 200) {
+      toast.error("Add at most 200 servers to one site overview.");
+      return null;
+    }
+    return { ...payload, server_inventory: rows };
+  }, [gapIntake, toast]);
 
   const loadMergeCandidates = useCallback(async () => {
     const seq = ++mergeRequest.current;
@@ -225,6 +273,16 @@ export function ReportsExportPage() {
     }
   }, [toast]);
 
+  // A scan job can be selected directly: the containing case is derived from
+  // the server's job/case mapping, rather than manually chosen by the user.
+  useEffect(() => {
+    let active = true;
+    vulnApi.listGapMergeJobCandidates({ limit: 200 }).then((result) => {
+      if (active) setAllJobCandidates(result.items || []);
+    }).catch(() => { if (active) setAllJobCandidates([]); });
+    return () => { active = false; };
+  }, []);
+
   // V1.10.3: the jobs of the selected case; the newest job is selected by default.
   useEffect(() => {
     let cancelled = false;
@@ -241,7 +299,8 @@ export function ReportsExportPage() {
         if (cancelled) return;
         const list = Array.isArray(items) ? items : [];
         setJobs(list);
-        setSelectedJobId(list[0]?.id ?? ALL_JOBS);
+        setSelectedJobId(selectionMode === "job" && list.some((item) => item.id === globalJobChoice)
+          ? globalJobChoice : (list[0]?.id ?? ALL_JOBS));
       })
       .catch(() => {
         if (!cancelled) setJobs([]);
@@ -252,17 +311,18 @@ export function ReportsExportPage() {
     return () => {
       cancelled = true;
     };
-  }, [selectedCaseId]);
+  }, [selectedCaseId, selectionMode, globalJobChoice]);
 
   const selectedJob = jobs.find((j) => j.id === selectedJobId) ?? null;
   const scopeLabel = selectedJob ? `job ${selectedJob.id.slice(0, 8)}` : "whole case";
+  const hasReportScope = !!selectedCaseId && (selectionMode === "case" || !!globalJobChoice);
 
   // Only the newest request may set the summary: switching job/case quickly must
   // never leave the counts of the previously selected scope on screen.
   const summaryRequest = useRef(0);
   const loadSummary = useCallback(async () => {
     const seq = ++summaryRequest.current;
-    if (!selectedCaseId || jobsLoading) {
+    if (!hasReportScope || jobsLoading) {
       setSummary(null);
       return;
     }
@@ -272,7 +332,7 @@ export function ReportsExportPage() {
     } catch {
       if (seq === summaryRequest.current) setSummary(null);
     }
-  }, [selectedCaseId, selectedJobId, jobsLoading]);
+  }, [selectedCaseId, selectedJobId, jobsLoading, hasReportScope]);
 
   const loadGapIntake = useCallback(async () => {
     if (!selectedCaseId) return;
@@ -357,10 +417,11 @@ export function ReportsExportPage() {
   }
 
   async function saveGapIntake() {
-    if (!selectedCaseId) return;
+    if (!hasReportScope) return;
+    const payload = intakePayload();
+    if (!payload) return;
     setSavingIntake(true);
     try {
-      const { has_saved_intake: _ignored, ...payload } = gapIntake;
       const saved = (await vulnApi.saveGapIntake(selectedCaseId, payload)) as GapIntake;
       setGapIntake(saved);
       setIntakeHasData(hasStoredIntake(saved));
@@ -378,10 +439,11 @@ export function ReportsExportPage() {
   }
 
   async function exportGap(fmt: "pdf" | "docx") {
-    if (!selectedCaseId) return;
+    if (!hasReportScope) return;
+    const payload = intakePayload();
+    if (!payload) return;
     setGapExporting(fmt);
     try {
-      const { has_saved_intake: _ignored, ...payload } = gapIntake;
       await vulnApi.saveGapIntake(selectedCaseId, payload);
       const scanJobId = selectedJobId || null;
       // V1.27.0: "All jobs in this case" with 2+ jobs downloads one ZIP holding each
@@ -448,18 +510,48 @@ export function ReportsExportPage() {
       ) : (
         <>
           <Card className="mb-6 p-4">
-            <div className="grid gap-4 md:grid-cols-2">
-              <Field label="Case" hint="The site overview for the gap report is saved per case.">
-                <Select value={selectedCaseId} onChange={(e) => setSelectedCaseId(e.target.value)}>
-                  <option value="">Select case…</option>
-                  {cases.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.title || c.number || c.id.slice(0, 8)}
-                    </option>
-                  ))}
+            <div className="grid gap-4 md:grid-cols-3">
+              <Field label="Report selection" hint="Choose a case, or pick a finished job without selecting a case first.">
+                <Select value={selectionMode} onChange={(e) => {
+                  const mode = e.target.value as "case" | "job";
+                  setSelectionMode(mode);
+                  setSelectedCaseId(mode === "job" ? "" : (cases[0]?.id || ""));
+                  setGlobalJobChoice("");
+                }}>
+                  <option value="case">Select by case</option>
+                  <option value="job">Select by scan job (any case)</option>
                 </Select>
               </Field>
-              <Field
+              {selectionMode === "case" ? (
+                <Field label="Case" hint="The site infrastructure is saved per case.">
+                  <Select value={selectedCaseId} onChange={(e) => setSelectedCaseId(e.target.value)}>
+                    <option value="">Select case…</option>
+                    {cases.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.title || c.number || c.id.slice(0, 8)}
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+              ) : (
+                <Field label="Scan job (case resolved automatically)" hint="Latest 200 completed jobs with saved site intake. Merge multiple jobs below.">
+                  <Select value={globalJobChoice} onChange={(e) => {
+                    const value = e.target.value;
+                    const match = allJobCandidates.find((candidate) => candidate.job_id === value);
+                    setGlobalJobChoice(value);
+                    setSelectedCaseId(match?.case_id || "");
+                    setSelectedJobId(value);
+                  }}>
+                    <option value="">Choose a finished scan job…</option>
+                    {allJobCandidates.map((candidate) => (
+                      <option key={candidate.job_id} value={candidate.job_id}>
+                        {candidate.case_title || candidate.case_number || candidate.case_id.slice(0, 8)} — {candidate.job_id.slice(0, 8)} ({candidate.status})
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+              )}
+              {selectionMode === "case" && <Field
                 label="Scan job"
                 hint={
                   jobsLoading
@@ -474,7 +566,7 @@ export function ReportsExportPage() {
                 <Select
                   value={selectedJobId}
                   onChange={(e) => setSelectedJobId(e.target.value)}
-                  disabled={!selectedCaseId || jobsLoading}
+                  disabled={!hasReportScope || jobsLoading}
                 >
                   {jobs.map((j) => (
                     <option key={j.id} value={j.id}>
@@ -483,7 +575,7 @@ export function ReportsExportPage() {
                   ))}
                   <option value={ALL_JOBS}>All jobs in this case</option>
                 </Select>
-              </Field>
+              </Field>}
             </div>
           </Card>
 
@@ -504,13 +596,13 @@ export function ReportsExportPage() {
                     ))}
                   </div>
                 </div>
-                <Button variant="brand" loading={exporting} onClick={exportXlsx} disabled={!selectedCaseId || jobsLoading}>
+                <Button variant="brand" loading={exporting} onClick={exportXlsx} disabled={!hasReportScope || jobsLoading}>
                   <Download className="h-4 w-4" /> Export solution-set Excel
                 </Button>
-                <Button variant="ghost" loading={exporting} onClick={exportCsv} disabled={!selectedCaseId || jobsLoading}>
+                <Button variant="ghost" loading={exporting} onClick={exportCsv} disabled={!hasReportScope || jobsLoading}>
                   <Download className="h-4 w-4" /> Export solution-set CSV
                 </Button>
-                <Button variant="ghost" loading={exporting} onClick={exportCoverage} disabled={!selectedCaseId || jobsLoading}>
+                <Button variant="ghost" loading={exporting} onClick={exportCoverage} disabled={!hasReportScope || jobsLoading}>
                   <Download className="h-4 w-4" /> Service coverage CSV
                 </Button>
                 <input
@@ -816,7 +908,45 @@ export function ReportsExportPage() {
                           onChange={(e) => patchIntake({ backup_storage: e.target.value })}
                         />
                       </Field>
+                      <Field label="Network switch(es)">
+                        <Input value={gapIntake.switch ?? ""} onChange={(e) => patchIntake({ switch: e.target.value })} />
+                      </Field>
+                      <Field label="Router(s)">
+                        <Input value={gapIntake.router ?? ""} onChange={(e) => patchIntake({ router: e.target.value })} />
+                      </Field>
+                      <Field label="Email system / provider">
+                        <Input value={gapIntake.email_summary ?? ""} onChange={(e) => patchIntake({ email_summary: e.target.value })} />
+                      </Field>
                     </div>
+                  </FieldGroupPanel>
+                </section>
+
+                <section>
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <SectionHeading>Server inventory — names and IP addresses</SectionHeading>
+                    <Button variant="outline" disabled={(gapIntake.server_inventory || []).length >= 200}
+                      onClick={addServer}>
+                      <Plus className="h-4 w-4" /> Add server
+                    </Button>
+                  </div>
+                  <p className="mt-2 text-sm text-ink-600">Add as many server IPs as needed (up to 200 per case). All rows appear under Site Infrastructure in the PDF/DOCX, with continuation pages when needed.</p>
+                  <FieldGroupPanel className="mt-4">
+                    {(gapIntake.server_inventory || []).length === 0 ? (
+                      <p className="text-sm text-ink-500">No servers entered. Select Add server to enter the first one.</p>
+                    ) : (
+                      <div className="space-y-3">
+                        {(gapIntake.server_inventory || []).map((server, index) => (
+                          <div key={index} className="grid gap-3 rounded-lg border border-ink-200 bg-white p-3 md:grid-cols-2 xl:grid-cols-[1.3fr_1.25fr_1fr_1fr_1fr_auto]">
+                            <Field label="Server name"><Input value={server.name} placeholder="APP-SERVER-01" onChange={(e) => updateServer(index, "name", e.target.value)} /></Field>
+                            <Field label="Server IP"><Input value={server.ip} placeholder="192.168.10.20" onChange={(e) => updateServer(index, "ip", e.target.value)} /></Field>
+                            <Field label="Role"><Input value={server.role ?? ""} placeholder="Application" onChange={(e) => updateServer(index, "role", e.target.value)} /></Field>
+                            <Field label="OS"><Input value={server.operating_system ?? ""} placeholder="Ubuntu 24.04" onChange={(e) => updateServer(index, "operating_system", e.target.value)} /></Field>
+                            <Field label="Location"><Input value={server.location ?? ""} placeholder="Office / DC" onChange={(e) => updateServer(index, "location", e.target.value)} /></Field>
+                            <div className="flex items-end pb-1"><Button variant="ghost" onClick={() => removeServer(index)} title={`Remove server ${index + 1}`}><Trash2 className="h-4 w-4" /> Remove</Button></div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </FieldGroupPanel>
                 </section>
 
@@ -825,14 +955,14 @@ export function ReportsExportPage() {
                     variant={intakeHasData ? "brand" : "outline"}
                     loading={savingIntake}
                     onClick={() => void saveGapIntake()}
-                    disabled={!selectedCaseId}
+                    disabled={!hasReportScope}
                   >
                     {intakeHasData ? "Update site overview" : "Save site overview"}
                   </Button>
                   <Button
                     variant="brand"
                     loading={gapExporting === "pdf"}
-                    disabled={!selectedCaseId || jobsLoading}
+                    disabled={!hasReportScope || jobsLoading}
                     onClick={() => void exportGap("pdf")}
                   >
                     <Download className="h-4 w-4" /> Download PDF
@@ -840,7 +970,7 @@ export function ReportsExportPage() {
                   <Button
                     variant="outline"
                     loading={gapExporting === "docx"}
-                    disabled={!selectedCaseId || jobsLoading}
+                    disabled={!hasReportScope || jobsLoading}
                     onClick={() => void exportGap("docx")}
                   >
                     <Download className="h-4 w-4" /> Download DOCX
