@@ -1,5 +1,5 @@
 {
-  "release": "sanitized-full-source-cpu-guard",
+  "release": "sanitized-full-source-compose-cpu-single-source",
   "date": "2026-11-19",
   "files": [
     {
@@ -426,6 +426,11 @@
       "path": "COMMON_DOCKER_VALIDATION_20261110.md",
       "bytes": 2684,
       "sha256": "0e7b59a35eac46fc9ca4b53a8ac670dc3e55120f32149eab0bfc6927fe86b040"
+    },
+    {
+      "path": "COMPOSE_CPU_CONFLICT_STARTUP_REPAIR_20261119.md",
+      "bytes": 4682,
+      "sha256": "4229ae082ec4f66e327e529227b43f0413cc5dc4d69ed4ca4f1db496f8a66afc"
     },
     {
       "path": "COMPOSE_DUPLICATE_KEYS_CLEANUP_V75.md",
@@ -6363,6 +6368,11 @@
       "sha256": "5d43f28913ae31e943027ad92a2ff79b41b9562a47d1c27c3e52bd1a047905bb"
     },
     {
+      "path": "backend/tests/test_compose_cpu_limits_consistency_20261119.py",
+      "bytes": 2795,
+      "sha256": "07586c563ada6ea3cb1093eb468953a73d7dbc6125f053dee780571a9908e1e3"
+    },
+    {
       "path": "backend/tests/test_connected_device_counts.py",
       "bytes": 1257,
       "sha256": "ff4250c2de47bdbb77c6b07ed25e859cee83403d007680515438471ed9e898b0"
@@ -8084,8 +8094,8 @@
     },
     {
       "path": "docker-compose.yml",
-      "bytes": 48086,
-      "sha256": "e5307d5f1ed4f38567c8242625b38fdcde9e2d04d4846f06279810567aacb0ea"
+      "bytes": 48326,
+      "sha256": "ec544bc0f4c3028f8cac187eb03603fb8d80b1ce76cb03da47f716ec397989e9"
     },
     {
       "path": "docker/pgadmin/pgpass",
@@ -9834,8 +9844,8 @@
     },
     {
       "path": "laptop-scanner/docker-compose.yml",
-      "bytes": 18988,
-      "sha256": "73ed44f31f4d2556e1abe59b9dfb97c339947ba2e23b6bb84b4610c34f73249d"
+      "bytes": 19243,
+      "sha256": "74af80d14437616571870dc40586caa9cc4dccca06cc415a7561d2763df65972"
     },
     {
       "path": "laptop-scanner/scanner-agent/Dockerfile",
@@ -12719,8 +12729,8 @@
     },
     {
       "path": "services/vuln/docker-compose.yml",
-      "bytes": 5073,
-      "sha256": "dd2b8f1395d12cdb319b28436c1ccd30232f05f91c752509b37bd6c1ba4228db"
+      "bytes": 5175,
+      "sha256": "7f844eb35c47f23a7ad8e32d9f8fa3e1f26de6b66cf6cdd63168b5f65ce6ffd1"
     },
     {
       "path": "setup-rag-public-https-complete.ps1",
@@ -13072,6 +13082,5 @@
       "bytes": 201844,
       "sha256": "e7935ce903e35a899f6f84db77fb656ac8ed96a4f303b59d6daddf4a648aaeb6"
     }
-  ],
-  "excluded": "private .env values, backups, caches, secrets and generated build dependencies"
+  ]
 }

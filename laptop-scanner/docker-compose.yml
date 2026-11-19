@@ -83,7 +83,10 @@ services:
       - gvm_psql_socket:/var/run/postgresql
 
   pg-gvm:
-    cpus: "${SCANNER_CPU_POSTGRES_CPUS:-0.5}"
+    deploy:
+      resources:
+        limits:
+          cpus: "${SCANNER_CPU_POSTGRES_CPUS:-0.5}"
     image: registry.community.greenbone.net/community/pg-gvm:stable
     restart: on-failure
     volumes:
@@ -111,7 +114,10 @@ services:
         condition: service_started
 
   gvmd:
-    cpus: "${SCANNER_CPU_GVMD_CPUS:-0.65}"
+    deploy:
+      resources:
+        limits:
+          cpus: "${SCANNER_CPU_GVMD_CPUS:-0.65}"
     image: registry.community.greenbone.net/community/gvmd:stable
     restart: on-failure
     volumes:
@@ -199,7 +205,10 @@ services:
         condition: service_completed_successfully
 
   openvasd:
-    cpus: "${SCANNER_CPU_OPENVASD_CPUS:-0.75}"
+    deploy:
+      resources:
+        limits:
+          cpus: "${SCANNER_CPU_OPENVASD_CPUS:-0.75}"
     image: registry.community.greenbone.net/community/openvas-scanner:stable
     restart: on-failure
     environment:
@@ -227,7 +236,10 @@ services:
         aliases: [openvasd]
 
   ospd-openvas:
-    cpus: "${SCANNER_CPU_OSPD_CPUS:-1.75}"
+    deploy:
+      resources:
+        limits:
+          cpus: "${SCANNER_CPU_OSPD_CPUS:-1.75}"
     image: registry.community.greenbone.net/community/ospd-openvas:stable
     hostname: ospd-openvas.local
     restart: on-failure
@@ -288,7 +300,10 @@ services:
     entrypoint: ["python", "-m", "agent.bootstrap_control_plane"]
 
   scanner-agent:
-    cpus: "${SCANNER_CPU_AGENT_CPUS:-0.5}"
+    deploy:
+      resources:
+        limits:
+          cpus: "${SCANNER_CPU_AGENT_CPUS:-0.5}"
     build: ./scanner-agent
     restart: unless-stopped
     env_file: .env

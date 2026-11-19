@@ -60,7 +60,10 @@ x-vuln-env: &vuln-env
 
 services:
   api:
-    cpus: "${VULN_CPU_API_CPUS:-0.5}"
+    deploy:
+      resources:
+        limits:
+          cpus: "${VULN_CPU_API_CPUS:-0.5}"
     networks:
       default: {}
       aetheris-common:
@@ -103,7 +106,10 @@ services:
       start_period: 420s
 
   worker-nessus:
-    cpus: "${VULN_CPU_WORKER_CPUS:-0.75}"
+    deploy:
+      resources:
+        limits:
+          cpus: "${VULN_CPU_WORKER_CPUS:-0.75}"
     networks:
       - default
       - aetheris-common

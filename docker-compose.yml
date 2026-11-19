@@ -299,7 +299,6 @@ services:
 
   # NVIDIA CUDA runtime — stays up so GPU passthrough is live for OCR/RAG workers.
   neo4j:
-    cpus: "${FORENSIC_CPU_NEO4J_CPUS:-0.5}"
     image: neo4j:5
     environment:
       NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-forensic123}
@@ -312,10 +311,10 @@ services:
     deploy:
       resources:
         limits:
+          cpus: "${FORENSIC_CPU_NEO4J_CPUS:-0.5}"
           memory: 2G
 
   api:
-    cpus: "${FORENSIC_CPU_API_CPUS:-1.0}"
     networks:
       default: {}
       aetheris-common:
@@ -376,6 +375,7 @@ services:
           devices:
             - *gpu
         limits:
+          cpus: "${FORENSIC_CPU_API_CPUS:-1.0}"
           memory: 4G
     command: ["/scripts/start-api-container.sh", "app.main:app"]
     healthcheck:
@@ -495,7 +495,10 @@ services:
   # CPU-only evidence quality triage. This sidecar inspects poor images/documents
   # and sampled video frames while native parsing continues. It never runs GPU OCR.
   worker-quality:
-    cpus: "${FORENSIC_CPU_QUALITY_CPUS:-0.5}"
+    deploy:
+      resources:
+        limits:
+          cpus: "${FORENSIC_CPU_QUALITY_CPUS:-0.5}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     <<: [*common-net, *worker-lifecycle, *client-evidence-fuse]
@@ -535,7 +538,6 @@ services:
 
   # GPU embeddings on rag-index. OCR runs on worker-ocr-gpu so both can overlap.
   worker-rag-gpu:
-    cpus: "${FORENSIC_CPU_RAG_GPU_CPUS:-0.5}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     <<: [*common-net, *worker-lifecycle, *client-evidence-fuse]
@@ -564,6 +566,7 @@ services:
           devices:
             - *gpu
         limits:
+          cpus: "${FORENSIC_CPU_RAG_GPU_CPUS:-0.5}"
           memory: 8G
     volumes:
       - ./backend:/app
@@ -634,7 +637,6 @@ services:
 
   # Dedicated OCR GPU worker — independent of RAG embeddings (two GPU slots).
   worker-ocr-gpu:
-    cpus: "${FORENSIC_CPU_OCR_GPU_CPUS:-0.5}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     <<: [*common-net, *worker-lifecycle, *client-evidence-fuse]
@@ -666,6 +668,7 @@ services:
           devices:
             - *gpu
         limits:
+          cpus: "${FORENSIC_CPU_OCR_GPU_CPUS:-0.5}"
           memory: 6G
     volumes:
       - ./backend:/app
@@ -694,7 +697,6 @@ services:
       - ocr
 
   worker-report:
-    cpus: "${FORENSIC_CPU_REPORT_CPUS:-0.25}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     <<: [*common-net, *worker-lifecycle, *client-evidence-fuse]
@@ -724,6 +726,7 @@ services:
     deploy:
       resources:
         limits:
+          cpus: "${FORENSIC_CPU_REPORT_CPUS:-0.25}"
           memory: 4G
     entrypoint: *dynamic-entrypoint
     command:
@@ -738,7 +741,6 @@ services:
 
   # Forensic Agentic AI — isolated from disk-build / rag-index
   worker-agent:
-    cpus: "${FORENSIC_CPU_AGENT_CPUS:-0.25}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     <<: [*common-net, *worker-lifecycle, *client-evidence-fuse]
@@ -767,6 +769,7 @@ services:
           devices:
             - *gpu
         limits:
+          cpus: "${FORENSIC_CPU_AGENT_CPUS:-0.25}"
           memory: 4G
     entrypoint: *dynamic-entrypoint
     command:
@@ -781,7 +784,10 @@ services:
       - agent-orchestration
 
   worker-progress:
-    cpus: "${FORENSIC_CPU_PROGRESS_CPUS:-0.35}"
+    deploy:
+      resources:
+        limits:
+          cpus: "${FORENSIC_CPU_PROGRESS_CPUS:-0.35}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     init: true
@@ -1024,7 +1030,10 @@ services:
     - disk-progress
 
   worker-beat:
-    cpus: "${FORENSIC_CPU_BEAT_CPUS:-0.15}"
+    deploy:
+      resources:
+        limits:
+          cpus: "${FORENSIC_CPU_BEAT_CPUS:-0.15}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     <<: [*common-net, *worker-lifecycle, *client-evidence-fuse]
@@ -1070,7 +1079,10 @@ services:
         condition: service_healthy
 
   worker-rag-prep:
-    cpus: "${FORENSIC_CPU_RAG_PREP_CPUS:-0.5}"
+    deploy:
+      resources:
+        limits:
+          cpus: "${FORENSIC_CPU_RAG_PREP_CPUS:-0.5}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     <<: [*common-net, *worker-lifecycle, *client-evidence-fuse]
